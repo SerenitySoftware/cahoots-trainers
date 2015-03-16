@@ -1,0 +1,5041 @@
+<?php
+/**
+ * Zend Framework (http://framework.zend.com/)
+ *
+ * @link      http://github.com/zendframework/zf2 for the canonical source repository
+ * @copyright Copyright (c) 2005-2015 Zend Technologies USA Inc. (http://www.zend.com)
+ * @license   http://framework.zend.com/license/new-bsd New BSD License
+ */
+
+namespace Zend\Mvc;
+
+use ArrayObject;
+use Zend\EventManager\EventManagerInterface;
+use Zend\EventManager\ListenerAggregateInterface;
+use Zend\Mvc\Exception\InvalidControllerException;
+use Zend\Stdlib\ArrayUtils;
+
+/**
+ * Default dispatch listener
+ *
+ * Pulls controllers from the service manager's "ControllerManager" service.
+ *
+ * If the controller cannot be found a "404" result is set up. Otherwise it
+ * will continue to try to load the controller.
+ *
+ * If the controller is not dispatchable it sets up a "404" result. In case
+ * of any other exceptions it trigger the "dispatch.error" event in an attempt
+ * to return a 500 status.
+ *
+ * If the controller subscribes to InjectApplicationEventInterface, it injects
+ * the current MvcEvent into the controller.
+ *
+ * It then calls the controller's "dispatch" method, passing it the request and
+ * response. If an exception occurs, it triggers the "dispatch.error" event,
+ * in an attempt to return a 500 status.
+ *
+ * The return value of dispatching the controller is placed into the result
+ * property of the MvcEvent, and returned.
+ */
+class DispatchListener implements ListenerAggregateInterface
+{
+    /**
+     * @var \Zend\Stdlib\CallbackHandler[]
+     */
+    protected $listeners = array();
+
+    /**
+     * Attach listeners to an event manager
+     *
+     * @param  EventManagerInterface $events
+     * @return void
+     */
+    public function attach(EventManagerInterface $events)
+    {
+        $this->listeners[] = $events->attach(MvcEvent::EVENT_DISPATCH, array($this, 'onDispatch'));
+        if (function_exists('zend_monitor_custom_event_ex')) {
+            $this->listeners[] = $events->attach(MvcEvent::EVENT_DISPATCH_ERROR, array($this, 'reportMonitorEvent'));
+        }
+    }
+
+    /**
+     * Detach listeners from an event manager
+     *
+     * @param  EventManagerInterface $events
+     * @return void
+     */
+    public function detach(EventManagerInterface $events)
+    {
+        foreach ($this->listeners as $index => $listener) {
+            if ($events->detach($listener)) {
+                unset($this->listeners[$index]);
+            }
+        }
+    }
+
+    /**
+     * Listen to the "dispatch" event
+     *
+     * @param  MvcEvent $e
+     * @return mixed
+     */
+    public function onDispatch(MvcEvent $e)
+    {
+        $routeMatch       = $e->getRouteMatch();
+        $controllerName   = $routeMatch->getParam('controller', 'not-found');
+        $application      = $e->getApplication();
+        $events           = $application->getEventManager();
+        $controllerLoader = $application->getServiceManager()->get('ControllerManager');
+
+        if (!$controllerLoader->has($controllerName)) {
+            $return = $this->marshalControllerNotFoundEvent($application::ERROR_CONTROLLER_NOT_FOUND, $controllerName, $e, $application);
+            return $this->complete($return, $e);
+        }
+
+        try {
+            $controller = $controllerLoader->get($controllerName);
+        } catch (InvalidControllerException $exception) {
+            $return = $this->marshalControllerNotFoundEvent($application::ERROR_CONTROLLER_INVALID, $controllerName, $e, $application, $exception);
+            return $this->complete($return, $e);
+        } catch (\Exception $exception) {
+            $return = $this->marshalBadControllerEvent($controllerName, $e, $application, $exception);
+            return $this->complete($return, $e);
+        }
+
+        $request  = $e->getRequest();
+        $response = $application->getResponse();
+
+        if ($controller instanceof InjectApplicationEventInterface) {
+            $controller->setEvent($e);
+        }
+
+        try {
+            $return = $controller->dispatch($request, $response);
+        } catch (\Exception $ex) {
+            $e->setError($application::ERROR_EXCEPTION)
+                  ->setController($controllerName)
+                  ->setControllerClass(get_class($controller))
+                  ->setParam('exception', $ex);
+            $results = $events->trigger(MvcEvent::EVENT_DISPATCH_ERROR, $e);
+            $return = $results->last();
+            if (! $return) {
+                $return = $e->getResult();
+            }
+        }
+
+        return $this->complete($return, $e);
+    }
+
+    /**
+     * @param MvcEvent $e
+     */
+    public function reportMonitorEvent(MvcEvent $e)
+    {
+        $error     = $e->getError();
+        $exception = $e->getParam('exception');
+        if ($exception instanceof \Exception) {
+            zend_monitor_custom_event_ex($error, $exception->getMessage(), 'Zend Framework Exception', array('code' => $exception->getCode(), 'trace' => $exception->getTraceAsString()));
+        }
+    }
+
+    /**
+     * Complete the dispatch
+     *
+     * @param  mixed $return
+     * @param  MvcEvent $event
+     * @return mixed
+     */
+    protected function complete($return, MvcEvent $event)
+    {
+        if (!is_object($return)) {
+            if (ArrayUtils::hasStringKeys($return)) {
+                $return = new ArrayObject($return, ArrayObject::ARRAY_AS_PROPS);
+            }
+        }
+        $event->setResult($return);
+        return $return;
+    }
+
+    /**
+     * Marshal a controller not found exception event
+     *
+     * @param  string $type
+     * @param  string $controllerName
+     * @param  MvcEvent $event
+     * @param  Application $application
+     * @param  \Exception $exception
+     * @return mixed
+     */
+    protected function marshalControllerNotFoundEvent(
+        $type,
+        $controllerName,
+        MvcEvent $event,
+        Application $application,
+        \Exception $exception = null
+    ) {
+        $event->setError($type)
+              ->setController($controllerName)
+              ->setControllerClass('invalid controller class or alias: ' . $controllerName);
+        if ($exception !== null) {
+            $event->setParam('exception', $exception);
+        }
+
+        $events  = $application->getEventManager();
+        $results = $events->trigger(MvcEvent::EVENT_DISPATCH_ERROR, $event);
+        $return  = $results->last();
+        if (! $return) {
+            $return = $event->getResult();
+        }
+        return $return;
+    }
+
+    /**
+     * Marshal a controller not found exception event
+     *
+     * @deprecated Use marshalControllerNotFoundEvent() instead
+     * @param  string $type
+     * @param  string $controllerName
+     * @param  MvcEvent $event
+     * @param  Application $application
+     * @param  \Exception $exception
+     * @return mixed
+     */
+    protected function marshallControllerNotFoundEvent(
+        $type,
+        $controllerName,
+        MvcEvent $event,
+        Application $application,
+        \Exception $exception = null
+    ) {
+        trigger_error(sprintf(
+            '%s is deprecated; please use %s::marshalControllerNotFoundEvent instead',
+            __METHOD__,
+            __CLASS__
+        ), E_USER_DEPRECATED);
+
+        return $this->marshalControllerNotFoundEvent($type, $controllerName, $event, $application, $exception);
+    }
+
+    /**
+     * Marshal a bad controller exception event
+     *
+     * @param  string $controllerName
+     * @param  MvcEvent $event
+     * @param  Application $application
+     * @param  \Exception $exception
+     * @return mixed
+     */
+    protected function marshalBadControllerEvent(
+        $controllerName,
+        MvcEvent $event,
+        Application $application,
+        \Exception $exception
+    ) {
+        $event->setError($application::ERROR_EXCEPTION)
+              ->setController($controllerName)
+              ->setParam('exception', $exception);
+
+        $events  = $application->getEventManager();
+        $results = $events->trigger(MvcEvent::EVENT_DISPATCH_ERROR, $event);
+        $return  = $results->last();
+        if (! $return) {
+            return $event->getResult();
+        }
+
+        return $return;
+    }
+}
+
+<?php
+/**
+ * Slim - a micro PHP 5 framework
+ *
+ * @author      Josh Lockhart <info@slimframework.com>
+ * @copyright   2011 Josh Lockhart
+ * @link        http://www.slimframework.com
+ * @license     http://www.slimframework.com/license
+ * @version     2.6.1
+ * @package     Slim
+ *
+ * MIT LICENSE
+ *
+ * Permission is hereby granted, free of charge, to any person obtaining
+ * a copy of this software and associated documentation files (the
+ * "Software"), to deal in the Software without restriction, including
+ * without limitation the rights to use, copy, modify, merge, publish,
+ * distribute, sublicense, and/or sell copies of the Software, and to
+ * permit persons to whom the Software is furnished to do so, subject to
+ * the following conditions:
+ *
+ * The above copyright notice and this permission notice shall be
+ * included in all copies or substantial portions of the Software.
+ *
+ * THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND,
+ * EXPRESS OR IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF
+ * MERCHANTABILITY, FITNESS FOR A PARTICULAR PURPOSE AND
+ * NONINFRINGEMENT. IN NO EVENT SHALL THE AUTHORS OR COPYRIGHT HOLDERS BE
+ * LIABLE FOR ANY CLAIM, DAMAGES OR OTHER LIABILITY, WHETHER IN AN ACTION
+ * OF CONTRACT, TORT OR OTHERWISE, ARISING FROM, OUT OF OR IN CONNECTION
+ * WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
+ */
+namespace Slim;
+
+// Ensure mcrypt constants are defined even if mcrypt extension is not loaded
+if (!extension_loaded('mcrypt')) {
+    define('MCRYPT_MODE_CBC', 0);
+    define('MCRYPT_RIJNDAEL_256', 0);
+}
+
+/**
+ * Slim
+ * @package  Slim
+ * @author   Josh Lockhart
+ * @since    1.0.0
+ *
+ * @property \Slim\Environment   $environment
+ * @property \Slim\Http\Response $response
+ * @property \Slim\Http\Request  $request
+ * @property \Slim\Router        $router
+ */
+class Slim
+{
+    /**
+     * @const string
+     */
+    const VERSION = '2.6.1';
+
+    /**
+     * @var \Slim\Helper\Set
+     */
+    public $container;
+
+    /**
+     * @var array[\Slim]
+     */
+    protected static $apps = array();
+
+    /**
+     * @var string
+     */
+    protected $name;
+
+    /**
+     * @var array
+     */
+    protected $middleware;
+
+    /**
+     * @var mixed Callable to be invoked if application error
+     */
+    protected $error;
+
+    /**
+     * @var mixed Callable to be invoked if no matching routes are found
+     */
+    protected $notFound;
+
+    /**
+     * @var array
+     */
+    protected $hooks = array(
+        'slim.before' => array(array()),
+        'slim.before.router' => array(array()),
+        'slim.before.dispatch' => array(array()),
+        'slim.after.dispatch' => array(array()),
+        'slim.after.router' => array(array()),
+        'slim.after' => array(array())
+    );
+
+    /********************************************************************************
+    * PSR-0 Autoloader
+    *
+    * Do not use if you are using Composer to autoload dependencies.
+    *******************************************************************************/
+
+    /**
+     * Slim PSR-0 autoloader
+     */
+    public static function autoload($className)
+    {
+        $thisClass = str_replace(__NAMESPACE__.'\\', '', __CLASS__);
+
+        $baseDir = __DIR__;
+
+        if (substr($baseDir, -strlen($thisClass)) === $thisClass) {
+            $baseDir = substr($baseDir, 0, -strlen($thisClass));
+        }
+
+        $className = ltrim($className, '\\');
+        $fileName  = $baseDir;
+        $namespace = '';
+        if ($lastNsPos = strripos($className, '\\')) {
+            $namespace = substr($className, 0, $lastNsPos);
+            $className = substr($className, $lastNsPos + 1);
+            $fileName  .= str_replace('\\', DIRECTORY_SEPARATOR, $namespace) . DIRECTORY_SEPARATOR;
+        }
+        $fileName .= str_replace('_', DIRECTORY_SEPARATOR, $className) . '.php';
+
+        if (file_exists($fileName)) {
+            require $fileName;
+        }
+    }
+
+    /**
+     * Register Slim's PSR-0 autoloader
+     */
+    public static function registerAutoloader()
+    {
+        spl_autoload_register(__NAMESPACE__ . "\\Slim::autoload");
+    }
+
+    /********************************************************************************
+    * Instantiation and Configuration
+    *******************************************************************************/
+
+    /**
+     * Constructor
+     * @param  array $userSettings Associative array of application settings
+     */
+    public function __construct(array $userSettings = array())
+    {
+        // Setup IoC container
+        $this->container = new \Slim\Helper\Set();
+        $this->container['settings'] = array_merge(static::getDefaultSettings(), $userSettings);
+
+        // Default environment
+        $this->container->singleton('environment', function ($c) {
+            return \Slim\Environment::getInstance();
+        });
+
+        // Default request
+        $this->container->singleton('request', function ($c) {
+            return new \Slim\Http\Request($c['environment']);
+        });
+
+        // Default response
+        $this->container->singleton('response', function ($c) {
+            return new \Slim\Http\Response();
+        });
+
+        // Default router
+        $this->container->singleton('router', function ($c) {
+            return new \Slim\Router();
+        });
+
+        // Default view
+        $this->container->singleton('view', function ($c) {
+            $viewClass = $c['settings']['view'];
+            $templatesPath = $c['settings']['templates.path'];
+
+            $view = ($viewClass instanceOf \Slim\View) ? $viewClass : new $viewClass;
+            $view->setTemplatesDirectory($templatesPath);
+            return $view;
+        });
+
+        // Default log writer
+        $this->container->singleton('logWriter', function ($c) {
+            $logWriter = $c['settings']['log.writer'];
+
+            return is_object($logWriter) ? $logWriter : new \Slim\LogWriter($c['environment']['slim.errors']);
+        });
+
+        // Default log
+        $this->container->singleton('log', function ($c) {
+            $log = new \Slim\Log($c['logWriter']);
+            $log->setEnabled($c['settings']['log.enabled']);
+            $log->setLevel($c['settings']['log.level']);
+            $env = $c['environment'];
+            $env['slim.log'] = $log;
+
+            return $log;
+        });
+
+        // Default mode
+        $this->container['mode'] = function ($c) {
+            $mode = $c['settings']['mode'];
+
+            if (isset($_ENV['SLIM_MODE'])) {
+                $mode = $_ENV['SLIM_MODE'];
+            } else {
+                $envMode = getenv('SLIM_MODE');
+                if ($envMode !== false) {
+                    $mode = $envMode;
+                }
+            }
+
+            return $mode;
+        };
+
+        // Define default middleware stack
+        $this->middleware = array($this);
+        $this->add(new \Slim\Middleware\Flash());
+        $this->add(new \Slim\Middleware\MethodOverride());
+
+        // Make default if first instance
+        if (is_null(static::getInstance())) {
+            $this->setName('default');
+        }
+    }
+
+    public function __get($name)
+    {
+        return $this->container->get($name);
+    }
+
+    public function __set($name, $value)
+    {
+        $this->container->set($name, $value);
+    }
+
+    public function __isset($name)
+    {
+        return $this->container->has($name);
+    }
+
+    public function __unset($name)
+    {
+        $this->container->remove($name);
+    }
+
+    /**
+     * Get application instance by name
+     * @param  string    $name The name of the Slim application
+     * @return \Slim\Slim|null
+     */
+    public static function getInstance($name = 'default')
+    {
+        return isset(static::$apps[$name]) ? static::$apps[$name] : null;
+    }
+
+    /**
+     * Set Slim application name
+     * @param  string $name The name of this Slim application
+     */
+    public function setName($name)
+    {
+        $this->name = $name;
+        static::$apps[$name] = $this;
+    }
+
+    /**
+     * Get Slim application name
+     * @return string|null
+     */
+    public function getName()
+    {
+        return $this->name;
+    }
+
+    /**
+     * Get default application settings
+     * @return array
+     */
+    public static function getDefaultSettings()
+    {
+        return array(
+            // Application
+            'mode' => 'development',
+            // Debugging
+            'debug' => true,
+            // Logging
+            'log.writer' => null,
+            'log.level' => \Slim\Log::DEBUG,
+            'log.enabled' => true,
+            // View
+            'templates.path' => './templates',
+            'view' => '\Slim\View',
+            // Cookies
+            'cookies.encrypt' => false,
+            'cookies.lifetime' => '20 minutes',
+            'cookies.path' => '/',
+            'cookies.domain' => null,
+            'cookies.secure' => false,
+            'cookies.httponly' => false,
+            // Encryption
+            'cookies.secret_key' => 'CHANGE_ME',
+            'cookies.cipher' => MCRYPT_RIJNDAEL_256,
+            'cookies.cipher_mode' => MCRYPT_MODE_CBC,
+            // HTTP
+            'http.version' => '1.1',
+            // Routing
+            'routes.case_sensitive' => true
+        );
+    }
+
+    /**
+     * Configure Slim Settings
+     *
+     * This method defines application settings and acts as a setter and a getter.
+     *
+     * If only one argument is specified and that argument is a string, the value
+     * of the setting identified by the first argument will be returned, or NULL if
+     * that setting does not exist.
+     *
+     * If only one argument is specified and that argument is an associative array,
+     * the array will be merged into the existing application settings.
+     *
+     * If two arguments are provided, the first argument is the name of the setting
+     * to be created or updated, and the second argument is the setting value.
+     *
+     * @param  string|array $name  If a string, the name of the setting to set or retrieve. Else an associated array of setting names and values
+     * @param  mixed        $value If name is a string, the value of the setting identified by $name
+     * @return mixed        The value of a setting if only one argument is a string
+     */
+    public function config($name, $value = null)
+    {
+        $c = $this->container;
+
+        if (is_array($name)) {
+            if (true === $value) {
+                $c['settings'] = array_merge_recursive($c['settings'], $name);
+            } else {
+                $c['settings'] = array_merge($c['settings'], $name);
+            }
+        } elseif (func_num_args() === 1) {
+            return isset($c['settings'][$name]) ? $c['settings'][$name] : null;
+        } else {
+            $settings = $c['settings'];
+            $settings[$name] = $value;
+            $c['settings'] = $settings;
+        }
+    }
+
+    /********************************************************************************
+    * Application Modes
+    *******************************************************************************/
+
+    /**
+     * Get application mode
+     *
+     * This method determines the application mode. It first inspects the $_ENV
+     * superglobal for key `SLIM_MODE`. If that is not found, it queries
+     * the `getenv` function. Else, it uses the application `mode` setting.
+     *
+     * @return string
+     */
+    public function getMode()
+    {
+        return $this->mode;
+    }
+
+    /**
+     * Configure Slim for a given mode
+     *
+     * This method will immediately invoke the callable if
+     * the specified mode matches the current application mode.
+     * Otherwise, the callable is ignored. This should be called
+     * only _after_ you initialize your Slim app.
+     *
+     * @param  string $mode
+     * @param  mixed  $callable
+     * @return void
+     */
+    public function configureMode($mode, $callable)
+    {
+        if ($mode === $this->getMode() && is_callable($callable)) {
+            call_user_func($callable);
+        }
+    }
+
+    /********************************************************************************
+    * Logging
+    *******************************************************************************/
+
+    /**
+     * Get application log
+     * @return \Slim\Log
+     */
+    public function getLog()
+    {
+        return $this->log;
+    }
+
+    /********************************************************************************
+    * Routing
+    *******************************************************************************/
+
+    /**
+     * Add GET|POST|PUT|PATCH|DELETE route
+     *
+     * Adds a new route to the router with associated callable. This
+     * route will only be invoked when the HTTP request's method matches
+     * this route's method.
+     *
+     * ARGUMENTS:
+     *
+     * First:       string  The URL pattern (REQUIRED)
+     * In-Between:  mixed   Anything that returns TRUE for `is_callable` (OPTIONAL)
+     * Last:        mixed   Anything that returns TRUE for `is_callable` (REQUIRED)
+     *
+     * The first argument is required and must always be the
+     * route pattern (ie. '/books/:id').
+     *
+     * The last argument is required and must always be the callable object
+     * to be invoked when the route matches an HTTP request.
+     *
+     * You may also provide an unlimited number of in-between arguments;
+     * each interior argument must be callable and will be invoked in the
+     * order specified before the route's callable is invoked.
+     *
+     * USAGE:
+     *
+     * Slim::get('/foo'[, middleware, middleware, ...], callable);
+     *
+     * @param   array (See notes above)
+     * @return  \Slim\Route
+     */
+    protected function mapRoute($args)
+    {
+        $pattern = array_shift($args);
+        $callable = array_pop($args);
+        $route = new \Slim\Route($pattern, $callable, $this->settings['routes.case_sensitive']);
+        $this->router->map($route);
+        if (count($args) > 0) {
+            $route->setMiddleware($args);
+        }
+
+        return $route;
+    }
+
+    /**
+     * Add generic route without associated HTTP method
+     * @see    mapRoute()
+     * @return \Slim\Route
+     */
+    public function map()
+    {
+        $args = func_get_args();
+
+        return $this->mapRoute($args);
+    }
+
+    /**
+     * Add GET route
+     * @see    mapRoute()
+     * @return \Slim\Route
+     */
+    public function get()
+    {
+        $args = func_get_args();
+
+        return $this->mapRoute($args)->via(\Slim\Http\Request::METHOD_GET, \Slim\Http\Request::METHOD_HEAD);
+    }
+
+    /**
+     * Add POST route
+     * @see    mapRoute()
+     * @return \Slim\Route
+     */
+    public function post()
+    {
+        $args = func_get_args();
+
+        return $this->mapRoute($args)->via(\Slim\Http\Request::METHOD_POST);
+    }
+
+    /**
+     * Add PUT route
+     * @see    mapRoute()
+     * @return \Slim\Route
+     */
+    public function put()
+    {
+        $args = func_get_args();
+
+        return $this->mapRoute($args)->via(\Slim\Http\Request::METHOD_PUT);
+    }
+
+    /**
+     * Add PATCH route
+     * @see    mapRoute()
+     * @return \Slim\Route
+     */
+    public function patch()
+    {
+        $args = func_get_args();
+
+        return $this->mapRoute($args)->via(\Slim\Http\Request::METHOD_PATCH);
+    }
+
+    /**
+     * Add DELETE route
+     * @see    mapRoute()
+     * @return \Slim\Route
+     */
+    public function delete()
+    {
+        $args = func_get_args();
+
+        return $this->mapRoute($args)->via(\Slim\Http\Request::METHOD_DELETE);
+    }
+
+    /**
+     * Add OPTIONS route
+     * @see    mapRoute()
+     * @return \Slim\Route
+     */
+    public function options()
+    {
+        $args = func_get_args();
+
+        return $this->mapRoute($args)->via(\Slim\Http\Request::METHOD_OPTIONS);
+    }
+
+    /**
+     * Route Groups
+     *
+     * This method accepts a route pattern and a callback all Route
+     * declarations in the callback will be prepended by the group(s)
+     * that it is in
+     *
+     * Accepts the same parameters as a standard route so:
+     * (pattern, middleware1, middleware2, ..., $callback)
+     */
+    public function group()
+    {
+        $args = func_get_args();
+        $pattern = array_shift($args);
+        $callable = array_pop($args);
+        $this->router->pushGroup($pattern, $args);
+        if (is_callable($callable)) {
+            call_user_func($callable);
+        }
+        $this->router->popGroup();
+    }
+
+    /*
+     * Add route for any HTTP method
+     * @see    mapRoute()
+     * @return \Slim\Route
+     */
+    public function any()
+    {
+        $args = func_get_args();
+
+        return $this->mapRoute($args)->via("ANY");
+    }
+
+    /**
+     * Not Found Handler
+     *
+     * This method defines or invokes the application-wide Not Found handler.
+     * There are two contexts in which this method may be invoked:
+     *
+     * 1. When declaring the handler:
+     *
+     * If the $callable parameter is not null and is callable, this
+     * method will register the callable to be invoked when no
+     * routes match the current HTTP request. It WILL NOT invoke the callable.
+     *
+     * 2. When invoking the handler:
+     *
+     * If the $callable parameter is null, Slim assumes you want
+     * to invoke an already-registered handler. If the handler has been
+     * registered and is callable, it is invoked and sends a 404 HTTP Response
+     * whose body is the output of the Not Found handler.
+     *
+     * @param  mixed $callable Anything that returns true for is_callable()
+     */
+    public function notFound ($callable = null)
+    {
+        if (is_callable($callable)) {
+            $this->notFound = $callable;
+        } else {
+            ob_start();
+            if (is_callable($this->notFound)) {
+                call_user_func($this->notFound);
+            } else {
+                call_user_func(array($this, 'defaultNotFound'));
+            }
+            $this->halt(404, ob_get_clean());
+        }
+    }
+
+    /**
+     * Error Handler
+     *
+     * This method defines or invokes the application-wide Error handler.
+     * There are two contexts in which this method may be invoked:
+     *
+     * 1. When declaring the handler:
+     *
+     * If the $argument parameter is callable, this
+     * method will register the callable to be invoked when an uncaught
+     * Exception is detected, or when otherwise explicitly invoked.
+     * The handler WILL NOT be invoked in this context.
+     *
+     * 2. When invoking the handler:
+     *
+     * If the $argument parameter is not callable, Slim assumes you want
+     * to invoke an already-registered handler. If the handler has been
+     * registered and is callable, it is invoked and passed the caught Exception
+     * as its one and only argument. The error handler's output is captured
+     * into an output buffer and sent as the body of a 500 HTTP Response.
+     *
+     * @param  mixed $argument Callable|\Exception
+     */
+    public function error($argument = null)
+    {
+        if (is_callable($argument)) {
+            //Register error handler
+            $this->error = $argument;
+        } else {
+            //Invoke error handler
+            $this->response->status(500);
+            $this->response->body('');
+            $this->response->write($this->callErrorHandler($argument));
+            $this->stop();
+        }
+    }
+
+    /**
+     * Call error handler
+     *
+     * This will invoke the custom or default error handler
+     * and RETURN its output.
+     *
+     * @param  \Exception|null $argument
+     * @return string
+     */
+    protected function callErrorHandler($argument = null)
+    {
+        ob_start();
+        if (is_callable($this->error)) {
+            call_user_func_array($this->error, array($argument));
+        } else {
+            call_user_func_array(array($this, 'defaultError'), array($argument));
+        }
+
+        return ob_get_clean();
+    }
+
+    /********************************************************************************
+    * Application Accessors
+    *******************************************************************************/
+
+    /**
+     * Get a reference to the Environment object
+     * @return \Slim\Environment
+     */
+    public function environment()
+    {
+        return $this->environment;
+    }
+
+    /**
+     * Get the Request object
+     * @return \Slim\Http\Request
+     */
+    public function request()
+    {
+        return $this->request;
+    }
+
+    /**
+     * Get the Response object
+     * @return \Slim\Http\Response
+     */
+    public function response()
+    {
+        return $this->response;
+    }
+
+    /**
+     * Get the Router object
+     * @return \Slim\Router
+     */
+    public function router()
+    {
+        return $this->router;
+    }
+
+    /**
+     * Get and/or set the View
+     *
+     * This method declares the View to be used by the Slim application.
+     * If the argument is a string, Slim will instantiate a new object
+     * of the same class. If the argument is an instance of View or a subclass
+     * of View, Slim will use the argument as the View.
+     *
+     * If a View already exists and this method is called to create a
+     * new View, data already set in the existing View will be
+     * transferred to the new View.
+     *
+     * @param  string|\Slim\View $viewClass The name or instance of a \Slim\View subclass
+     * @return \Slim\View
+     */
+    public function view($viewClass = null)
+    {
+        if (!is_null($viewClass)) {
+            $existingData = is_null($this->view) ? array() : $this->view->getData();
+            if ($viewClass instanceOf \Slim\View) {
+                $this->view = $viewClass;
+            } else {
+                $this->view = new $viewClass();
+            }
+            $this->view->appendData($existingData);
+            $this->view->setTemplatesDirectory($this->config('templates.path'));
+        }
+
+        return $this->view;
+    }
+
+    /********************************************************************************
+    * Rendering
+    *******************************************************************************/
+
+    /**
+     * Render a template
+     *
+     * Call this method within a GET, POST, PUT, PATCH, DELETE, NOT FOUND, or ERROR
+     * callable to render a template whose output is appended to the
+     * current HTTP response body. How the template is rendered is
+     * delegated to the current View.
+     *
+     * @param  string $template The name of the template passed into the view's render() method
+     * @param  array  $data     Associative array of data made available to the view
+     * @param  int    $status   The HTTP response status code to use (optional)
+     */
+    public function render($template, $data = array(), $status = null)
+    {
+        if (!is_null($status)) {
+            $this->response->status($status);
+        }
+        $this->view->appendData($data);
+        $this->view->display($template);
+    }
+
+    /********************************************************************************
+    * HTTP Caching
+    *******************************************************************************/
+
+    /**
+     * Set Last-Modified HTTP Response Header
+     *
+     * Set the HTTP 'Last-Modified' header and stop if a conditional
+     * GET request's `If-Modified-Since` header matches the last modified time
+     * of the resource. The `time` argument is a UNIX timestamp integer value.
+     * When the current request includes an 'If-Modified-Since' header that
+     * matches the specified last modified time, the application will stop
+     * and send a '304 Not Modified' response to the client.
+     *
+     * @param  int                       $time The last modified UNIX timestamp
+     * @throws \InvalidArgumentException If provided timestamp is not an integer
+     */
+    public function lastModified($time)
+    {
+        if (is_integer($time)) {
+            $this->response->headers->set('Last-Modified', gmdate('D, d M Y H:i:s T', $time));
+            if ($time === strtotime($this->request->headers->get('IF_MODIFIED_SINCE'))) {
+                $this->halt(304);
+            }
+        } else {
+            throw new \InvalidArgumentException('Slim::lastModified only accepts an integer UNIX timestamp value.');
+        }
+    }
+
+    /**
+     * Set ETag HTTP Response Header
+     *
+     * Set the etag header and stop if the conditional GET request matches.
+     * The `value` argument is a unique identifier for the current resource.
+     * The `type` argument indicates whether the etag should be used as a strong or
+     * weak cache validator.
+     *
+     * When the current request includes an 'If-None-Match' header with
+     * a matching etag, execution is immediately stopped. If the request
+     * method is GET or HEAD, a '304 Not Modified' response is sent.
+     *
+     * @param  string                    $value The etag value
+     * @param  string                    $type  The type of etag to create; either "strong" or "weak"
+     * @throws \InvalidArgumentException If provided type is invalid
+     */
+    public function etag($value, $type = 'strong')
+    {
+        //Ensure type is correct
+        if (!in_array($type, array('strong', 'weak'))) {
+            throw new \InvalidArgumentException('Invalid Slim::etag type. Expected "strong" or "weak".');
+        }
+
+        //Set etag value
+        $value = '"' . $value . '"';
+        if ($type === 'weak') {
+            $value = 'W/'.$value;
+        }
+        $this->response['ETag'] = $value;
+
+        //Check conditional GET
+        if ($etagsHeader = $this->request->headers->get('IF_NONE_MATCH')) {
+            $etags = preg_split('@\s*,\s*@', $etagsHeader);
+            if (in_array($value, $etags) || in_array('*', $etags)) {
+                $this->halt(304);
+            }
+        }
+    }
+
+    /**
+     * Set Expires HTTP response header
+     *
+     * The `Expires` header tells the HTTP client the time at which
+     * the current resource should be considered stale. At that time the HTTP
+     * client will send a conditional GET request to the server; the server
+     * may return a 200 OK if the resource has changed, else a 304 Not Modified
+     * if the resource has not changed. The `Expires` header should be used in
+     * conjunction with the `etag()` or `lastModified()` methods above.
+     *
+     * @param string|int    $time   If string, a time to be parsed by `strtotime()`;
+     *                              If int, a UNIX timestamp;
+     */
+    public function expires($time)
+    {
+        if (is_string($time)) {
+            $time = strtotime($time);
+        }
+        $this->response->headers->set('Expires', gmdate('D, d M Y H:i:s T', $time));
+    }
+
+    /********************************************************************************
+    * HTTP Cookies
+    *******************************************************************************/
+
+    /**
+     * Set HTTP cookie to be sent with the HTTP response
+     *
+     * @param string     $name      The cookie name
+     * @param string     $value     The cookie value
+     * @param int|string $time      The duration of the cookie;
+     *                                  If integer, should be UNIX timestamp;
+     *                                  If string, converted to UNIX timestamp with `strtotime`;
+     * @param string     $path      The path on the server in which the cookie will be available on
+     * @param string     $domain    The domain that the cookie is available to
+     * @param bool       $secure    Indicates that the cookie should only be transmitted over a secure
+     *                              HTTPS connection to/from the client
+     * @param bool       $httponly  When TRUE the cookie will be made accessible only through the HTTP protocol
+     */
+    public function setCookie($name, $value, $time = null, $path = null, $domain = null, $secure = null, $httponly = null)
+    {
+        $settings = array(
+            'value' => $value,
+            'expires' => is_null($time) ? $this->config('cookies.lifetime') : $time,
+            'path' => is_null($path) ? $this->config('cookies.path') : $path,
+            'domain' => is_null($domain) ? $this->config('cookies.domain') : $domain,
+            'secure' => is_null($secure) ? $this->config('cookies.secure') : $secure,
+            'httponly' => is_null($httponly) ? $this->config('cookies.httponly') : $httponly
+        );
+        $this->response->cookies->set($name, $settings);
+    }
+
+    /**
+     * Get value of HTTP cookie from the current HTTP request
+     *
+     * Return the value of a cookie from the current HTTP request,
+     * or return NULL if cookie does not exist. Cookies created during
+     * the current request will not be available until the next request.
+     *
+     * @param  string      $name
+     * @param  bool        $deleteIfInvalid
+     * @return string|null
+     */
+    public function getCookie($name, $deleteIfInvalid = true)
+    {
+        // Get cookie value
+        $value = $this->request->cookies->get($name);
+
+        // Decode if encrypted
+        if ($this->config('cookies.encrypt')) {
+            $value = \Slim\Http\Util::decodeSecureCookie(
+                $value,
+                $this->config('cookies.secret_key'),
+                $this->config('cookies.cipher'),
+                $this->config('cookies.cipher_mode')
+            );
+            if ($value === false && $deleteIfInvalid) {
+                $this->deleteCookie($name);
+            }
+        }
+
+        /*
+         * transform $value to @return doc requirement.
+         * \Slim\Http\Util::decodeSecureCookie -  is able
+         * to return false and we have to cast it to null.
+         */
+        return $value === false ? null : $value;
+    }
+
+    /**
+     * DEPRECATION WARNING! Use `setCookie` with the `cookies.encrypt` app setting set to `true`.
+     *
+     * Set encrypted HTTP cookie
+     *
+     * @param string    $name       The cookie name
+     * @param mixed     $value      The cookie value
+     * @param mixed     $expires    The duration of the cookie;
+     *                                  If integer, should be UNIX timestamp;
+     *                                  If string, converted to UNIX timestamp with `strtotime`;
+     * @param string    $path       The path on the server in which the cookie will be available on
+     * @param string    $domain     The domain that the cookie is available to
+     * @param bool      $secure     Indicates that the cookie should only be transmitted over a secure
+     *                              HTTPS connection from the client
+     * @param  bool     $httponly   When TRUE the cookie will be made accessible only through the HTTP protocol
+     */
+    public function setEncryptedCookie($name, $value, $expires = null, $path = null, $domain = null, $secure = false, $httponly = false)
+    {
+        $this->setCookie($name, $value, $expires, $path, $domain, $secure, $httponly);
+    }
+
+    /**
+     * DEPRECATION WARNING! Use `getCookie` with the `cookies.encrypt` app setting set to `true`.
+     *
+     * Get value of encrypted HTTP cookie
+     *
+     * Return the value of an encrypted cookie from the current HTTP request,
+     * or return NULL if cookie does not exist. Encrypted cookies created during
+     * the current request will not be available until the next request.
+     *
+     * @param  string       $name
+     * @param  bool         $deleteIfInvalid
+     * @return string|bool
+     */
+    public function getEncryptedCookie($name, $deleteIfInvalid = true)
+    {
+        return $this->getCookie($name, $deleteIfInvalid);
+    }
+
+    /**
+     * Delete HTTP cookie (encrypted or unencrypted)
+     *
+     * Remove a Cookie from the client. This method will overwrite an existing Cookie
+     * with a new, empty, auto-expiring Cookie. This method's arguments must match
+     * the original Cookie's respective arguments for the original Cookie to be
+     * removed. If any of this method's arguments are omitted or set to NULL, the
+     * default Cookie setting values (set during Slim::init) will be used instead.
+     *
+     * @param string    $name       The cookie name
+     * @param string    $path       The path on the server in which the cookie will be available on
+     * @param string    $domain     The domain that the cookie is available to
+     * @param bool      $secure     Indicates that the cookie should only be transmitted over a secure
+     *                              HTTPS connection from the client
+     * @param  bool     $httponly   When TRUE the cookie will be made accessible only through the HTTP protocol
+     */
+    public function deleteCookie($name, $path = null, $domain = null, $secure = null, $httponly = null)
+    {
+        $settings = array(
+            'domain' => is_null($domain) ? $this->config('cookies.domain') : $domain,
+            'path' => is_null($path) ? $this->config('cookies.path') : $path,
+            'secure' => is_null($secure) ? $this->config('cookies.secure') : $secure,
+            'httponly' => is_null($httponly) ? $this->config('cookies.httponly') : $httponly
+        );
+        $this->response->cookies->remove($name, $settings);
+    }
+
+    /********************************************************************************
+    * Helper Methods
+    *******************************************************************************/
+
+    /**
+     * Get the absolute path to this Slim application's root directory
+     *
+     * This method returns the absolute path to the Slim application's
+     * directory. If the Slim application is installed in a public-accessible
+     * sub-directory, the sub-directory path will be included. This method
+     * will always return an absolute path WITH a trailing slash.
+     *
+     * @return string
+     */
+    public function root()
+    {
+        return rtrim($_SERVER['DOCUMENT_ROOT'], '/') . rtrim($this->request->getRootUri(), '/') . '/';
+    }
+
+    /**
+     * Clean current output buffer
+     */
+    protected function cleanBuffer()
+    {
+        if (ob_get_level() !== 0) {
+            ob_clean();
+        }
+    }
+
+    /**
+     * Stop
+     *
+     * The thrown exception will be caught in application's `call()` method
+     * and the response will be sent as is to the HTTP client.
+     *
+     * @throws \Slim\Exception\Stop
+     */
+    public function stop()
+    {
+        throw new \Slim\Exception\Stop();
+    }
+
+    /**
+     * Halt
+     *
+     * Stop the application and immediately send the response with a
+     * specific status and body to the HTTP client. This may send any
+     * type of response: info, success, redirect, client error, or server error.
+     * If you need to render a template AND customize the response status,
+     * use the application's `render()` method instead.
+     *
+     * @param  int      $status     The HTTP response status
+     * @param  string   $message    The HTTP response body
+     */
+    public function halt($status, $message = '')
+    {
+        $this->cleanBuffer();
+        $this->response->status($status);
+        $this->response->body($message);
+        $this->stop();
+    }
+
+    /**
+     * Pass
+     *
+     * The thrown exception is caught in the application's `call()` method causing
+     * the router's current iteration to stop and continue to the subsequent route if available.
+     * If no subsequent matching routes are found, a 404 response will be sent to the client.
+     *
+     * @throws \Slim\Exception\Pass
+     */
+    public function pass()
+    {
+        $this->cleanBuffer();
+        throw new \Slim\Exception\Pass();
+    }
+
+    /**
+     * Set the HTTP response Content-Type
+     * @param  string   $type   The Content-Type for the Response (ie. text/html)
+     */
+    public function contentType($type)
+    {
+        $this->response->headers->set('Content-Type', $type);
+    }
+
+    /**
+     * Set the HTTP response status code
+     * @param  int      $code     The HTTP response status code
+     */
+    public function status($code)
+    {
+        $this->response->setStatus($code);
+    }
+
+    /**
+     * Get the URL for a named route
+     * @param  string               $name       The route name
+     * @param  array                $params     Associative array of URL parameters and replacement values
+     * @throws \RuntimeException    If named route does not exist
+     * @return string
+     */
+    public function urlFor($name, $params = array())
+    {
+        return $this->request->getRootUri() . $this->router->urlFor($name, $params);
+    }
+
+    /**
+     * Redirect
+     *
+     * This method immediately redirects to a new URL. By default,
+     * this issues a 302 Found response; this is considered the default
+     * generic redirect response. You may also specify another valid
+     * 3xx status code if you want. This method will automatically set the
+     * HTTP Location header for you using the URL parameter.
+     *
+     * @param  string   $url        The destination URL
+     * @param  int      $status     The HTTP redirect status code (optional)
+     */
+    public function redirect($url, $status = 302)
+    {
+        $this->response->redirect($url, $status);
+        $this->halt($status);
+    }
+
+    /**
+     * RedirectTo
+     *
+     * Redirects to a specific named route
+     *
+     * @param string    $route      The route name
+     * @param array     $params     Associative array of URL parameters and replacement values
+     */
+    public function redirectTo($route, $params = array(), $status = 302){
+        $this->redirect($this->urlFor($route, $params), $status);
+    }
+
+    /********************************************************************************
+    * Flash Messages
+    *******************************************************************************/
+
+    /**
+     * Set flash message for subsequent request
+     * @param  string   $key
+     * @param  mixed    $value
+     */
+    public function flash($key, $value)
+    {
+        if (isset($this->environment['slim.flash'])) {
+            $this->environment['slim.flash']->set($key, $value);
+        }
+    }
+
+    /**
+     * Set flash message for current request
+     * @param  string   $key
+     * @param  mixed    $value
+     */
+    public function flashNow($key, $value)
+    {
+        if (isset($this->environment['slim.flash'])) {
+            $this->environment['slim.flash']->now($key, $value);
+        }
+    }
+
+    /**
+     * Keep flash messages from previous request for subsequent request
+     */
+    public function flashKeep()
+    {
+        if (isset($this->environment['slim.flash'])) {
+            $this->environment['slim.flash']->keep();
+        }
+    }
+
+    /**
+     * Get all flash messages
+     */
+    public function flashData()
+    {
+        if (isset($this->environment['slim.flash'])) {
+            return $this->environment['slim.flash']->getMessages();
+        }
+    }
+
+    /********************************************************************************
+    * Hooks
+    *******************************************************************************/
+
+    /**
+     * Assign hook
+     * @param  string   $name       The hook name
+     * @param  mixed    $callable   A callable object
+     * @param  int      $priority   The hook priority; 0 = high, 10 = low
+     */
+    public function hook($name, $callable, $priority = 10)
+    {
+        if (!isset($this->hooks[$name])) {
+            $this->hooks[$name] = array(array());
+        }
+        if (is_callable($callable)) {
+            $this->hooks[$name][(int) $priority][] = $callable;
+        }
+    }
+
+    /**
+     * Invoke hook
+     * @param  string $name The hook name
+     * @param  mixed  ...   (Optional) Argument(s) for hooked functions, can specify multiple arguments
+     */
+    public function applyHook($name)
+    {
+        if (!isset($this->hooks[$name])) {
+            $this->hooks[$name] = array(array());
+        }
+        if (!empty($this->hooks[$name])) {
+            // Sort by priority, low to high, if there's more than one priority
+            if (count($this->hooks[$name]) > 1) {
+                ksort($this->hooks[$name]);
+            }
+
+            $args = func_get_args();
+            array_shift($args);
+
+            foreach ($this->hooks[$name] as $priority) {
+                if (!empty($priority)) {
+                    foreach ($priority as $callable) {
+                        call_user_func_array($callable, $args);
+                    }
+                }
+            }
+        }
+    }
+
+    /**
+     * Get hook listeners
+     *
+     * Return an array of registered hooks. If `$name` is a valid
+     * hook name, only the listeners attached to that hook are returned.
+     * Else, all listeners are returned as an associative array whose
+     * keys are hook names and whose values are arrays of listeners.
+     *
+     * @param  string     $name     A hook name (Optional)
+     * @return array|null
+     */
+    public function getHooks($name = null)
+    {
+        if (!is_null($name)) {
+            return isset($this->hooks[(string) $name]) ? $this->hooks[(string) $name] : null;
+        } else {
+            return $this->hooks;
+        }
+    }
+
+    /**
+     * Clear hook listeners
+     *
+     * Clear all listeners for all hooks. If `$name` is
+     * a valid hook name, only the listeners attached
+     * to that hook will be cleared.
+     *
+     * @param  string   $name   A hook name (Optional)
+     */
+    public function clearHooks($name = null)
+    {
+        if (!is_null($name) && isset($this->hooks[(string) $name])) {
+            $this->hooks[(string) $name] = array(array());
+        } else {
+            foreach ($this->hooks as $key => $value) {
+                $this->hooks[$key] = array(array());
+            }
+        }
+    }
+
+    /********************************************************************************
+    * Middleware
+    *******************************************************************************/
+
+    /**
+     * Add middleware
+     *
+     * This method prepends new middleware to the application middleware stack.
+     * The argument must be an instance that subclasses Slim_Middleware.
+     *
+     * @param \Slim\Middleware
+     */
+    public function add(\Slim\Middleware $newMiddleware)
+    {
+        if(in_array($newMiddleware, $this->middleware)) {
+            $middleware_class = get_class($newMiddleware);
+            throw new \RuntimeException("Circular Middleware setup detected. Tried to queue the same Middleware instance ({$middleware_class}) twice.");
+        }
+        $newMiddleware->setApplication($this);
+        $newMiddleware->setNextMiddleware($this->middleware[0]);
+        array_unshift($this->middleware, $newMiddleware);
+    }
+
+    /********************************************************************************
+    * Runner
+    *******************************************************************************/
+
+    /**
+     * Run
+     *
+     * This method invokes the middleware stack, including the core Slim application;
+     * the result is an array of HTTP status, header, and body. These three items
+     * are returned to the HTTP client.
+     */
+    public function run()
+    {
+        set_error_handler(array('\Slim\Slim', 'handleErrors'));
+
+        //Apply final outer middleware layers
+        if ($this->config('debug')) {
+            //Apply pretty exceptions only in debug to avoid accidental information leakage in production
+            $this->add(new \Slim\Middleware\PrettyExceptions());
+        }
+
+        //Invoke middleware and application stack
+        $this->middleware[0]->call();
+
+        //Fetch status, header, and body
+        list($status, $headers, $body) = $this->response->finalize();
+
+        // Serialize cookies (with optional encryption)
+        \Slim\Http\Util::serializeCookies($headers, $this->response->cookies, $this->settings);
+
+        //Send headers
+        if (headers_sent() === false) {
+            //Send status
+            if (strpos(PHP_SAPI, 'cgi') === 0) {
+                header(sprintf('Status: %s', \Slim\Http\Response::getMessageForCode($status)));
+            } else {
+                header(sprintf('HTTP/%s %s', $this->config('http.version'), \Slim\Http\Response::getMessageForCode($status)));
+            }
+
+            //Send headers
+            foreach ($headers as $name => $value) {
+                $hValues = explode("\n", $value);
+                foreach ($hValues as $hVal) {
+                    header("$name: $hVal", false);
+                }
+            }
+        }
+
+        //Send body, but only if it isn't a HEAD request
+        if (!$this->request->isHead()) {
+            echo $body;
+        }
+
+        $this->applyHook('slim.after');
+
+        restore_error_handler();
+    }
+
+    /**
+     * Call
+     *
+     * This method finds and iterates all route objects that match the current request URI.
+     */
+    public function call()
+    {
+        try {
+            if (isset($this->environment['slim.flash'])) {
+                $this->view()->setData('flash', $this->environment['slim.flash']);
+            }
+            $this->applyHook('slim.before');
+            ob_start();
+            $this->applyHook('slim.before.router');
+            $dispatched = false;
+            $matchedRoutes = $this->router->getMatchedRoutes($this->request->getMethod(), $this->request->getResourceUri());
+            foreach ($matchedRoutes as $route) {
+                try {
+                    $this->applyHook('slim.before.dispatch');
+                    $dispatched = $route->dispatch();
+                    $this->applyHook('slim.after.dispatch');
+                    if ($dispatched) {
+                        break;
+                    }
+                } catch (\Slim\Exception\Pass $e) {
+                    continue;
+                }
+            }
+            if (!$dispatched) {
+                $this->notFound();
+            }
+            $this->applyHook('slim.after.router');
+            $this->stop();
+        } catch (\Slim\Exception\Stop $e) {
+            $this->response()->write(ob_get_clean());
+        } catch (\Exception $e) {
+            if ($this->config('debug')) {
+                throw $e;
+            } else {
+                try {
+                    $this->response()->write(ob_get_clean());
+                    $this->error($e);
+                } catch (\Slim\Exception\Stop $e) {
+                    // Do nothing
+                }
+            }
+        }
+    }
+
+    /********************************************************************************
+    * Error Handling and Debugging
+    *******************************************************************************/
+
+    /**
+     * Convert errors into ErrorException objects
+     *
+     * This method catches PHP errors and converts them into \ErrorException objects;
+     * these \ErrorException objects are then thrown and caught by Slim's
+     * built-in or custom error handlers.
+     *
+     * @param  int            $errno   The numeric type of the Error
+     * @param  string         $errstr  The error message
+     * @param  string         $errfile The absolute path to the affected file
+     * @param  int            $errline The line number of the error in the affected file
+     * @return bool
+     * @throws \ErrorException
+     */
+    public static function handleErrors($errno, $errstr = '', $errfile = '', $errline = '')
+    {
+        if (!($errno & error_reporting())) {
+            return;
+        }
+
+        throw new \ErrorException($errstr, $errno, 0, $errfile, $errline);
+    }
+
+    /**
+     * Generate diagnostic template markup
+     *
+     * This method accepts a title and body content to generate an HTML document layout.
+     *
+     * @param  string   $title  The title of the HTML template
+     * @param  string   $body   The body content of the HTML template
+     * @return string
+     */
+    protected static function generateTemplateMarkup($title, $body)
+    {
+        return sprintf("<html><head><title>%s</title><style>body{margin:0;padding:30px;font:12px/1.5 Helvetica,Arial,Verdana,sans-serif;}h1{margin:0;font-size:48px;font-weight:normal;line-height:48px;}strong{display:inline-block;width:65px;}</style></head><body><h1>%s</h1>%s</body></html>", $title, $title, $body);
+    }
+
+    /**
+     * Default Not Found handler
+     */
+    protected function defaultNotFound()
+    {
+        echo static::generateTemplateMarkup('404 Page Not Found', '<p>The page you are looking for could not be found. Check the address bar to ensure your URL is spelled correctly. If all else fails, you can visit our home page at the link below.</p><a href="' . $this->request->getRootUri() . '/">Visit the Home Page</a>');
+    }
+
+    /**
+     * Default Error handler
+     */
+    protected function defaultError($e)
+    {
+        $this->getLog()->error($e);
+        echo self::generateTemplateMarkup('Error', '<p>A website error has occurred. The website administrator has been notified of the issue. Sorry for the temporary inconvenience.</p>');
+    }
+}
+
+<?php
+namespace GuzzleHttp;
+
+/**
+ * Key value pair collection object
+ */
+class Collection implements
+    \ArrayAccess,
+    \IteratorAggregate,
+    \Countable,
+    ToArrayInterface
+{
+    use HasDataTrait;
+
+    /**
+     * @param array $data Associative array of data to set
+     */
+    public function __construct(array $data = [])
+    {
+        $this->data = $data;
+    }
+
+    /**
+     * Create a new collection from an array, validate the keys, and add default
+     * values where missing
+     *
+     * @param array $config   Configuration values to apply.
+     * @param array $defaults Default parameters
+     * @param array $required Required parameter names
+     *
+     * @return self
+     * @throws \InvalidArgumentException if a parameter is missing
+     */
+    public static function fromConfig(
+        array $config = [],
+        array $defaults = [],
+        array $required = []
+    ) {
+        $data = $config + $defaults;
+
+        if ($missing = array_diff($required, array_keys($data))) {
+            throw new \InvalidArgumentException(
+                'Config is missing the following keys: ' .
+                implode(', ', $missing));
+        }
+
+        return new self($data);
+    }
+
+    /**
+     * Removes all key value pairs
+     */
+    public function clear()
+    {
+        $this->data = [];
+    }
+
+    /**
+     * Get a specific key value.
+     *
+     * @param string $key Key to retrieve.
+     *
+     * @return mixed|null Value of the key or NULL
+     */
+    public function get($key)
+    {
+        return isset($this->data[$key]) ? $this->data[$key] : null;
+    }
+
+    /**
+     * Set a key value pair
+     *
+     * @param string $key   Key to set
+     * @param mixed  $value Value to set
+     */
+    public function set($key, $value)
+    {
+        $this->data[$key] = $value;
+    }
+
+    /**
+     * Add a value to a key.  If a key of the same name has already been added,
+     * the key value will be converted into an array and the new value will be
+     * pushed to the end of the array.
+     *
+     * @param string $key   Key to add
+     * @param mixed  $value Value to add to the key
+     */
+    public function add($key, $value)
+    {
+        if (!array_key_exists($key, $this->data)) {
+            $this->data[$key] = $value;
+        } elseif (is_array($this->data[$key])) {
+            $this->data[$key][] = $value;
+        } else {
+            $this->data[$key] = array($this->data[$key], $value);
+        }
+    }
+
+    /**
+     * Remove a specific key value pair
+     *
+     * @param string $key A key to remove
+     */
+    public function remove($key)
+    {
+        unset($this->data[$key]);
+    }
+
+    /**
+     * Get all keys in the collection
+     *
+     * @return array
+     */
+    public function getKeys()
+    {
+        return array_keys($this->data);
+    }
+
+    /**
+     * Returns whether or not the specified key is present.
+     *
+     * @param string $key The key for which to check the existence.
+     *
+     * @return bool
+     */
+    public function hasKey($key)
+    {
+        return array_key_exists($key, $this->data);
+    }
+
+    /**
+     * Checks if any keys contains a certain value
+     *
+     * @param string $value Value to search for
+     *
+     * @return mixed Returns the key if the value was found FALSE if the value
+     *     was not found.
+     */
+    public function hasValue($value)
+    {
+        return array_search($value, $this->data, true);
+    }
+
+    /**
+     * Replace the data of the object with the value of an array
+     *
+     * @param array $data Associative array of data
+     */
+    public function replace(array $data)
+    {
+        $this->data = $data;
+    }
+
+    /**
+     * Add and merge in a Collection or array of key value pair data.
+     *
+     * @param Collection|array $data Associative array of key value pair data
+     */
+    public function merge($data)
+    {
+        foreach ($data as $key => $value) {
+            $this->add($key, $value);
+        }
+    }
+
+    /**
+     * Overwrite key value pairs in this collection with all of the data from
+     * an array or collection.
+     *
+     * @param array|\Traversable $data Values to override over this config
+     */
+    public function overwriteWith($data)
+    {
+        if (is_array($data)) {
+            $this->data = $data + $this->data;
+        } elseif ($data instanceof Collection) {
+            $this->data = $data->toArray() + $this->data;
+        } else {
+            foreach ($data as $key => $value) {
+                $this->data[$key] = $value;
+            }
+        }
+    }
+
+    /**
+     * Returns a Collection containing all the elements of the collection after
+     * applying the callback function to each one.
+     *
+     * The callable should accept three arguments:
+     * - (string) $key
+     * - (string) $value
+     * - (array) $context
+     *
+     * The callable must return a the altered or unaltered value.
+     *
+     * @param callable $closure Map function to apply
+     * @param array    $context Context to pass to the callable
+     *
+     * @return Collection
+     */
+    public function map(callable $closure, array $context = [])
+    {
+        $collection = new static();
+        foreach ($this as $key => $value) {
+            $collection[$key] = $closure($key, $value, $context);
+        }
+
+        return $collection;
+    }
+
+    /**
+     * Iterates over each key value pair in the collection passing them to the
+     * callable. If the callable returns true, the current value from input is
+     * returned into the result Collection.
+     *
+     * The callable must accept two arguments:
+     * - (string) $key
+     * - (string) $value
+     *
+     * @param callable $closure Evaluation function
+     *
+     * @return Collection
+     */
+    public function filter(callable $closure)
+    {
+        $collection = new static();
+        foreach ($this->data as $key => $value) {
+            if ($closure($key, $value)) {
+                $collection[$key] = $value;
+            }
+        }
+
+        return $collection;
+    }
+}
+
+<?php
+namespace GuzzleHttp\Message;
+
+/**
+ * Request and response parser used by Guzzle
+ */
+class MessageParser
+{
+    /**
+     * Parse an HTTP request message into an associative array of parts.
+     *
+     * @param string $message HTTP request to parse
+     *
+     * @return array|bool Returns false if the message is invalid
+     */
+    public function parseRequest($message)
+    {
+        if (!($parts = $this->parseMessage($message))) {
+            return false;
+        }
+
+        // Parse the protocol and protocol version
+        if (isset($parts['start_line'][2])) {
+            $startParts = explode('/', $parts['start_line'][2]);
+            $protocol = strtoupper($startParts[0]);
+            $version = isset($startParts[1]) ? $startParts[1] : '1.1';
+        } else {
+            $protocol = 'HTTP';
+            $version = '1.1';
+        }
+
+        $parsed = [
+            'method'   => strtoupper($parts['start_line'][0]),
+            'protocol' => $protocol,
+            'protocol_version' => $version,
+            'headers'  => $parts['headers'],
+            'body'     => $parts['body']
+        ];
+
+        $parsed['request_url'] = $this->getUrlPartsFromMessage(
+            (isset($parts['start_line'][1]) ? $parts['start_line'][1] : ''), $parsed);
+
+        return $parsed;
+    }
+
+    /**
+     * Parse an HTTP response message into an associative array of parts.
+     *
+     * @param string $message HTTP response to parse
+     *
+     * @return array|bool Returns false if the message is invalid
+     */
+    public function parseResponse($message)
+    {
+        if (!($parts = $this->parseMessage($message))) {
+            return false;
+        }
+
+        list($protocol, $version) = explode('/', trim($parts['start_line'][0]));
+
+        return [
+            'protocol'         => $protocol,
+            'protocol_version' => $version,
+            'code'             => $parts['start_line'][1],
+            'reason_phrase'    => isset($parts['start_line'][2]) ? $parts['start_line'][2] : '',
+            'headers'          => $parts['headers'],
+            'body'             => $parts['body']
+        ];
+    }
+
+    /**
+     * Parse a message into parts
+     *
+     * @param string $message Message to parse
+     *
+     * @return array|bool
+     */
+    private function parseMessage($message)
+    {
+        if (!$message) {
+            return false;
+        }
+
+        $startLine = null;
+        $headers = [];
+        $body = '';
+
+        // Iterate over each line in the message, accounting for line endings
+        $lines = preg_split('/(\\r?\\n)/', $message, -1, PREG_SPLIT_DELIM_CAPTURE);
+        for ($i = 0, $totalLines = count($lines); $i < $totalLines; $i += 2) {
+
+            $line = $lines[$i];
+
+            // If two line breaks were encountered, then this is the end of body
+            if (empty($line)) {
+                if ($i < $totalLines - 1) {
+                    $body = implode('', array_slice($lines, $i + 2));
+                }
+                break;
+            }
+
+            // Parse message headers
+            if (!$startLine) {
+                $startLine = explode(' ', $line, 3);
+            } elseif (strpos($line, ':')) {
+                $parts = explode(':', $line, 2);
+                $key = trim($parts[0]);
+                $value = isset($parts[1]) ? trim($parts[1]) : '';
+                if (!isset($headers[$key])) {
+                    $headers[$key] = $value;
+                } elseif (!is_array($headers[$key])) {
+                    $headers[$key] = [$headers[$key], $value];
+                } else {
+                    $headers[$key][] = $value;
+                }
+            }
+        }
+
+        return [
+            'start_line' => $startLine,
+            'headers'    => $headers,
+            'body'       => $body
+        ];
+    }
+
+    /**
+     * Create URL parts from HTTP message parts
+     *
+     * @param string $requestUrl Associated URL
+     * @param array  $parts      HTTP message parts
+     *
+     * @return array
+     */
+    private function getUrlPartsFromMessage($requestUrl, array $parts)
+    {
+        // Parse the URL information from the message
+        $urlParts = ['path' => $requestUrl, 'scheme' => 'http'];
+
+        // Check for the Host header
+        if (isset($parts['headers']['Host'])) {
+            $urlParts['host'] = $parts['headers']['Host'];
+        } elseif (isset($parts['headers']['host'])) {
+            $urlParts['host'] = $parts['headers']['host'];
+        } else {
+            $urlParts['host'] = null;
+        }
+
+        if (false === strpos($urlParts['host'], ':')) {
+            $urlParts['port'] = '';
+        } else {
+            $hostParts = explode(':', $urlParts['host']);
+            $urlParts['host'] = trim($hostParts[0]);
+            $urlParts['port'] = (int) trim($hostParts[1]);
+            if ($urlParts['port'] == 443) {
+                $urlParts['scheme'] = 'https';
+            }
+        }
+
+        // Check if a query is present
+        $path = $urlParts['path'];
+        $qpos = strpos($path, '?');
+        if ($qpos) {
+            $urlParts['query'] = substr($path, $qpos + 1);
+            $urlParts['path'] = substr($path, 0, $qpos);
+        } else {
+            $urlParts['query'] = '';
+        }
+
+        return $urlParts;
+    }
+}
+
+<?php
+/**
+ * CRequiredValidator class file.
+ *
+ * @author Qiang Xue <qiang.xue@gmail.com>
+ * @link http://www.yiiframework.com/
+ * @copyright 2008-2013 Yii Software LLC
+ * @license http://www.yiiframework.com/license/
+ */
+
+/**
+ * CRequiredValidator validates that the specified attribute does not have null or empty value.
+ *
+ * When using the {@link message} property to define a custom error message, the message
+ * may contain additional placeholders that will be replaced with the actual content. In addition
+ * to the "{attribute}" placeholder, recognized by all validators (see {@link CValidator}),
+ * CRequiredValidator allows for the following placeholders to be specified:
+ * <ul>
+ * <li>{value}: replaced with the desired value {@link requiredValue}.</li>
+ * </ul>
+ *
+ * @author Qiang Xue <qiang.xue@gmail.com>
+ * @package system.validators
+ * @since 1.0
+ */
+class CRequiredValidator extends CValidator
+{
+	/**
+	 * @var mixed the desired value that the attribute must have.
+	 * If this is null, the validator will validate that the specified attribute does not have null or empty value.
+	 * If this is set as a value that is not null, the validator will validate that
+	 * the attribute has a value that is the same as this property value.
+	 * Defaults to null.
+	 */
+	public $requiredValue;
+	/**
+	 * @var boolean whether the comparison to {@link requiredValue} is strict.
+	 * When this is true, the attribute value and type must both match those of {@link requiredValue}.
+	 * Defaults to false, meaning only the value needs to be matched.
+	 * This property is only used when {@link requiredValue} is not null.
+	 */
+	public $strict=false;
+	/**
+	 * @var boolean whether the value should be trimmed with php trim() function when comparing strings.
+	 * When set to false, the attribute value is not considered empty when it contains spaces.
+	 * Defaults to true, meaning the value will be trimmed.
+	 * @since 1.1.14
+	 */
+	public $trim=true;
+	/**
+	 * Validates the attribute of the object.
+	 * If there is any error, the error message is added to the object.
+	 * @param CModel $object the object being validated
+	 * @param string $attribute the attribute being validated
+	 */
+	protected function validateAttribute($object,$attribute)
+	{
+		$value=$object->$attribute;
+		if($this->requiredValue!==null)
+		{
+			if(!$this->strict && $value!=$this->requiredValue || $this->strict && $value!==$this->requiredValue)
+			{
+				$message=$this->message!==null?$this->message:Yii::t('yii','{attribute} must be {value}.',
+					array('{value}'=>$this->requiredValue));
+				$this->addError($object,$attribute,$message);
+			}
+		}
+		elseif($this->isEmpty($value,$this->trim))
+		{
+			$message=$this->message!==null?$this->message:Yii::t('yii','{attribute} cannot be blank.');
+			$this->addError($object,$attribute,$message);
+		}
+	}
+
+	/**
+	 * Returns the JavaScript needed for performing client-side validation.
+	 * @param CModel $object the data object being validated
+	 * @param string $attribute the name of the attribute to be validated.
+	 * @return string the client-side validation script.
+	 * @see CActiveForm::enableClientValidation
+	 * @since 1.1.7
+	 */
+	public function clientValidateAttribute($object,$attribute)
+	{
+		$message=$this->message;
+		if($this->requiredValue!==null)
+		{
+			if($message===null)
+				$message=Yii::t('yii','{attribute} must be {value}.');
+			$message=strtr($message, array(
+				'{value}'=>$this->requiredValue,
+				'{attribute}'=>$object->getAttributeLabel($attribute),
+			));
+			return "
+if(value!=" . CJSON::encode($this->requiredValue) . ") {
+	messages.push(".CJSON::encode($message).");
+}
+";
+		}
+		else
+		{
+			if($message===null)
+				$message=Yii::t('yii','{attribute} cannot be blank.');
+			$message=strtr($message, array(
+				'{attribute}'=>$object->getAttributeLabel($attribute),
+			));
+			if($this->trim)
+				$emptyCondition = "jQuery.trim(value)==''";
+			else
+				$emptyCondition = "value==''";
+			return "
+if({$emptyCondition}) {
+	messages.push(".CJSON::encode($message).");
+}
+";
+		}
+	}
+}
+
+<?php
+/**
+ * CModule class file.
+ *
+ * @author Qiang Xue <qiang.xue@gmail.com>
+ * @link http://www.yiiframework.com/
+ * @copyright 2008-2013 Yii Software LLC
+ * @license http://www.yiiframework.com/license/
+ */
+
+/**
+ * CModule is the base class for module and application classes.
+ *
+ * CModule mainly manages application components and sub-modules.
+ *
+ * @property string $id The module ID.
+ * @property string $basePath The root directory of the module. Defaults to the directory containing the module class.
+ * @property CAttributeCollection $params The list of user-defined parameters.
+ * @property string $modulePath The directory that contains the application modules. Defaults to the 'modules' subdirectory of {@link basePath}.
+ * @property CModule $parentModule The parent module. Null if this module does not have a parent.
+ * @property array $modules The configuration of the currently installed modules (module ID => configuration).
+ * @property array $components The application components (indexed by their IDs).
+ * @property array $import List of aliases to be imported.
+ * @property array $aliases List of aliases to be defined. The array keys are root aliases,
+ * while the array values are paths or aliases corresponding to the root aliases.
+ * For example,
+ * <pre>
+ * array(
+ *    'models'=>'application.models',              // an existing alias
+ *    'extensions'=>'application.extensions',      // an existing alias
+ *    'backend'=>dirname(__FILE__).'/../backend',  // a directory
+ * )
+ * </pre>.
+ *
+ * @author Qiang Xue <qiang.xue@gmail.com>
+ * @package system.base
+ */
+abstract class CModule extends CComponent
+{
+	/**
+	 * @var array the IDs of the application components that should be preloaded.
+	 */
+	public $preload=array();
+	/**
+	 * @var array the behaviors that should be attached to the module.
+	 * The behaviors will be attached to the module when {@link init} is called.
+	 * Please refer to {@link CModel::behaviors} on how to specify the value of this property.
+	 */
+	public $behaviors=array();
+
+	private $_id;
+	private $_parentModule;
+	private $_basePath;
+	private $_modulePath;
+	private $_params;
+	private $_modules=array();
+	private $_moduleConfig=array();
+	private $_components=array();
+	private $_componentConfig=array();
+
+
+	/**
+	 * Constructor.
+	 * @param string $id the ID of this module
+	 * @param CModule $parent the parent module (if any)
+	 * @param mixed $config the module configuration. It can be either an array or
+	 * the path of a PHP file returning the configuration array.
+	 */
+	public function __construct($id,$parent,$config=null)
+	{
+		$this->_id=$id;
+		$this->_parentModule=$parent;
+
+		// set basePath at early as possible to avoid trouble
+		if(is_string($config))
+			$config=require($config);
+		if(isset($config['basePath']))
+		{
+			$this->setBasePath($config['basePath']);
+			unset($config['basePath']);
+		}
+		Yii::setPathOfAlias($id,$this->getBasePath());
+
+		$this->preinit();
+
+		$this->configure($config);
+		$this->attachBehaviors($this->behaviors);
+		$this->preloadComponents();
+
+		$this->init();
+	}
+
+	/**
+	 * Getter magic method.
+	 * This method is overridden to support accessing application components
+	 * like reading module properties.
+	 * @param string $name application component or property name
+	 * @return mixed the named property value
+	 */
+	public function __get($name)
+	{
+		if($this->hasComponent($name))
+			return $this->getComponent($name);
+		else
+			return parent::__get($name);
+	}
+
+	/**
+	 * Checks if a property value is null.
+	 * This method overrides the parent implementation by checking
+	 * if the named application component is loaded.
+	 * @param string $name the property name or the event name
+	 * @return boolean whether the property value is null
+	 */
+	public function __isset($name)
+	{
+		if($this->hasComponent($name))
+			return $this->getComponent($name)!==null;
+		else
+			return parent::__isset($name);
+	}
+
+	/**
+	 * Returns the module ID.
+	 * @return string the module ID.
+	 */
+	public function getId()
+	{
+		return $this->_id;
+	}
+
+	/**
+	 * Sets the module ID.
+	 * @param string $id the module ID
+	 */
+	public function setId($id)
+	{
+		$this->_id=$id;
+	}
+
+	/**
+	 * Returns the root directory of the module.
+	 * @return string the root directory of the module. Defaults to the directory containing the module class.
+	 */
+	public function getBasePath()
+	{
+		if($this->_basePath===null)
+		{
+			$class=new ReflectionClass(get_class($this));
+			$this->_basePath=dirname($class->getFileName());
+		}
+		return $this->_basePath;
+	}
+
+	/**
+	 * Sets the root directory of the module.
+	 * This method can only be invoked at the beginning of the constructor.
+	 * @param string $path the root directory of the module.
+	 * @throws CException if the directory does not exist.
+	 */
+	public function setBasePath($path)
+	{
+		if(($this->_basePath=realpath($path))===false || !is_dir($this->_basePath))
+			throw new CException(Yii::t('yii','Base path "{path}" is not a valid directory.',
+				array('{path}'=>$path)));
+	}
+
+	/**
+	 * Returns user-defined parameters.
+	 * @return CAttributeCollection the list of user-defined parameters
+	 */
+	public function getParams()
+	{
+		if($this->_params!==null)
+			return $this->_params;
+		else
+		{
+			$this->_params=new CAttributeCollection;
+			$this->_params->caseSensitive=true;
+			return $this->_params;
+		}
+	}
+
+	/**
+	 * Sets user-defined parameters.
+	 * @param array $value user-defined parameters. This should be in name-value pairs.
+	 */
+	public function setParams($value)
+	{
+		$params=$this->getParams();
+		foreach($value as $k=>$v)
+			$params->add($k,$v);
+	}
+
+	/**
+	 * Returns the directory that contains the application modules.
+	 * @return string the directory that contains the application modules. Defaults to the 'modules' subdirectory of {@link basePath}.
+	 */
+	public function getModulePath()
+	{
+		if($this->_modulePath!==null)
+			return $this->_modulePath;
+		else
+			return $this->_modulePath=$this->getBasePath().DIRECTORY_SEPARATOR.'modules';
+	}
+
+	/**
+	 * Sets the directory that contains the application modules.
+	 * @param string $value the directory that contains the application modules.
+	 * @throws CException if the directory is invalid
+	 */
+	public function setModulePath($value)
+	{
+		if(($this->_modulePath=realpath($value))===false || !is_dir($this->_modulePath))
+			throw new CException(Yii::t('yii','The module path "{path}" is not a valid directory.',
+				array('{path}'=>$value)));
+	}
+
+	/**
+	 * Sets the aliases that are used in the module.
+	 * @param array $aliases list of aliases to be imported
+	 */
+	public function setImport($aliases)
+	{
+		foreach($aliases as $alias)
+			Yii::import($alias);
+	}
+
+	/**
+	 * Defines the root aliases.
+	 * @param array $mappings list of aliases to be defined. The array keys are root aliases,
+	 * while the array values are paths or aliases corresponding to the root aliases.
+	 * For example,
+	 * <pre>
+	 * array(
+	 *    'models'=>'application.models',              // an existing alias
+	 *    'extensions'=>'application.extensions',      // an existing alias
+	 *    'backend'=>dirname(__FILE__).'/../backend',  // a directory
+	 * )
+	 * </pre>
+	 */
+	public function setAliases($mappings)
+	{
+		foreach($mappings as $name=>$alias)
+		{
+			if(($path=Yii::getPathOfAlias($alias))!==false)
+				Yii::setPathOfAlias($name,$path);
+			else
+				Yii::setPathOfAlias($name,$alias);
+		}
+	}
+
+	/**
+	 * Returns the parent module.
+	 * @return CModule the parent module. Null if this module does not have a parent.
+	 */
+	public function getParentModule()
+	{
+		return $this->_parentModule;
+	}
+
+	/**
+	 * Retrieves the named application module.
+	 * The module has to be declared in {@link modules}. A new instance will be created
+	 * when calling this method with the given ID for the first time.
+	 * @param string $id application module ID (case-sensitive)
+	 * @return CModule the module instance, null if the module is disabled or does not exist.
+	 */
+	public function getModule($id)
+	{
+		if(isset($this->_modules[$id]) || array_key_exists($id,$this->_modules))
+			return $this->_modules[$id];
+		elseif(isset($this->_moduleConfig[$id]))
+		{
+			$config=$this->_moduleConfig[$id];
+			if(!isset($config['enabled']) || $config['enabled'])
+			{
+				Yii::trace("Loading \"$id\" module",'system.base.CModule');
+				$class=$config['class'];
+				unset($config['class'], $config['enabled']);
+				if($this===Yii::app())
+					$module=Yii::createComponent($class,$id,null,$config);
+				else
+					$module=Yii::createComponent($class,$this->getId().'/'.$id,$this,$config);
+				return $this->_modules[$id]=$module;
+			}
+		}
+	}
+
+	/**
+	 * Returns a value indicating whether the specified module is installed.
+	 * @param string $id the module ID
+	 * @return boolean whether the specified module is installed.
+	 * @since 1.1.2
+	 */
+	public function hasModule($id)
+	{
+		return isset($this->_moduleConfig[$id]) || isset($this->_modules[$id]);
+	}
+
+	/**
+	 * Returns the configuration of the currently installed modules.
+	 * @return array the configuration of the currently installed modules (module ID => configuration)
+	 */
+	public function getModules()
+	{
+		return $this->_moduleConfig;
+	}
+
+	/**
+	 * Configures the sub-modules of this module.
+	 *
+	 * Call this method to declare sub-modules and configure them with their initial property values.
+	 * The parameter should be an array of module configurations. Each array element represents a single module,
+	 * which can be either a string representing the module ID or an ID-configuration pair representing
+	 * a module with the specified ID and the initial property values.
+	 *
+	 * For example, the following array declares two modules:
+	 * <pre>
+	 * array(
+	 *     'admin',                // a single module ID
+	 *     'payment'=>array(       // ID-configuration pair
+	 *         'server'=>'paymentserver.com',
+	 *     ),
+	 * )
+	 * </pre>
+	 *
+	 * By default, the module class is determined using the expression <code>ucfirst($moduleID).'Module'</code>.
+	 * And the class file is located under <code>modules/$moduleID</code>.
+	 * You may override this default by explicitly specifying the 'class' option in the configuration.
+	 *
+	 * You may also enable or disable a module by specifying the 'enabled' option in the configuration.
+	 *
+	 * @param array $modules module configurations.
+	 * @param boolean $merge whether to merge the new module configuration
+	 * with the existing one. Defaults to true, meaning the previously registered
+	 * module configuration with the same ID will be merged with the new configuration.
+	 * If set to false, the existing configuration will be replaced completely.
+	 * This parameter is available since 1.1.16.
+	 */
+	public function setModules($modules,$merge=true)
+	{
+		foreach($modules as $id=>$module)
+		{
+			if(is_int($id))
+			{
+				$id=$module;
+				$module=array();
+			}
+			if(isset($this->_moduleConfig[$id]) && $merge)
+				$this->_moduleConfig[$id]=CMap::mergeArray($this->_moduleConfig[$id],$module);
+			else
+			{
+				if(!isset($module['class']))
+				{
+					if (Yii::getPathOfAlias($id)===false)
+						Yii::setPathOfAlias($id,$this->getModulePath().DIRECTORY_SEPARATOR.$id);
+					$module['class']=$id.'.'.ucfirst($id).'Module';
+				}
+				$this->_moduleConfig[$id]=$module;
+			}
+		}
+	}
+
+	/**
+	 * Checks whether the named component exists.
+	 * @param string $id application component ID
+	 * @return boolean whether the named application component exists (including both loaded and disabled.)
+	 */
+	public function hasComponent($id)
+	{
+		return isset($this->_components[$id]) || isset($this->_componentConfig[$id]);
+	}
+
+	/**
+	 * Retrieves the named application component.
+	 * @param string $id application component ID (case-sensitive)
+	 * @param boolean $createIfNull whether to create the component if it doesn't exist yet.
+	 * @return IApplicationComponent the application component instance, null if the application component is disabled or does not exist.
+	 * @see hasComponent
+	 */
+	public function getComponent($id,$createIfNull=true)
+	{
+		if(isset($this->_components[$id]))
+			return $this->_components[$id];
+		elseif(isset($this->_componentConfig[$id]) && $createIfNull)
+		{
+			$config=$this->_componentConfig[$id];
+			if(!isset($config['enabled']) || $config['enabled'])
+			{
+				Yii::trace("Loading \"$id\" application component",'system.CModule');
+				unset($config['enabled']);
+				$component=Yii::createComponent($config);
+				$component->init();
+				return $this->_components[$id]=$component;
+			}
+		}
+	}
+
+	/**
+	 * Puts a component under the management of the module.
+	 * The component will be initialized by calling its {@link CApplicationComponent::init() init()}
+	 * method if it has not done so.
+	 * @param string $id component ID
+	 * @param array|IApplicationComponent $component application component
+	 * (either configuration array or instance). If this parameter is null,
+	 * component will be unloaded from the module.
+	 * @param boolean $merge whether to merge the new component configuration
+	 * with the existing one. Defaults to true, meaning the previously registered
+	 * component configuration with the same ID will be merged with the new configuration.
+	 * If set to false, the existing configuration will be replaced completely.
+	 * This parameter is available since 1.1.13.
+	 */
+	public function setComponent($id,$component,$merge=true)
+	{
+		if($component===null)
+		{
+			unset($this->_components[$id]);
+			return;
+		}
+		elseif($component instanceof IApplicationComponent)
+		{
+			$this->_components[$id]=$component;
+
+			if(!$component->getIsInitialized())
+				$component->init();
+
+			return;
+		}
+		elseif(isset($this->_components[$id]))
+		{
+			if(isset($component['class']) && get_class($this->_components[$id])!==$component['class'])
+			{
+				unset($this->_components[$id]);
+				$this->_componentConfig[$id]=$component; //we should ignore merge here
+				return;
+			}
+
+			foreach($component as $key=>$value)
+			{
+				if($key!=='class')
+					$this->_components[$id]->$key=$value;
+			}
+		}
+		elseif(isset($this->_componentConfig[$id]['class'],$component['class'])
+			&& $this->_componentConfig[$id]['class']!==$component['class'])
+		{
+			$this->_componentConfig[$id]=$component; //we should ignore merge here
+			return;
+		}
+
+		if(isset($this->_componentConfig[$id]) && $merge)
+			$this->_componentConfig[$id]=CMap::mergeArray($this->_componentConfig[$id],$component);
+		else
+			$this->_componentConfig[$id]=$component;
+	}
+
+	/**
+	 * Returns the application components.
+	 * @param boolean $loadedOnly whether to return the loaded components only. If this is set false,
+	 * then all components specified in the configuration will be returned, whether they are loaded or not.
+	 * Loaded components will be returned as objects, while unloaded components as configuration arrays.
+	 * This parameter has been available since version 1.1.3.
+	 * @return array the application components (indexed by their IDs)
+	 */
+	public function getComponents($loadedOnly=true)
+	{
+		if($loadedOnly)
+			return $this->_components;
+		else
+			return array_merge($this->_componentConfig, $this->_components);
+	}
+
+	/**
+	 * Sets the application components.
+	 *
+	 * When a configuration is used to specify a component, it should consist of
+	 * the component's initial property values (name-value pairs). Additionally,
+	 * a component can be enabled (default) or disabled by specifying the 'enabled' value
+	 * in the configuration.
+	 *
+	 * If a configuration is specified with an ID that is the same as an existing
+	 * component or configuration, the existing one will be replaced silently.
+	 *
+	 * The following is the configuration for two components:
+	 * <pre>
+	 * array(
+	 *     'db'=>array(
+	 *         'class'=>'CDbConnection',
+	 *         'connectionString'=>'sqlite:path/to/file.db',
+	 *     ),
+	 *     'cache'=>array(
+	 *         'class'=>'CDbCache',
+	 *         'connectionID'=>'db',
+	 *         'enabled'=>!YII_DEBUG,  // enable caching in non-debug mode
+	 *     ),
+	 * )
+	 * </pre>
+	 *
+	 * @param array $components application components(id=>component configuration or instances)
+	 * @param boolean $merge whether to merge the new component configuration with the existing one.
+	 * Defaults to true, meaning the previously registered component configuration of the same ID
+	 * will be merged with the new configuration. If false, the existing configuration will be replaced completely.
+	 */
+	public function setComponents($components,$merge=true)
+	{
+		foreach($components as $id=>$component)
+			$this->setComponent($id,$component,$merge);
+	}
+
+	/**
+	 * Configures the module with the specified configuration.
+	 * @param array $config the configuration array
+	 */
+	public function configure($config)
+	{
+		if(is_array($config))
+		{
+			foreach($config as $key=>$value)
+				$this->$key=$value;
+		}
+	}
+
+	/**
+	 * Loads static application components.
+	 */
+	protected function preloadComponents()
+	{
+		foreach($this->preload as $id)
+			$this->getComponent($id);
+	}
+
+	/**
+	 * Preinitializes the module.
+	 * This method is called at the beginning of the module constructor.
+	 * You may override this method to do some customized preinitialization work.
+	 * Note that at this moment, the module is not configured yet.
+	 * @see init
+	 */
+	protected function preinit()
+	{
+	}
+
+	/**
+	 * Initializes the module.
+	 * This method is called at the end of the module constructor.
+	 * Note that at this moment, the module has been configured, the behaviors
+	 * have been attached and the application components have been registered.
+	 * @see preinit
+	 */
+	protected function init()
+	{
+	}
+}
+
+<?php
+/**
+ * Flexihash bundler.
+ * Bundles code required to use flexihash into a single PHP file.
+ *
+ * @author Paul Annesley
+ * @package Flexihash
+ * @licence http://www.opensource.org/licenses/mit-license.php
+ */
+
+error_reporting(E_ALL);
+ini_set('display_errors', true);
+
+require(dirname(__FILE__).'/../include/init.php');
+
+// ----------------------------------------
+
+// declaration-level dependencies first
+$classFiles = array(
+	'classes/Flexihash.php',
+	'classes/Flexihash/Hasher.php',
+	'classes/Flexihash/Crc32Hasher.php',
+	'classes/Flexihash/Md5Hasher.php',
+	'classes/Flexihash/Exception.php',
+);
+
+$baseDir = realpath(dirname(__FILE__).'/..');
+$classDir = "$baseDir/classes";
+$licenceFile = "$baseDir/LICENCE";
+$buildDir = "$baseDir/build";
+$outFile = "$buildDir/flexihash.php";
+
+// ----------------------------------------
+// set up build environment
+
+if (is_dir($buildDir))
+{
+	flexihash_build_log("Build directory exists: $buildDir");
+}
+else
+{
+	flexihash_build_log("Creating build directory: $buildDir");
+	mkdir($buildDir);
+}
+
+// ----------------------------------------
+// open bundle file, write header
+
+if (!$fpOut = fopen($outFile, 'w'))
+	throw new Exception("Unable to open file for writing: $outFile");
+
+flexihash_build_log("Writing header to $outFile");
+
+// Open PHP tag
+fwrite($fpOut, "<?php\n");
+
+// Main file docblock
+$docBlock = new Pda_Docblock();
+$docBlock
+	->setShortDescription('Flexihash - A simple consistent hashing implementation for PHP.')
+	->setLongDescription(trim(file_get_contents($licenceFile))."\n")
+	->addTag('author', 'Paul Annesley')
+	->addTag('link', 'http://paul.annesley.cc/')
+	->addTag('copyright', 'Paul Annesley, 2008')
+	;
+
+fwrite($fpOut, $docBlock);
+
+// counters
+$countFiles = 0;
+
+foreach ($classFiles as $classFile)
+{
+	$countFiles++;
+	flexihash_build_log("Adding $classFile...");
+
+	// open file, discard first line - PHP open tag
+	$fpIn = fopen($classFile, 'r');
+	fgets($fpIn);
+	while (!feof($fpIn)) fwrite($fpOut, fgets($fpIn));
+	fclose($fpIn);
+}
+
+$pos = ftell($fpOut);
+fclose($fpOut);
+
+flexihash_build_log("Bundled $pos bytes from $countFiles files into $outFile");
+
+
+// ----------------------------------------
+
+/**
+ * Logs a message to the console.
+ * @param string $message
+ */
+function flexihash_build_log($message)
+{
+	printf("%s\n", $message);
+}
+
+// ----------------------------------------
+// docblock helpers.
+// should probably move to a separate library.
+
+/**
+ * A block of PHPDoc documentation.
+ * @author Paul Annesley
+ * @licence http://www.opensource.org/licenses/mit-license.php
+ */
+class Pda_Docblock
+{
+
+	const DOCBLOCK_OPEN  = "/**\n";
+	const DOCBLOCK_BODY  = ' * ';
+	const DOCBLOCK_CLOSE = " */\n";
+	const DOCBLOCK_NEWLINE = "\n";
+	const DOCBLOCK_TAGSIGIL = '@';
+
+	private $_shortDescription;
+	private $_longDescription;
+	private $_tags = array();
+	private $_indent = '';
+
+	/**
+	 * The short description, up to three lines, terminated by a period.
+	 * @param string $shortDescription
+	 */
+	public function setShortDescription($shortDescription)
+	{
+		$this->_shortDescription = $shortDescription;
+		return $this;
+	}
+
+	/**
+	 * The long description, up to three lines, terminated by a period.
+	 * @param string $longDescription
+	 */
+	public function setLongDescription($longDescription)
+	{
+		$this->_longDescription = $longDescription;
+		return $this;
+	}
+
+	/**
+	 * @param string $name The name of the tag
+	 * @param string $value The value of the tag
+	 */
+	public function addTag($name, $value = '')
+	{
+		$this->_tags []= new Pda_Docblock_Tag($name, $value);
+		return $this;
+	}
+
+	/**
+	 * The indentation to apply when serializing, e.g. "\t\t"
+	 * @param string $indent
+	 */
+	public function setIndent($indent)
+	{
+		$this->_indent = $indent;
+		return $this;
+	}
+
+	/**
+	 * @return string
+	 */
+	public function serialize()
+	{
+		$i = $this->_indent;
+		$output = $i . self::DOCBLOCK_OPEN;
+
+		if (isset($this->_shortDescription))
+		{
+			// TODO: handle multi-line short descriptions
+			$output .= $i .
+				self::DOCBLOCK_BODY .
+				$this->_shortDescription .
+				self::DOCBLOCK_NEWLINE;
+		}
+
+		if (isset($this->_longDescription))
+		{
+			if (isset($this->_shortDescription))
+			{
+				// blank line between long & short descriptions
+				$output .= $i . self::DOCBLOCK_BODY . self::DOCBLOCK_NEWLINE;
+			}
+
+			// TODO: handle wrapping long lines to correct length.
+			$output .= $i .
+				self::DOCBLOCK_BODY .
+				preg_replace(
+					'#\n#',
+					self::DOCBLOCK_NEWLINE . $i . self::DOCBLOCK_BODY,
+					$this->_longDescription
+				) .
+				self::DOCBLOCK_NEWLINE;
+		}
+
+		foreach ($this->_tags as $tag)
+		{
+			// TODO: handle multi-line tag values
+			$output .= $i .
+				self::DOCBLOCK_BODY .
+				self::DOCBLOCK_TAGSIGIL .
+				$tag->getName() .
+				' ' .
+				$tag->getValue()  .
+				self::DOCBLOCK_NEWLINE;
+		}
+
+		$output .= $i . self::DOCBLOCK_CLOSE;
+
+		return $output;
+	}
+
+	/**
+	 * Alias for self::serialize()
+	 */
+	public function __toString()
+	{
+		return $this->serialize();
+	}
+
+}
+
+/**
+ * A tag in a block of PHPDoc documentation.
+ * @author Paul Annesley
+ * @licence http://www.opensource.org/licenses/mit-license.php
+ */
+class Pda_Docblock_Tag
+{
+	private $_name;
+	private $_value;
+
+	/**
+	 * @param string $name The name of the tag
+	 * @param string $value The value of the tag
+	 */
+	public function __construct($name, $value = '')
+	{
+		$this->_name = $name;
+		$this->_value = $value;
+	}
+
+	/**
+	 * The name of the tag
+	 * @return string
+	 */
+	public function getName()
+	{
+		return $this->_name;
+	}
+
+	/**
+	 * The value of the tag
+	 * @return string
+	 */
+	public function getValue()
+	{
+		return $this->_value;
+	}
+
+}
+
+<?php
+
+/*
+ * This file is part of Mustache.php.
+ *
+ * (c) 2010-2014 Justin Hileman
+ *
+ * For the full copyright and license information, please view the LICENSE
+ * file that was distributed with this source code.
+ */
+
+/**
+ * A Mustache Template cascading loader implementation, which delegates to other
+ * Loader instances.
+ */
+class Mustache_Loader_CascadingLoader implements Mustache_Loader
+{
+    private $loaders;
+
+    /**
+     * Construct a CascadingLoader with an array of loaders:
+     *
+     *     $loader = new Mustache_Loader_CascadingLoader(array(
+     *         new Mustache_Loader_InlineLoader(__FILE__, __COMPILER_HALT_OFFSET__),
+     *         new Mustache_Loader_FilesystemLoader(__DIR__.'/templates')
+     *     ));
+     *
+     * @param Mustache_Loader[] $loaders
+     */
+    public function __construct(array $loaders = array())
+    {
+        $this->loaders = array();
+        foreach ($loaders as $loader) {
+            $this->addLoader($loader);
+        }
+    }
+
+    /**
+     * Add a Loader instance.
+     *
+     * @param Mustache_Loader $loader
+     */
+    public function addLoader(Mustache_Loader $loader)
+    {
+        $this->loaders[] = $loader;
+    }
+
+    /**
+     * Load a Template by name.
+     *
+     * @throws Mustache_Exception_UnknownTemplateException If a template file is not found.
+     *
+     * @param string $name
+     *
+     * @return string Mustache Template source
+     */
+    public function load($name)
+    {
+        foreach ($this->loaders as $loader) {
+            try {
+                return $loader->load($name);
+            } catch (Mustache_Exception_UnknownTemplateException $e) {
+                // do nothing, check the next loader.
+            }
+        }
+
+        throw new Mustache_Exception_UnknownTemplateException($name);
+    }
+}
+
+<?php
+
+/*
+ * This file is part of Mustache.php.
+ *
+ * (c) 2010-2014 Justin Hileman
+ *
+ * For the full copyright and license information, please view the LICENSE
+ * file that was distributed with this source code.
+ */
+
+/**
+ * Mustache class autoloader.
+ */
+class Mustache_Autoloader
+{
+    private $baseDir;
+
+    /**
+     * Autoloader constructor.
+     *
+     * @param string $baseDir Mustache library base directory (default: dirname(__FILE__).'/..')
+     */
+    public function __construct($baseDir = null)
+    {
+        if ($baseDir === null) {
+            $baseDir = dirname(__FILE__).'/..';
+        }
+
+        // realpath doesn't always work, for example, with stream URIs
+        $realDir = realpath($baseDir);
+        if (is_dir($realDir)) {
+            $this->baseDir = $realDir;
+        } else {
+            $this->baseDir = $baseDir;
+        }
+    }
+
+    /**
+     * Register a new instance as an SPL autoloader.
+     *
+     * @param string $baseDir Mustache library base directory (default: dirname(__FILE__).'/..')
+     *
+     * @return Mustache_Autoloader Registered Autoloader instance
+     */
+    public static function register($baseDir = null)
+    {
+        $loader = new self($baseDir);
+        spl_autoload_register(array($loader, 'autoload'));
+
+        return $loader;
+    }
+
+    /**
+     * Autoload Mustache classes.
+     *
+     * @param string $class
+     */
+    public function autoload($class)
+    {
+        if ($class[0] === '\\') {
+            $class = substr($class, 1);
+        }
+
+        if (strpos($class, 'Mustache') !== 0) {
+            return;
+        }
+
+        $file = sprintf('%s/%s.php', $this->baseDir, str_replace('_', '/', $class));
+        if (is_file($file)) {
+            require $file;
+        }
+    }
+}
+
+<?php
+
+/*
+ * This file is part of Mustache.php.
+ *
+ * (c) 2010-2014 Justin Hileman
+ *
+ * For the full copyright and license information, please view the LICENSE
+ * file that was distributed with this source code.
+ */
+
+/**
+ * Abstract Mustache Template class.
+ *
+ * @abstract
+ */
+abstract class Mustache_Template
+{
+    /**
+     * @var Mustache_Engine
+     */
+    protected $mustache;
+
+    /**
+     * @var boolean
+     */
+    protected $strictCallables = false;
+
+    /**
+     * Mustache Template constructor.
+     *
+     * @param Mustache_Engine $mustache
+     */
+    public function __construct(Mustache_Engine $mustache)
+    {
+        $this->mustache = $mustache;
+    }
+
+    /**
+     * Mustache Template instances can be treated as a function and rendered by simply calling them:
+     *
+     *     $m = new Mustache_Engine;
+     *     $tpl = $m->loadTemplate('Hello, {{ name }}!');
+     *     echo $tpl(array('name' => 'World')); // "Hello, World!"
+     *
+     * @return string Rendered template
+     */
+    public function __invoke($context = array())
+    {
+        return $this->render($context);
+    }
+
+    /**
+     * Render this template given the rendering context.
+     *
+     * @param mixed $context Array or object rendering context (default: array())
+     *
+     * @return string Rendered template
+     */
+    public function render($context = array())
+    {
+        return $this->renderInternal(
+            $this->prepareContextStack($context)
+        );
+    }
+
+    /**
+     * Internal rendering method implemented by Mustache Template concrete subclasses.
+     *
+     * This is where the magic happens :)
+     *
+     * NOTE: This method is not part of the Mustache.php public API.
+     *
+     * @param Mustache_Context $context
+     * @param string           $indent  (default: '')
+     *
+     * @return string Rendered template
+     */
+    abstract public function renderInternal(Mustache_Context $context, $indent = '');
+
+    /**
+     * Tests whether a value should be iterated over (e.g. in a section context).
+     *
+     * @param mixed $value
+     *
+     * @return boolean True if the value is 'iterable'
+     */
+    protected function isIterable($value)
+    {
+        switch (gettype($value)) {
+            case 'object':
+                return $value instanceof Traversable;
+
+            case 'array':
+                $i = 0;
+                foreach ($value as $k => $v) {
+                    if ($k !== $i++) {
+                        return false;
+                    }
+                }
+
+                return true;
+
+            default:
+                return false;
+        }
+    }
+
+    /**
+     * Helper method to prepare the Context stack.
+     *
+     * Adds the Mustache HelperCollection to the stack's top context frame if helpers are present.
+     *
+     * @param mixed $context Optional first context frame (default: null)
+     *
+     * @return Mustache_Context
+     */
+    protected function prepareContextStack($context = null)
+    {
+        $stack = new Mustache_Context();
+
+        $helpers = $this->mustache->getHelpers();
+        if (!$helpers->isEmpty()) {
+            $stack->push($helpers);
+        }
+
+        if (!empty($context)) {
+            $stack->push($context);
+        }
+
+        return $stack;
+    }
+
+    /**
+     * Resolve a context value.
+     *
+     * Invoke the value if it is callable, otherwise return the value.
+     *
+     * @param mixed            $value
+     * @param Mustache_Context $context
+     * @param string           $indent
+     *
+     * @return string
+     */
+    protected function resolveValue($value, Mustache_Context $context, $indent = '')
+    {
+        if (($this->strictCallables ? is_object($value) : !is_string($value)) && is_callable($value)) {
+            return $this->mustache
+                ->loadLambda((string) call_user_func($value))
+                ->renderInternal($context, $indent);
+        }
+
+        return $value;
+    }
+}
+
+<?php
+
+namespace Intervention\Image;
+
+class Image extends File
+{
+    /**
+     * Instance of current image driver
+     *
+     * @var AbstractDriver
+     */
+    protected $driver;
+
+    /**
+     * Image resource/object of current image processor
+     *
+     * @var mixed
+     */
+    protected $core;
+
+    /**
+     * Array of Image resource backups of current image processor
+     *
+     * @var array
+     */
+    protected $backups = array();
+
+    /**
+     * Last image encoding result
+     *
+     * @var string
+     */
+    public $encoded = '';
+
+    /**
+     * Creates a new Image instance
+     *
+     * @param AbstractDriver $driver
+     * @param mixed  $core
+     */
+    public function __construct(AbstractDriver $driver = null, $core = null)
+    {
+        $this->driver = $driver;
+        $this->core = $core;
+    }
+
+    /**
+     * Magic method to catch all image calls
+     * usually any AbstractCommand
+     *
+     * @param  string $name
+     * @param  Array  $arguments
+     * @return mixed
+     */
+    public function __call($name, $arguments)
+    {
+        $command = $this->driver->executeCommand($this, $name, $arguments);
+        return $command->hasOutput() ? $command->getOutput() : $this;
+    }
+
+    /**
+     * Starts encoding of current image
+     *
+     * @param  string  $format
+     * @param  integer $quality
+     * @return \Intervention\Image\Image
+     */
+    public function encode($format = null, $quality = 90)
+    {
+        return $this->driver->encode($this, $format, $quality);
+    }
+
+    /**
+     * Saves encoded image in filesystem
+     *
+     * @param  string  $path
+     * @param  integer $quality
+     * @return \Intervention\Image\Image
+     */
+    public function save($path = null, $quality = null)
+    {
+        $path = is_null($path) ? $this->basePath() : $path;
+
+        if (is_null($path)) {
+            throw new Exception\NotWritableException(
+                "Can't write to undefined path."
+            );
+        }
+
+        $data = $this->encode(pathinfo($path, PATHINFO_EXTENSION), $quality);
+        $saved = @file_put_contents($path, $data);
+
+        if ($saved === false) {
+            throw new Exception\NotWritableException(
+                "Can't write image data to path ({$path})"
+            );
+        }
+
+        // set new file info
+        $this->setFileInfoFromPath($path);
+
+        return $this;
+    }
+
+    /**
+     * Runs a given filter on current image
+     *
+     * @param  FiltersFilterInterface $filter
+     * @return \Intervention\Image\Image
+     */
+    public function filter(Filters\FilterInterface $filter)
+    {
+        return $filter->applyFilter($this);
+    }
+
+    /**
+     * Returns current image driver
+     *
+     * @return \Intervention\Image\AbstractDriver
+     */
+    public function getDriver()
+    {
+        return $this->driver;
+    }
+
+    /**
+     * Sets current image driver
+     * @param AbstractDriver $driver
+     */
+    public function setDriver(AbstractDriver $driver)
+    {
+        $this->driver = $driver;
+
+        return $this;
+    }
+
+    /**
+     * Returns current image resource/obj
+     *
+     * @return mixed
+     */
+    public function getCore()
+    {
+        return $this->core;
+    }
+
+    /**
+     * Sets current image resource
+     *
+     * @param mixed $core
+     */
+    public function setCore($core)
+    {
+        $this->core = $core;
+
+        return $this;
+    }
+
+    /**
+     * Returns current image backup
+     *
+     * @param string $name
+     * @return mixed
+     */
+    public function getBackup($name = null)
+    {
+        $name = is_null($name) ? 'default' : $name;
+
+        if ( ! $this->backupExists($name)) {
+            throw new \Intervention\Image\Exception\RuntimeException(
+                "Backup with name ({$name}) not available. Call backup() before reset()."
+            );
+        }
+
+        return $this->backups[$name];
+    }
+
+    /**
+     * Returns all backups attached to image
+     *
+     * @return array
+     */
+    public function getBackups()
+    {
+        return $this->backups;
+    }
+
+    /**
+     * Sets current image backup
+     *
+     * @param mixed  $resource
+     * @param string $name
+     * @return self
+     */
+    public function setBackup($resource, $name = null)
+    {
+        $name = is_null($name) ? 'default' : $name;
+
+        $this->backups[$name] = $resource;
+
+        return $this;
+    }
+
+    /**
+     * Checks if named backup exists
+     *
+     * @param  string $name
+     * @return bool
+     */
+    private function backupExists($name)
+    {
+        return array_key_exists($name, $this->backups);
+    }
+
+    /**
+     * Checks if current image is already encoded
+     *
+     * @return boolean
+     */
+    public function isEncoded()
+    {
+        return ! is_null($this->encoded);
+    }
+
+    /**
+     * Returns encoded image data of current image
+     *
+     * @return string
+     */
+    public function getEncoded()
+    {
+        return $this->encoded;
+    }
+
+    /**
+     * Sets encoded image buffer
+     *
+     * @param string $value
+     */
+    public function setEncoded($value)
+    {
+        $this->encoded = $value;
+
+        return $this;
+    }
+
+    /**
+     * Calculates current image width
+     *
+     * @return integer
+     */
+    public function getWidth()
+    {
+        return $this->getSize()->width;
+    }
+
+    /**
+     * Alias of getWidth()
+     *
+     * @return integer
+     */
+    public function width()
+    {
+        return $this->getWidth();
+    }
+
+    /**
+     * Calculates current image height
+     *
+     * @return integer
+     */
+    public function getHeight()
+    {
+        return $this->getSize()->height;
+    }
+
+    /**
+     * Alias of getHeight
+     *
+     * @return integer
+     */
+    public function height()
+    {
+        return $this->getHeight();
+    }
+
+    /**
+     * Reads mime type
+     *
+     * @return string
+     */
+    public function mime()
+    {
+        return $this->mime;
+    }
+
+    /**
+     * Get fully qualified path to image
+     *
+     * @return string
+     */
+    public function basePath()
+    {
+        if ($this->dirname && $this->basename) {
+            return ($this->dirname .'/'. $this->basename);
+        }
+
+        return null;
+    }
+
+    /**
+     * Returns encoded image data in string conversion
+     *
+     * @return string
+     */
+    public function __toString()
+    {
+        return $this->encoded;
+    }
+
+    /**
+     * Cloning an image
+     */
+    public function __clone()
+    {
+        $this->core = $this->driver->cloneCore($this->core);
+    }
+}
+
+<?php
+
+namespace Intervention\Image;
+
+use Illuminate\Foundation\Application;
+use Illuminate\Support\ServiceProvider;
+
+class ImageServiceProvider extends ServiceProvider
+{
+    /**
+     * Indicates if loading of the provider is deferred.
+     *
+     * @var bool
+     */
+    protected $defer = false;
+
+    /**
+     * Actual provider
+     *
+     * @var \Illuminate\Support\ServiceProvider
+     */
+    protected $provider;
+
+    /**
+     * Create a new service provider instance.
+     *
+     * @param  \Illuminate\Contracts\Foundation\Application  $app
+     * @return void
+     */
+    public function __construct($app)
+    {
+        parent::__construct($app);
+
+        $this->provider = $this->getProvider();
+    }
+
+    /**
+     * Bootstrap the application events.
+     *
+     * @return void
+     */
+    public function boot()
+    {
+        return $this->provider->boot();
+    }
+
+    /**
+     * Register the service provider.
+     *
+     * @return void
+     */
+    public function register()
+    {
+        return $this->provider->register();
+    }
+
+    /**
+     * Return ServiceProvider according to Laravel version
+     *
+     * @return \Intervention\Image\Provider\ProviderInterface
+     */
+    private function getProvider()
+    {
+        if (version_compare(Application::VERSION, '5.0', '<')) {
+            $provider = '\Intervention\Image\ImageServiceProviderLaravel4';
+        } else {
+            $provider = '\Intervention\Image\ImageServiceProviderLaravel5';
+        }
+
+        return new $provider($this->app);
+    }
+
+    /**
+     * Get the services provided by the provider.
+     *
+     * @return array
+     */
+    public function provides()
+    {
+        return array('image');
+    }
+}
+
+<?php
+
+/*
+ * This file is part of the Monolog package.
+ *
+ * (c) Jordi Boggiano <j.boggiano@seld.be>
+ *
+ * For the full copyright and license information, please view the LICENSE
+ * file that was distributed with this source code.
+ */
+
+namespace Monolog\Formatter;
+
+/**
+ * Formats a record for use with the MongoDBHandler.
+ *
+ * @author Florian Plattner <me@florianplattner.de>
+ */
+class MongoDBFormatter implements FormatterInterface
+{
+    private $exceptionTraceAsString;
+    private $maxNestingLevel;
+
+    /**
+     * @param int  $maxNestingLevel        0 means infinite nesting, the $record itself is level 1, $record['context'] is 2
+     * @param bool $exceptionTraceAsString set to false to log exception traces as a sub documents instead of strings
+     */
+    public function __construct($maxNestingLevel = 3, $exceptionTraceAsString = true)
+    {
+        $this->maxNestingLevel = max($maxNestingLevel, 0);
+        $this->exceptionTraceAsString = (bool) $exceptionTraceAsString;
+    }
+
+    /**
+     * {@inheritDoc}
+     */
+    public function format(array $record)
+    {
+        return $this->formatArray($record);
+    }
+
+    /**
+     * {@inheritDoc}
+     */
+    public function formatBatch(array $records)
+    {
+        foreach ($records as $key => $record) {
+            $records[$key] = $this->format($record);
+        }
+
+        return $records;
+    }
+
+    protected function formatArray(array $record, $nestingLevel = 0)
+    {
+        if ($this->maxNestingLevel == 0 || $nestingLevel <= $this->maxNestingLevel) {
+            foreach ($record as $name => $value) {
+                if ($value instanceof \DateTime) {
+                    $record[$name] = $this->formatDate($value, $nestingLevel + 1);
+                } elseif ($value instanceof \Exception) {
+                    $record[$name] = $this->formatException($value, $nestingLevel + 1);
+                } elseif (is_array($value)) {
+                    $record[$name] = $this->formatArray($value, $nestingLevel + 1);
+                } elseif (is_object($value)) {
+                    $record[$name] = $this->formatObject($value, $nestingLevel + 1);
+                }
+            }
+        } else {
+            $record = '[...]';
+        }
+
+        return $record;
+    }
+
+    protected function formatObject($value, $nestingLevel)
+    {
+        $objectVars = get_object_vars($value);
+        $objectVars['class'] = get_class($value);
+
+        return $this->formatArray($objectVars, $nestingLevel);
+    }
+
+    protected function formatException(\Exception $exception, $nestingLevel)
+    {
+        $formattedException = array(
+            'class' => get_class($exception),
+            'message' => $exception->getMessage(),
+            'code' => $exception->getCode(),
+            'file' => $exception->getFile() . ':' . $exception->getLine(),
+        );
+
+        if ($this->exceptionTraceAsString === true) {
+            $formattedException['trace'] = $exception->getTraceAsString();
+        } else {
+            $formattedException['trace'] = $exception->getTrace();
+        }
+
+        return $this->formatArray($formattedException, $nestingLevel);
+    }
+
+    protected function formatDate(\DateTime $value, $nestingLevel)
+    {
+        return new \MongoDate($value->getTimestamp());
+    }
+}
+
+<?php
+
+/*
+ * This file is part of the Monolog package.
+ *
+ * (c) Jordi Boggiano <j.boggiano@seld.be>
+ *
+ * For the full copyright and license information, please view the LICENSE
+ * file that was distributed with this source code.
+ */
+
+namespace Monolog\Handler;
+
+use Monolog\Logger;
+
+/**
+ * Simple handler wrapper that filters records based on a list of levels
+ *
+ * It can be configured with an exact list of levels to allow, or a min/max level.
+ *
+ * @author Hennadiy Verkh
+ * @author Jordi Boggiano <j.boggiano@seld.be>
+ */
+class FilterHandler extends AbstractHandler
+{
+    /**
+     * Handler or factory callable($record, $this)
+     *
+     * @var callable|\Monolog\Handler\HandlerInterface
+     */
+    protected $handler;
+
+    /**
+     * Minimum level for logs that are passes to handler
+     *
+     * @var int[]
+     */
+    protected $acceptedLevels;
+
+    /**
+     * Whether the messages that are handled can bubble up the stack or not
+     *
+     * @var Boolean
+     */
+    protected $bubble;
+
+    /**
+     * @param callable|HandlerInterface $handler        Handler or factory callable($record, $this).
+     * @param int|array                 $minLevelOrList A list of levels to accept or a minimum level if maxLevel is provided
+     * @param int                       $maxLevel       Maximum level to accept, only used if $minLevelOrList is not an array
+     * @param Boolean                   $bubble         Whether the messages that are handled can bubble up the stack or not
+     */
+    public function __construct($handler, $minLevelOrList = Logger::DEBUG, $maxLevel = Logger::EMERGENCY, $bubble = true)
+    {
+        $this->handler  = $handler;
+        $this->bubble   = $bubble;
+        $this->setAcceptedLevels($minLevelOrList, $maxLevel);
+
+        if (!$this->handler instanceof HandlerInterface && !is_callable($this->handler)) {
+            throw new \RuntimeException("The given handler (".json_encode($this->handler).") is not a callable nor a Monolog\Handler\HandlerInterface object");
+        }
+    }
+
+    /**
+     * @return array
+     */
+    public function getAcceptedLevels()
+    {
+        return array_flip($this->acceptedLevels);
+    }
+
+    /**
+     * @param int|array $minLevelOrList A list of levels to accept or a minimum level if maxLevel is provided
+     * @param int       $maxLevel       Maximum level to accept, only used if $minLevelOrList is not an array
+     */
+    public function setAcceptedLevels($minLevelOrList = Logger::DEBUG, $maxLevel = Logger::EMERGENCY)
+    {
+        if (is_array($minLevelOrList)) {
+            $acceptedLevels = array_map('Monolog\Logger::toMonologLevel', $minLevelOrList);
+        } else {
+            $minLevelOrList = Logger::toMonologLevel($minLevelOrList);
+            $maxLevel = Logger::toMonologLevel($maxLevel);
+            $acceptedLevels = array_values(array_filter(Logger::getLevels(), function ($level) use ($minLevelOrList, $maxLevel) {
+                return $level >= $minLevelOrList && $level <= $maxLevel;
+            }));
+        }
+        $this->acceptedLevels = array_flip($acceptedLevels);
+    }
+
+    /**
+     * {@inheritdoc}
+     */
+    public function isHandling(array $record)
+    {
+        return isset($this->acceptedLevels[$record['level']]);
+    }
+
+    /**
+     * {@inheritdoc}
+     */
+    public function handle(array $record)
+    {
+        if (!$this->isHandling($record)) {
+            return false;
+        }
+
+        // The same logic as in FingersCrossedHandler
+        if (!$this->handler instanceof HandlerInterface) {
+            $this->handler = call_user_func($this->handler, $record, $this);
+            if (!$this->handler instanceof HandlerInterface) {
+                throw new \RuntimeException("The factory callable should return a HandlerInterface");
+            }
+        }
+
+        if ($this->processors) {
+            foreach ($this->processors as $processor) {
+                $record = call_user_func($processor, $record);
+            }
+        }
+
+        $this->handler->handle($record);
+
+        return false === $this->bubble;
+    }
+
+    /**
+     * {@inheritdoc}
+     */
+    public function handleBatch(array $records)
+    {
+        $filtered = array();
+        foreach ($records as $record) {
+            if ($this->isHandling($record)) {
+                $filtered[] = $record;
+            }
+        }
+
+        $this->handler->handleBatch($filtered);
+    }
+}
+
+<?php
+
+namespace React\Promise;
+
+class RejectedPromise implements ExtendedPromiseInterface, CancellablePromiseInterface
+{
+    private $reason;
+
+    public function __construct($reason = null)
+    {
+        if ($reason instanceof PromiseInterface) {
+            throw new \InvalidArgumentException('You cannot create React\Promise\RejectedPromise with a promise. Use React\Promise\reject($promiseOrValue) instead.');
+        }
+
+        $this->reason = $reason;
+    }
+
+    public function then(callable $onFulfilled = null, callable $onRejected = null, callable $onProgress = null)
+    {
+        try {
+            if (null === $onRejected) {
+                return new RejectedPromise($this->reason);
+            }
+
+            return resolve($onRejected($this->reason));
+        } catch (\Exception $exception) {
+            return new RejectedPromise($exception);
+        }
+    }
+
+    public function done(callable $onFulfilled = null, callable $onRejected = null, callable $onProgress = null)
+    {
+        if (null === $onRejected) {
+            throw UnhandledRejectionException::resolve($this->reason);
+        }
+
+        $result = $onRejected($this->reason);
+
+        if ($result instanceof self) {
+            throw UnhandledRejectionException::resolve($result->reason);
+        }
+
+        if ($result instanceof ExtendedPromiseInterface) {
+            $result->done();
+        }
+    }
+
+    public function otherwise(callable $onRejected)
+    {
+        if (!_checkTypehint($onRejected, $this->reason)) {
+            return new RejectedPromise($this->reason);
+        }
+
+        return $this->then(null, $onRejected);
+    }
+
+    public function always(callable $onFulfilledOrRejected)
+    {
+        return $this->then(null, function ($reason) use ($onFulfilledOrRejected) {
+            return resolve($onFulfilledOrRejected())->then(function () use ($reason) {
+                return new RejectedPromise($reason);
+            });
+        });
+    }
+
+    public function progress(callable $onProgress)
+    {
+        return new RejectedPromise($this->reason);
+    }
+
+    public function cancel()
+    {
+    }
+}
+
+<?php
+
+namespace React\Promise;
+
+function resolve($promiseOrValue = null)
+{
+    if (!$promiseOrValue instanceof PromiseInterface) {
+        return new FulfilledPromise($promiseOrValue);
+    }
+
+    if ($promiseOrValue instanceof ExtendedPromiseInterface) {
+        return $promiseOrValue;
+    }
+
+    return new Promise(function ($resolve, $reject, $notify) use ($promiseOrValue) {
+        $promiseOrValue->then($resolve, $reject, $notify);
+    });
+}
+
+function reject($promiseOrValue = null)
+{
+    if ($promiseOrValue instanceof PromiseInterface) {
+        return resolve($promiseOrValue)->then(function ($value) {
+            return new RejectedPromise($value);
+        });
+    }
+
+    return new RejectedPromise($promiseOrValue);
+}
+
+function all($promisesOrValues)
+{
+    return map($promisesOrValues, function ($val) {
+        return $val;
+    });
+}
+
+function race($promisesOrValues)
+{
+    return resolve($promisesOrValues)
+        ->then(function ($array) {
+            if (!is_array($array) || !$array) {
+                return resolve();
+            }
+
+            return new Promise(function ($resolve, $reject, $notify) use ($array) {
+                foreach ($array as $promiseOrValue) {
+                    resolve($promiseOrValue)
+                        ->done($resolve, $reject, $notify);
+                }
+            });
+        });
+}
+
+function any($promisesOrValues)
+{
+    return some($promisesOrValues, 1)
+        ->then(function ($val) {
+            return array_shift($val);
+        });
+}
+
+function some($promisesOrValues, $howMany)
+{
+    return resolve($promisesOrValues)
+        ->then(function ($array) use ($howMany) {
+            if (!is_array($array) || !$array || $howMany < 1) {
+                return resolve([]);
+            }
+
+            return new Promise(function ($resolve, $reject, $notify) use ($array, $howMany) {
+                $len       = count($array);
+                $toResolve = min($howMany, $len);
+                $toReject  = ($len - $toResolve) + 1;
+                $values    = [];
+                $reasons   = [];
+
+                foreach ($array as $i => $promiseOrValue) {
+                    $fulfiller = function ($val) use ($i, &$values, &$toResolve, $toReject, $resolve) {
+                        if ($toResolve < 1 || $toReject < 1) {
+                            return;
+                        }
+
+                        $values[$i] = $val;
+
+                        if (0 === --$toResolve) {
+                            $resolve($values);
+                        }
+                    };
+
+                    $rejecter = function ($reason) use ($i, &$reasons, &$toReject, $toResolve, $reject) {
+                        if ($toResolve < 1 || $toReject < 1) {
+                            return;
+                        }
+
+                        $reasons[$i] = $reason;
+
+                        if (0 === --$toReject) {
+                            $reject($reasons);
+                        }
+                    };
+
+                    resolve($promiseOrValue)
+                        ->done($fulfiller, $rejecter, $notify);
+                }
+            });
+        });
+}
+
+function map($promisesOrValues, callable $mapFunc)
+{
+    return resolve($promisesOrValues)
+        ->then(function ($array) use ($mapFunc) {
+            if (!is_array($array) || !$array) {
+                return resolve([]);
+            }
+
+            return new Promise(function ($resolve, $reject, $notify) use ($array, $mapFunc) {
+                $toResolve = count($array);
+                $values    = [];
+
+                foreach ($array as $i => $promiseOrValue) {
+                    resolve($promiseOrValue)
+                        ->then($mapFunc)
+                        ->done(
+                            function ($mapped) use ($i, &$values, &$toResolve, $resolve) {
+                                $values[$i] = $mapped;
+
+                                if (0 === --$toResolve) {
+                                    $resolve($values);
+                                }
+                            },
+                            $reject,
+                            $notify
+                        );
+                }
+            });
+        });
+}
+
+function reduce($promisesOrValues, callable $reduceFunc, $initialValue = null)
+{
+    return resolve($promisesOrValues)
+        ->then(function ($array) use ($reduceFunc, $initialValue) {
+            if (!is_array($array)) {
+                $array = [];
+            }
+
+            $total = count($array);
+            $i = 0;
+
+            // Wrap the supplied $reduceFunc with one that handles promises and then
+            // delegates to the supplied.
+            $wrappedReduceFunc = function ($current, $val) use ($reduceFunc, $total, &$i) {
+                return resolve($current)
+                    ->then(function ($c) use ($reduceFunc, $total, &$i, $val) {
+                        return resolve($val)
+                            ->then(function ($value) use ($reduceFunc, $total, &$i, $c) {
+                                return $reduceFunc($c, $value, $i++, $total);
+                            });
+                    });
+            };
+
+            return array_reduce($array, $wrappedReduceFunc, $initialValue);
+        });
+}
+
+// Internal functions
+function _checkTypehint(callable $callback, $object)
+{
+    if (!is_object($object)) {
+        return true;
+    }
+
+    if (is_array($callback)) {
+        $callbackReflection = new \ReflectionMethod($callback[0], $callback[1]);
+    } elseif (is_object($callback) && !$callback instanceof \Closure) {
+        $callbackReflection = new \ReflectionMethod($callback, '__invoke');
+    } else {
+        $callbackReflection = new \ReflectionFunction($callback);
+    }
+
+    $parameters = $callbackReflection->getParameters();
+
+    if (!isset($parameters[0])) {
+        return true;
+    }
+
+    $expectedException = $parameters[0];
+
+    if (!$expectedException->getClass()) {
+        return true;
+    }
+
+    return $expectedException->getClass()->isInstance($object);
+}
+
+<?php
+
+namespace React\Promise;
+
+class FulfilledPromise implements ExtendedPromiseInterface, CancellablePromiseInterface
+{
+    private $value;
+
+    public function __construct($value = null)
+    {
+        if ($value instanceof PromiseInterface) {
+            throw new \InvalidArgumentException('You cannot create React\Promise\FulfilledPromise with a promise. Use React\Promise\resolve($promiseOrValue) instead.');
+        }
+
+        $this->value = $value;
+    }
+
+    public function then(callable $onFulfilled = null, callable $onRejected = null, callable $onProgress = null)
+    {
+        try {
+            $value = $this->value;
+
+            if (null !== $onFulfilled) {
+                $value = $onFulfilled($value);
+            }
+
+            return resolve($value);
+        } catch (\Exception $exception) {
+            return new RejectedPromise($exception);
+        }
+    }
+
+    public function done(callable $onFulfilled = null, callable $onRejected = null, callable $onProgress = null)
+    {
+        if (null === $onFulfilled) {
+            return;
+        }
+
+        $result = $onFulfilled($this->value);
+
+        if ($result instanceof ExtendedPromiseInterface) {
+            $result->done();
+        }
+    }
+
+    public function otherwise(callable $onRejected)
+    {
+        return new FulfilledPromise($this->value);
+    }
+
+    public function always(callable $onFulfilledOrRejected)
+    {
+        return $this->then(function ($value) use ($onFulfilledOrRejected) {
+            return resolve($onFulfilledOrRejected())->then(function () use ($value) {
+                return $value;
+            });
+        });
+    }
+
+    public function progress(callable $onProgress)
+    {
+        return new FulfilledPromise($this->value);
+    }
+
+    public function cancel()
+    {
+    }
+}
+
+<?php
+
+/*
+ * This file is part of the Assetic package, an OpenSky project.
+ *
+ * (c) 2010-2014 OpenSky Project Inc
+ *
+ * For the full copyright and license information, please view the LICENSE
+ * file that was distributed with this source code.
+ */
+
+use Assetic\Factory\AssetFactory;
+use Assetic\Util\TraversableString;
+
+if (function_exists('assetic_init')) {
+    return;
+}
+
+/**
+ * Initializes the global Assetic object.
+ *
+ * @param AssetFactory $factory The asset factory
+ */
+function assetic_init(AssetFactory $factory)
+{
+    global $_assetic;
+
+    $_assetic = new stdClass();
+    $_assetic->factory = $factory;
+}
+
+/**
+ * Returns an array of javascript URLs.
+ *
+ * @param array|string $inputs  Input strings
+ * @param array|string $filters Filter names
+ * @param array        $options An array of options
+ *
+ * @return array An array of javascript URLs
+ */
+function assetic_javascripts($inputs = array(), $filters = array(), array $options = array())
+{
+    if (!isset($options['output'])) {
+        $options['output'] = 'js/*.js';
+    }
+
+    return _assetic_urls($inputs, $filters, $options);
+}
+
+/**
+ * Returns an array of stylesheet URLs.
+ *
+ * @param array|string $inputs  Input strings
+ * @param array|string $filters Filter names
+ * @param array        $options An array of options
+ *
+ * @return array An array of stylesheet URLs
+ */
+function assetic_stylesheets($inputs = array(), $filters = array(), array $options = array())
+{
+    if (!isset($options['output'])) {
+        $options['output'] = 'css/*.css';
+    }
+
+    return _assetic_urls($inputs, $filters, $options);
+}
+
+/**
+ * Returns an image URL.
+ *
+ * @param string       $input   An input
+ * @param array|string $filters Filter names
+ * @param array        $options An array of options
+ *
+ * @return string An image URL
+ */
+function assetic_image($input, $filters = array(), array $options = array())
+{
+    if (!isset($options['output'])) {
+        $options['output'] = 'images/*';
+    }
+
+    $urls = _assetic_urls($input, $filters, $options);
+
+    return current($urls);
+}
+
+/**
+ * Returns an array of asset urls.
+ *
+ * @param array|string $inputs  Input strings
+ * @param array|string $filters Filter names
+ * @param array        $options An array of options
+ *
+ * @return array An array of URLs
+ */
+function _assetic_urls($inputs = array(), $filters = array(), array $options = array())
+{
+    global $_assetic;
+
+    if (!is_array($inputs)) {
+        $inputs = array_filter(array_map('trim', explode(',', $inputs)));
+    }
+
+    if (!is_array($filters)) {
+        $filters = array_filter(array_map('trim', explode(',', $filters)));
+    }
+
+    $coll = $_assetic->factory->createAsset($inputs, $filters, $options);
+
+    $debug = isset($options['debug']) ? $options['debug'] : $_assetic->factory->isDebug();
+    $combine = isset($options['combine']) ? $options['combine'] : !$debug;
+
+    $one = $coll->getTargetPath();
+    if ($combine) {
+        $many = array($one);
+    } else {
+        $many = array();
+        foreach ($coll as $leaf) {
+            $many[] = $leaf->getTargetPath();
+        }
+    }
+
+    return new TraversableString($one, $many);
+}
+
+<?php
+
+/*
+ * This file is part of the Assetic package, an OpenSky project.
+ *
+ * (c) 2010-2014 OpenSky Project Inc
+ *
+ * For the full copyright and license information, please view the LICENSE
+ * file that was distributed with this source code.
+ */
+
+namespace Assetic\Extension\Twig;
+
+use Assetic\Asset\AssetInterface;
+
+class AsseticNode extends \Twig_Node
+{
+    /**
+     * Constructor.
+     *
+     * Available attributes:
+     *
+     *  * debug:    The debug mode
+     *  * combine:  Whether to combine assets
+     *  * var_name: The name of the variable to expose to the body node
+     *
+     * @param AssetInterface      $asset      The asset
+     * @param \Twig_NodeInterface $body       The body node
+     * @param array               $inputs     An array of input strings
+     * @param array               $filters    An array of filter strings
+     * @param string              $name       The name of the asset
+     * @param array               $attributes An array of attributes
+     * @param integer             $lineno     The line number
+     * @param string              $tag        The tag name
+     */
+    public function __construct(AssetInterface $asset, \Twig_NodeInterface $body, array $inputs, array $filters, $name, array $attributes = array(), $lineno = 0, $tag = null)
+    {
+        $nodes = array('body' => $body);
+
+        $attributes = array_replace(
+            array('debug' => null, 'combine' => null, 'var_name' => 'asset_url'),
+            $attributes,
+            array('asset' => $asset, 'inputs' => $inputs, 'filters' => $filters, 'name' => $name)
+        );
+
+        parent::__construct($nodes, $attributes, $lineno, $tag);
+    }
+
+    public function compile(\Twig_Compiler $compiler)
+    {
+        $compiler->addDebugInfo($this);
+
+        $combine = $this->getAttribute('combine');
+        $debug = $this->getAttribute('debug');
+
+        if (null === $combine && null !== $debug) {
+            $combine = !$debug;
+        }
+
+        if (null === $combine) {
+            $compiler
+                ->write("if (isset(\$context['assetic']['debug']) && \$context['assetic']['debug']) {\n")
+                ->indent()
+            ;
+
+            $this->compileDebug($compiler);
+
+            $compiler
+                ->outdent()
+                ->write("} else {\n")
+                ->indent()
+            ;
+
+            $this->compileAsset($compiler, $this->getAttribute('asset'), $this->getAttribute('name'));
+
+            $compiler
+                ->outdent()
+                ->write("}\n")
+            ;
+        } elseif ($combine) {
+            $this->compileAsset($compiler, $this->getAttribute('asset'), $this->getAttribute('name'));
+        } else {
+            $this->compileDebug($compiler);
+        }
+
+        $compiler
+            ->write('unset($context[')
+            ->repr($this->getAttribute('var_name'))
+            ->raw("]);\n")
+        ;
+    }
+
+    protected function compileDebug(\Twig_Compiler $compiler)
+    {
+        $i = 0;
+        foreach ($this->getAttribute('asset') as $leaf) {
+            $leafName = $this->getAttribute('name').'_'.$i++;
+            $this->compileAsset($compiler, $leaf, $leafName);
+        }
+    }
+
+    protected function compileAsset(\Twig_Compiler $compiler, AssetInterface $asset, $name)
+    {
+        if ($vars = $asset->getVars()) {
+            $compiler->write("// check variable conditions\n");
+
+            foreach ($vars as $var) {
+                $compiler
+                    ->write("if (!isset(\$context['assetic']['vars']['$var'])) {\n")
+                    ->indent()
+                    ->write("throw new \RuntimeException(sprintf('The asset \"".$name."\" expected variable \"".$var."\" to be set, but got only these vars: %s. Did you set-up a value supplier?', isset(\$context['assetic']['vars']) && \$context['assetic']['vars'] ? implode(', ', \$context['assetic']['vars']) : '# none #'));\n")
+                    ->outdent()
+                    ->write("}\n")
+                ;
+            }
+
+            $compiler->raw("\n");
+        }
+
+        $compiler
+            ->write("// asset \"$name\"\n")
+            ->write('$context[')
+            ->repr($this->getAttribute('var_name'))
+            ->raw('] = ')
+        ;
+
+        $this->compileAssetUrl($compiler, $asset, $name);
+
+        $compiler
+            ->raw(";\n")
+            ->subcompile($this->getNode('body'))
+        ;
+    }
+
+    protected function compileAssetUrl(\Twig_Compiler $compiler, AssetInterface $asset, $name)
+    {
+        if (!$vars = $asset->getVars()) {
+            $compiler->repr($asset->getTargetPath());
+
+            return;
+        }
+
+        $compiler
+            ->raw("strtr(")
+            ->string($asset->getTargetPath())
+            ->raw(", array(");
+
+        $first = true;
+        foreach ($vars as $var) {
+            if (!$first) {
+                $compiler->raw(", ");
+            }
+            $first = false;
+
+            $compiler
+                ->string("{".$var."}")
+                ->raw(" => \$context['assetic']['vars']['$var']")
+            ;
+        }
+
+        $compiler
+            ->raw("))")
+        ;
+    }
+}
+
+<?php
+
+/*
+ * This file is part of the Assetic package, an OpenSky project.
+ *
+ * (c) 2010-2014 OpenSky Project Inc
+ *
+ * For the full copyright and license information, please view the LICENSE
+ * file that was distributed with this source code.
+ */
+
+namespace Assetic\Asset;
+
+use Assetic\Filter\FilterInterface;
+use Assetic\Util\VarUtils;
+
+/**
+ * Represents an asset loaded via an HTTP request.
+ *
+ * @author Kris Wallsmith <kris.wallsmith@gmail.com>
+ */
+class HttpAsset extends BaseAsset
+{
+    private $sourceUrl;
+    private $ignoreErrors;
+
+    /**
+     * Constructor.
+     *
+     * @param string  $sourceUrl    The source URL
+     * @param array   $filters      An array of filters
+     * @param Boolean $ignoreErrors
+     * @param array   $vars
+     *
+     * @throws \InvalidArgumentException If the first argument is not an URL
+     */
+    public function __construct($sourceUrl, $filters = array(), $ignoreErrors = false, array $vars = array())
+    {
+        if (0 === strpos($sourceUrl, '//')) {
+            $sourceUrl = 'http:'.$sourceUrl;
+        } elseif (false === strpos($sourceUrl, '://')) {
+            throw new \InvalidArgumentException(sprintf('"%s" is not a valid URL.', $sourceUrl));
+        }
+
+        $this->sourceUrl = $sourceUrl;
+        $this->ignoreErrors = $ignoreErrors;
+
+        list($scheme, $url) = explode('://', $sourceUrl, 2);
+        list($host, $path) = explode('/', $url, 2);
+
+        parent::__construct($filters, $scheme.'://'.$host, $path, $vars);
+    }
+
+    public function load(FilterInterface $additionalFilter = null)
+    {
+        $content = @file_get_contents(
+            VarUtils::resolve($this->sourceUrl, $this->getVars(), $this->getValues())
+        );
+
+        if (false === $content && !$this->ignoreErrors) {
+            throw new \RuntimeException(sprintf('Unable to load asset from URL "%s"', $this->sourceUrl));
+        }
+
+        $this->doLoad($content, $additionalFilter);
+    }
+
+    public function getLastModified()
+    {
+        if (false !== @file_get_contents($this->sourceUrl, false, stream_context_create(array('http' => array('method' => 'HEAD'))))) {
+            foreach ($http_response_header as $header) {
+                if (0 === stripos($header, 'Last-Modified: ')) {
+                    list(, $mtime) = explode(':', $header, 2);
+
+                    return strtotime(trim($mtime));
+                }
+            }
+        }
+    }
+}
+
+<?php
+
+/*
+ * This file is part of the Silex framework.
+ *
+ * (c) Fabien Potencier <fabien@symfony.com>
+ *
+ * For the full copyright and license information, please view the LICENSE
+ * file that was distributed with this source code.
+ */
+
+namespace Silex\Application;
+
+use Symfony\Component\Security\Core\Authentication\Token\TokenInterface;
+use Symfony\Component\Security\Core\User\UserInterface;
+
+/**
+ * Security trait.
+ *
+ * @author Fabien Potencier <fabien@symfony.com>
+ */
+trait SecurityTrait
+{
+    /**
+     * Gets a user from the Security Context.
+     *
+     * @return mixed
+     *
+     * @see TokenInterface::getUser()
+     */
+    public function user()
+    {
+        if (null === $token = $this['security']->getToken()) {
+            return;
+        }
+
+        if (!is_object($user = $token->getUser())) {
+            return;
+        }
+
+        return $user;
+    }
+
+    /**
+     * Encodes the raw password.
+     *
+     * @param UserInterface $user     A UserInterface instance
+     * @param string        $password The password to encode
+     *
+     * @return string The encoded password
+     *
+     * @throws \RuntimeException when no password encoder could be found for the user
+     */
+    public function encodePassword(UserInterface $user, $password)
+    {
+        return $this['security.encoder_factory']->getEncoder($user)->encodePassword($password, $user->getSalt());
+    }
+}
+
+<?php
+
+/*
+ * This file is part of the Silex framework.
+ *
+ * (c) Fabien Potencier <fabien@symfony.com>
+ *
+ * For the full copyright and license information, please view the LICENSE
+ * file that was distributed with this source code.
+ */
+
+namespace Silex\Application;
+
+use Symfony\Component\HttpFoundation\Response;
+use Symfony\Component\HttpFoundation\StreamedResponse;
+
+/**
+ * Twig trait.
+ *
+ * @author Fabien Potencier <fabien@symfony.com>
+ */
+trait TwigTrait
+{
+    /**
+     * Renders a view and returns a Response.
+     *
+     * To stream view, pass an instance
+     *
+     * @return Response A Response instance
+     */
+    public function render($view, array $parameters = array(), Response $response = null)
+    {
+        $twig = $this['twig'];
+
+        if ($response instanceof StreamedResponse) {
+            $response->setCallback(function () use ($twig, $view, $parameters) {
+                $twig->display($view, $parameters);
+            });
+        } else {
+            if (null === $response) {
+                $response = new Response();
+            }
+            $response->setContent($twig->render($view, $parameters));
+        }
+
+        return $response;
+    }
+
+    /**
+     * Renders a view.
+     *
+     * @param string $view       The view name
+     * @param array  $parameters An array of parameters to pass to the view
+     *
+     * @return Response A Response instance
+     */
+    public function renderView($view, array $parameters = array())
+    {
+        return $this['twig']->render($view, $parameters);
+    }
+}
+
+<?php
+
+/*
+ * This file is part of the Silex framework.
+ *
+ * (c) Fabien Potencier <fabien@symfony.com>
+ *
+ * For the full copyright and license information, please view the LICENSE
+ * file that was distributed with this source code.
+ */
+
+namespace Silex\Provider;
+
+use Silex\Application;
+use Silex\ServiceProviderInterface;
+
+/**
+ * Swiftmailer Provider.
+ *
+ * @author Fabien Potencier <fabien@symfony.com>
+ */
+class SwiftmailerServiceProvider implements ServiceProviderInterface
+{
+    public function register(Application $app)
+    {
+        $app['swiftmailer.options'] = array();
+        $app['swiftmailer.use_spool'] = true;
+
+        $app['mailer.initialized'] = false;
+
+        $app['mailer'] = $app->share(function ($app) {
+            $app['mailer.initialized'] = true;
+            $transport = $app['swiftmailer.use_spool'] ? $app['swiftmailer.spooltransport'] : $app['swiftmailer.transport'];
+
+            return new \Swift_Mailer($transport);
+        });
+
+        $app['swiftmailer.spooltransport'] = $app->share(function ($app) {
+            return new \Swift_Transport_SpoolTransport($app['swiftmailer.transport.eventdispatcher'], $app['swiftmailer.spool']);
+        });
+
+        $app['swiftmailer.spool'] = $app->share(function ($app) {
+            return new \Swift_MemorySpool();
+        });
+
+        $app['swiftmailer.transport'] = $app->share(function ($app) {
+            $transport = new \Swift_Transport_EsmtpTransport(
+                $app['swiftmailer.transport.buffer'],
+                array($app['swiftmailer.transport.authhandler']),
+                $app['swiftmailer.transport.eventdispatcher']
+            );
+
+            $options = $app['swiftmailer.options'] = array_replace(array(
+                'host'       => 'localhost',
+                'port'       => 25,
+                'username'   => '',
+                'password'   => '',
+                'encryption' => null,
+                'auth_mode'  => null,
+            ), $app['swiftmailer.options']);
+
+            $transport->setHost($options['host']);
+            $transport->setPort($options['port']);
+            $transport->setEncryption($options['encryption']);
+            $transport->setUsername($options['username']);
+            $transport->setPassword($options['password']);
+            $transport->setAuthMode($options['auth_mode']);
+
+            return $transport;
+        });
+
+        $app['swiftmailer.transport.buffer'] = $app->share(function () {
+            return new \Swift_Transport_StreamBuffer(new \Swift_StreamFilters_StringReplacementFilterFactory());
+        });
+
+        $app['swiftmailer.transport.authhandler'] = $app->share(function () {
+            return new \Swift_Transport_Esmtp_AuthHandler(array(
+                new \Swift_Transport_Esmtp_Auth_CramMd5Authenticator(),
+                new \Swift_Transport_Esmtp_Auth_LoginAuthenticator(),
+                new \Swift_Transport_Esmtp_Auth_PlainAuthenticator(),
+            ));
+        });
+
+        $app['swiftmailer.transport.eventdispatcher'] = $app->share(function () {
+            return new \Swift_Events_SimpleEventDispatcher();
+        });
+    }
+
+    public function boot(Application $app)
+    {
+        $app->finish(function () use ($app) {
+            // To speed things up (by avoiding Swift Mailer initialization), flush
+            // messages only if our mailer has been created (potentially used)
+            if ($app['mailer.initialized']) {
+                $app['swiftmailer.spooltransport']->getSpool()->flushQueue($app['swiftmailer.transport']);
+            }
+        });
+    }
+}
+
+<?php
+
+/*
+ * This file is part of the Silex framework.
+ *
+ * (c) Fabien Potencier <fabien@symfony.com>
+ *
+ * For the full copyright and license information, please view the LICENSE
+ * file that was distributed with this source code.
+ */
+
+namespace Silex\Provider;
+
+use Silex\Application;
+use Silex\ServiceProviderInterface;
+use Symfony\Component\Security\Core\Authentication\Provider\RememberMeAuthenticationProvider;
+use Symfony\Component\Security\Http\Firewall\RememberMeListener;
+use Symfony\Component\Security\Http\RememberMe\TokenBasedRememberMeServices;
+use Symfony\Component\Security\Http\RememberMe\ResponseListener;
+
+/**
+ * Remember-me authentication for the SecurityServiceProvider
+ *
+ * @author Jérôme Tamarelle <jerome@tamarelle.net>
+ */
+class RememberMeServiceProvider implements ServiceProviderInterface
+{
+    public function register(Application $app)
+    {
+        $app['security.remember_me.response_listener'] = $app->share(function () {
+            return new ResponseListener();
+        });
+
+        $app['security.authentication_listener.factory.remember_me'] = $app->protect(function ($name, $options) use ($app) {
+            if (empty($options['key'])) {
+                $options['key'] = $name;
+            }
+
+            if (!isset($app['security.remember_me.service.'.$name])) {
+                $app['security.remember_me.service.'.$name] = $app['security.remember_me.service._proto']($name, $options);
+            }
+
+            if (!isset($app['security.authentication_listener.'.$name.'.remember_me'])) {
+                $app['security.authentication_listener.'.$name.'.remember_me'] = $app['security.authentication_listener.remember_me._proto']($name, $options);
+            }
+
+            if (!isset($app['security.authentication_provider.'.$name.'.remember_me'])) {
+                $app['security.authentication_provider.'.$name.'.remember_me'] = $app['security.authentication_provider.remember_me._proto']($name, $options);
+            }
+
+            return array(
+                'security.authentication_provider.'.$name.'.remember_me',
+                'security.authentication_listener.'.$name.'.remember_me',
+                null, // entry point
+                'remember_me',
+            );
+        });
+
+        $app['security.remember_me.service._proto'] = $app->protect(function ($providerKey, $options) use ($app) {
+            return $app->share(function () use ($providerKey, $options, $app) {
+                $options = array_replace(array(
+                    'name'                  => 'REMEMBERME',
+                    'lifetime'              => 31536000,
+                    'path'                  => '/',
+                    'domain'                => null,
+                    'secure'                => false,
+                    'httponly'              => true,
+                    'always_remember_me'    => false,
+                    'remember_me_parameter' => '_remember_me',
+                ), $options);
+
+                return new TokenBasedRememberMeServices(array($app['security.user_provider.'.$providerKey]), $options['key'], $providerKey, $options, $app['logger']);
+            });
+        });
+
+        $app['security.authentication_listener.remember_me._proto'] = $app->protect(function ($providerKey) use ($app) {
+            return $app->share(function () use ($app, $providerKey) {
+                $listener = new RememberMeListener(
+                    $app['security'],
+                    $app['security.remember_me.service.'.$providerKey],
+                    $app['security.authentication_manager'],
+                    $app['logger'],
+                    $app['dispatcher']
+                );
+
+                return $listener;
+            });
+        });
+
+        $app['security.authentication_provider.remember_me._proto'] = $app->protect(function ($name, $options) use ($app) {
+            return $app->share(function () use ($app, $name, $options) {
+                return new RememberMeAuthenticationProvider($app['security.user_checker'], $options['key'], $name);
+            });
+        });
+    }
+
+    public function boot(Application $app)
+    {
+        if (!isset($app['security'])) {
+            throw new \LogicException('You must register the SecurityServiceProvider to use the RememberMeServiceProvider');
+        }
+
+        $app['dispatcher']->addSubscriber($app['security.remember_me.response_listener']);
+    }
+}
