@@ -1,0 +1,6126 @@
+
+/**
+ * Module dependencies.
+ */
+
+var EventEmitter = require('events').EventEmitter;
+var spawn = require('child_process').spawn;
+var readlink = require('graceful-readlink').readlinkSync;
+var path = require('path');
+var dirname = path.dirname;
+var basename = path.basename;
+var fs = require('fs');
+
+/**
+ * Expose the root command.
+ */
+
+exports = module.exports = new Command();
+
+/**
+ * Expose `Command`.
+ */
+
+exports.Command = Command;
+
+/**
+ * Expose `Option`.
+ */
+
+exports.Option = Option;
+
+/**
+ * Initialize a new `Option` with the given `flags` and `description`.
+ *
+ * @param {String} flags
+ * @param {String} description
+ * @api public
+ */
+
+function Option(flags, description) {
+  this.flags = flags;
+  this.required = ~flags.indexOf('<');
+  this.optional = ~flags.indexOf('[');
+  this.bool = !~flags.indexOf('-no-');
+  flags = flags.split(/[ ,|]+/);
+  if (flags.length > 1 && !/^[[<]/.test(flags[1])) this.short = flags.shift();
+  this.long = flags.shift();
+  this.description = description || '';
+}
+
+/**
+ * Return option name.
+ *
+ * @return {String}
+ * @api private
+ */
+
+Option.prototype.name = function() {
+  return this.long
+    .replace('--', '')
+    .replace('no-', '');
+};
+
+/**
+ * Check if `arg` matches the short or long flag.
+ *
+ * @param {String} arg
+ * @return {Boolean}
+ * @api private
+ */
+
+Option.prototype.is = function(arg) {
+  return arg == this.short || arg == this.long;
+};
+
+/**
+ * Initialize a new `Command`.
+ *
+ * @param {String} name
+ * @api public
+ */
+
+function Command(name) {
+  this.commands = [];
+  this.options = [];
+  this._execs = [];
+  this._allowUnknownOption = false;
+  this._args = [];
+  this._name = name;
+}
+
+/**
+ * Inherit from `EventEmitter.prototype`.
+ */
+
+Command.prototype.__proto__ = EventEmitter.prototype;
+
+/**
+ * Add command `name`.
+ *
+ * The `.action()` callback is invoked when the
+ * command `name` is specified via __ARGV__,
+ * and the remaining arguments are applied to the
+ * function for access.
+ *
+ * When the `name` is "*" an un-matched command
+ * will be passed as the first arg, followed by
+ * the rest of __ARGV__ remaining.
+ *
+ * Examples:
+ *
+ *      program
+ *        .version('0.0.1')
+ *        .option('-C, --chdir <path>', 'change the working directory')
+ *        .option('-c, --config <path>', 'set config path. defaults to ./deploy.conf')
+ *        .option('-T, --no-tests', 'ignore test hook')
+ *
+ *      program
+ *        .command('setup')
+ *        .description('run remote setup commands')
+ *        .action(function() {
+ *          console.log('setup');
+ *        });
+ *
+ *      program
+ *        .command('exec <cmd>')
+ *        .description('run the given remote command')
+ *        .action(function(cmd) {
+ *          console.log('exec "%s"', cmd);
+ *        });
+ *
+ *      program
+ *        .command('teardown <dir> [otherDirs...]')
+ *        .description('run teardown commands')
+ *        .action(function(dir, otherDirs) {
+ *          console.log('dir "%s"', dir);
+ *          if (otherDirs) {
+ *            otherDirs.forEach(function (oDir) {
+ *              console.log('dir "%s"', oDir);
+ *            });
+ *          }
+ *        });
+ *
+ *      program
+ *        .command('*')
+ *        .description('deploy the given env')
+ *        .action(function(env) {
+ *          console.log('deploying "%s"', env);
+ *        });
+ *
+ *      program.parse(process.argv);
+  *
+ * @param {String} name
+ * @param {String} [desc] for git-style sub-commands
+ * @return {Command} the new command
+ * @api public
+ */
+
+Command.prototype.command = function(name, desc) {
+  var args = name.split(/ +/);
+  var cmd = new Command(args.shift());
+
+  if (desc) {
+    cmd.description(desc);
+    this.executables = true;
+    this._execs[cmd._name] = true;
+  }
+
+  this.commands.push(cmd);
+  cmd.parseExpectedArgs(args);
+  cmd.parent = this;
+
+  if (desc) return this;
+  return cmd;
+};
+
+/**
+ * Add an implicit `help [cmd]` subcommand
+ * which invokes `--help` for the given command.
+ *
+ * @api private
+ */
+
+Command.prototype.addImplicitHelpCommand = function() {
+  this.command('help [cmd]', 'display help for [cmd]');
+};
+
+/**
+ * Parse expected `args`.
+ *
+ * For example `["[type]"]` becomes `[{ required: false, name: 'type' }]`.
+ *
+ * @param {Array} args
+ * @return {Command} for chaining
+ * @api public
+ */
+
+Command.prototype.parseExpectedArgs = function(args) {
+  if (!args.length) return;
+  var self = this;
+  args.forEach(function(arg) {
+    var argDetails = {
+      required: false,
+      name: '',
+      variadic: false
+    };
+
+    switch (arg[0]) {
+      case '<':
+        argDetails.required = true;
+        argDetails.name = arg.slice(1, -1);
+        break;
+      case '[':
+        argDetails.name = arg.slice(1, -1);
+        break;
+    }
+
+    if (argDetails.name.length > 3 && argDetails.name.slice(-3) === '...') {
+      argDetails.variadic = true;
+      argDetails.name = argDetails.name.slice(0, -3);
+    }
+    if (argDetails.name) {
+      self._args.push(argDetails);
+    }
+  });
+  return this;
+};
+
+/**
+ * Register callback `fn` for the command.
+ *
+ * Examples:
+ *
+ *      program
+ *        .command('help')
+ *        .description('display verbose help')
+ *        .action(function() {
+ *           // output help here
+ *        });
+ *
+ * @param {Function} fn
+ * @return {Command} for chaining
+ * @api public
+ */
+
+Command.prototype.action = function(fn) {
+  var self = this;
+  var listener = function(args, unknown) {
+    // Parse any so-far unknown options
+    args = args || [];
+    unknown = unknown || [];
+
+    var parsed = self.parseOptions(unknown);
+
+    // Output help if necessary
+    outputHelpIfNecessary(self, parsed.unknown);
+
+    // If there are still any unknown options, then we simply
+    // die, unless someone asked for help, in which case we give it
+    // to them, and then we die.
+    if (parsed.unknown.length > 0) {
+      self.unknownOption(parsed.unknown[0]);
+    }
+
+    // Leftover arguments need to be pushed back. Fixes issue #56
+    if (parsed.args.length) args = parsed.args.concat(args);
+
+    self._args.forEach(function(arg, i) {
+      if (arg.required && null == args[i]) {
+        self.missingArgument(arg.name);
+      } else if (arg.variadic) {
+        if (i !== self._args.length - 1) {
+          self.variadicArgNotLast(arg.name);
+        }
+
+        args[i] = args.splice(i);
+      }
+    });
+
+    // Always append ourselves to the end of the arguments,
+    // to make sure we match the number of arguments the user
+    // expects
+    if (self._args.length) {
+      args[self._args.length] = self;
+    } else {
+      args.push(self);
+    }
+
+    fn.apply(self, args);
+  };
+  this.parent.on(this._name, listener);
+  if (this._alias) this.parent.on(this._alias, listener);
+  return this;
+};
+
+/**
+ * Define option with `flags`, `description` and optional
+ * coercion `fn`.
+ *
+ * The `flags` string should contain both the short and long flags,
+ * separated by comma, a pipe or space. The following are all valid
+ * all will output this way when `--help` is used.
+ *
+ *    "-p, --pepper"
+ *    "-p|--pepper"
+ *    "-p --pepper"
+ *
+ * Examples:
+ *
+ *     // simple boolean defaulting to false
+ *     program.option('-p, --pepper', 'add pepper');
+ *
+ *     --pepper
+ *     program.pepper
+ *     // => Boolean
+ *
+ *     // simple boolean defaulting to true
+ *     program.option('-C, --no-cheese', 'remove cheese');
+ *
+ *     program.cheese
+ *     // => true
+ *
+ *     --no-cheese
+ *     program.cheese
+ *     // => false
+ *
+ *     // required argument
+ *     program.option('-C, --chdir <path>', 'change the working directory');
+ *
+ *     --chdir /tmp
+ *     program.chdir
+ *     // => "/tmp"
+ *
+ *     // optional argument
+ *     program.option('-c, --cheese [type]', 'add cheese [marble]');
+ *
+ * @param {String} flags
+ * @param {String} description
+ * @param {Function|Mixed} fn or default
+ * @param {Mixed} defaultValue
+ * @return {Command} for chaining
+ * @api public
+ */
+
+Command.prototype.option = function(flags, description, fn, defaultValue) {
+  var self = this
+    , option = new Option(flags, description)
+    , oname = option.name()
+    , name = camelcase(oname);
+
+  // default as 3rd arg
+  if (typeof fn != 'function') {
+    if (fn instanceof RegExp) {
+      var regex = fn;
+      fn = function(val, def) {
+        var m = regex.exec(val);
+        return m ? m[0] : def;
+      }
+    }
+    else {
+      defaultValue = fn;
+      fn = null;
+    }
+  }
+
+  // preassign default value only for --no-*, [optional], or <required>
+  if (false == option.bool || option.optional || option.required) {
+    // when --no-* we make sure default is true
+    if (false == option.bool) defaultValue = true;
+    // preassign only if we have a default
+    if (undefined !== defaultValue) self[name] = defaultValue;
+  }
+
+  // register the option
+  this.options.push(option);
+
+  // when it's passed assign the value
+  // and conditionally invoke the callback
+  this.on(oname, function(val) {
+    // coercion
+    if (null !== val && fn) val = fn(val, undefined === self[name]
+      ? defaultValue
+      : self[name]);
+
+    // unassigned or bool
+    if ('boolean' == typeof self[name] || 'undefined' == typeof self[name]) {
+      // if no value, bool true, and we have a default, then use it!
+      if (null == val) {
+        self[name] = option.bool
+          ? defaultValue || true
+          : false;
+      } else {
+        self[name] = val;
+      }
+    } else if (null !== val) {
+      // reassign
+      self[name] = val;
+    }
+  });
+
+  return this;
+};
+
+/**
+ * Allow unknown options on the command line.
+ *
+ * @param {Boolean} arg if `true` or omitted, no error will be thrown
+ * for unknown options.
+ * @api public
+ */
+Command.prototype.allowUnknownOption = function(arg) {
+    this._allowUnknownOption = arguments.length === 0 || arg;
+    return this;
+};
+
+/**
+ * Parse `argv`, settings options and invoking commands when defined.
+ *
+ * @param {Array} argv
+ * @return {Command} for chaining
+ * @api public
+ */
+
+Command.prototype.parse = function(argv) {
+  // implicit help
+  if (this.executables) this.addImplicitHelpCommand();
+
+  // store raw args
+  this.rawArgs = argv;
+
+  // guess name
+  this._name = this._name || basename(argv[1], '.js');
+
+  // process argv
+  var parsed = this.parseOptions(this.normalize(argv.slice(2)));
+  var args = this.args = parsed.args;
+
+  var result = this.parseArgs(this.args, parsed.unknown);
+
+  // executable sub-commands
+  var name = result.args[0];
+  if (this._execs[name] && typeof this._execs[name] != "function") {
+    return this.executeSubCommand(argv, args, parsed.unknown);
+  }
+
+  return result;
+};
+
+/**
+ * Execute a sub-command executable.
+ *
+ * @param {Array} argv
+ * @param {Array} args
+ * @param {Array} unknown
+ * @api private
+ */
+
+Command.prototype.executeSubCommand = function(argv, args, unknown) {
+  args = args.concat(unknown);
+
+  if (!args.length) this.help();
+  if ('help' == args[0] && 1 == args.length) this.help();
+
+  // <cmd> --help
+  if ('help' == args[0]) {
+    args[0] = args[1];
+    args[1] = '--help';
+  }
+
+  // executable
+  var f = argv[1];
+  var link = readlink(f);
+  if (link !== f && link.charAt(0) !== '/') {
+    link = path.join(dirname(f), link)
+  }
+  var dir = dirname(link);
+  var bin = basename(f, '.js') + '-' + args[0];
+
+  // prefer local `./<bin>` to bin in the $PATH
+  var local = path.join(dir, bin);
+  try {
+    // for versions before node v0.8 when there weren't `fs.existsSync`
+    if (fs.statSync(local).isFile()) {
+      bin = local;
+    }
+  } catch (e) {}
+
+  // run it
+  args = args.slice(1);
+
+  var proc;
+  if (process.platform !== 'win32') {
+    proc = spawn(bin, args, { stdio: 'inherit', customFds: [0, 1, 2] });
+  } else {
+    args.unshift(local);
+    proc = spawn(process.execPath, args, { stdio: 'inherit'});
+  }
+
+  proc.on('close', process.exit.bind(process));
+  proc.on('error', function(err) {
+    if (err.code == "ENOENT") {
+      console.error('\n  %s(1) does not exist, try --help\n', bin);
+    } else if (err.code == "EACCES") {
+      console.error('\n  %s(1) not executable. try chmod or run with root\n', bin);
+    }
+    process.exit(1);
+  });
+
+  this.runningCommand = proc;
+};
+
+/**
+ * Normalize `args`, splitting joined short flags. For example
+ * the arg "-abc" is equivalent to "-a -b -c".
+ * This also normalizes equal sign and splits "--abc=def" into "--abc def".
+ *
+ * @param {Array} args
+ * @return {Array}
+ * @api private
+ */
+
+Command.prototype.normalize = function(args) {
+  var ret = []
+    , arg
+    , lastOpt
+    , index;
+
+  for (var i = 0, len = args.length; i < len; ++i) {
+    arg = args[i];
+    if (i > 0) {
+      lastOpt = this.optionFor(args[i-1]);
+    }
+
+    if (arg === '--') {
+      // Honor option terminator
+      ret = ret.concat(args.slice(i));
+      break;
+    } else if (lastOpt && lastOpt.required) {
+      ret.push(arg);
+    } else if (arg.length > 1 && '-' == arg[0] && '-' != arg[1]) {
+      arg.slice(1).split('').forEach(function(c) {
+        ret.push('-' + c);
+      });
+    } else if (/^--/.test(arg) && ~(index = arg.indexOf('='))) {
+      ret.push(arg.slice(0, index), arg.slice(index + 1));
+    } else {
+      ret.push(arg);
+    }
+  }
+
+  return ret;
+};
+
+/**
+ * Parse command `args`.
+ *
+ * When listener(s) are available those
+ * callbacks are invoked, otherwise the "*"
+ * event is emitted and those actions are invoked.
+ *
+ * @param {Array} args
+ * @return {Command} for chaining
+ * @api private
+ */
+
+Command.prototype.parseArgs = function(args, unknown) {
+  var name;
+
+  if (args.length) {
+    name = args[0];
+    if (this.listeners(name).length) {
+      this.emit(args.shift(), args, unknown);
+    } else {
+      this.emit('*', args);
+    }
+  } else {
+    outputHelpIfNecessary(this, unknown);
+
+    // If there were no args and we have unknown options,
+    // then they are extraneous and we need to error.
+    if (unknown.length > 0) {
+      this.unknownOption(unknown[0]);
+    }
+  }
+
+  return this;
+};
+
+/**
+ * Return an option matching `arg` if any.
+ *
+ * @param {String} arg
+ * @return {Option}
+ * @api private
+ */
+
+Command.prototype.optionFor = function(arg) {
+  for (var i = 0, len = this.options.length; i < len; ++i) {
+    if (this.options[i].is(arg)) {
+      return this.options[i];
+    }
+  }
+};
+
+/**
+ * Parse options from `argv` returning `argv`
+ * void of these options.
+ *
+ * @param {Array} argv
+ * @return {Array}
+ * @api public
+ */
+
+Command.prototype.parseOptions = function(argv) {
+  var args = []
+    , len = argv.length
+    , literal
+    , option
+    , arg;
+
+  var unknownOptions = [];
+
+  // parse options
+  for (var i = 0; i < len; ++i) {
+    arg = argv[i];
+
+    // literal args after --
+    if ('--' == arg) {
+      literal = true;
+      continue;
+    }
+
+    if (literal) {
+      args.push(arg);
+      continue;
+    }
+
+    // find matching Option
+    option = this.optionFor(arg);
+
+    // option is defined
+    if (option) {
+      // requires arg
+      if (option.required) {
+        arg = argv[++i];
+        if (null == arg) return this.optionMissingArgument(option);
+        this.emit(option.name(), arg);
+      // optional arg
+      } else if (option.optional) {
+        arg = argv[i+1];
+        if (null == arg || ('-' == arg[0] && '-' != arg)) {
+          arg = null;
+        } else {
+          ++i;
+        }
+        this.emit(option.name(), arg);
+      // bool
+      } else {
+        this.emit(option.name());
+      }
+      continue;
+    }
+
+    // looks like an option
+    if (arg.length > 1 && '-' == arg[0]) {
+      unknownOptions.push(arg);
+
+      // If the next argument looks like it might be
+      // an argument for this option, we pass it on.
+      // If it isn't, then it'll simply be ignored
+      if (argv[i+1] && '-' != argv[i+1][0]) {
+        unknownOptions.push(argv[++i]);
+      }
+      continue;
+    }
+
+    // arg
+    args.push(arg);
+  }
+
+  return { args: args, unknown: unknownOptions };
+};
+
+/**
+ * Return an object containing options as key-value pairs
+ *
+ * @return {Object}
+ * @api public
+ */
+Command.prototype.opts = function() {
+  var result = {}
+    , len = this.options.length;
+
+  for (var i = 0 ; i < len; i++) {
+    var key = camelcase(this.options[i].name());
+    result[key] = key === 'version' ? this._version : this[key];
+  }
+  return result;
+};
+
+/**
+ * Argument `name` is missing.
+ *
+ * @param {String} name
+ * @api private
+ */
+
+Command.prototype.missingArgument = function(name) {
+  console.error();
+  console.error("  error: missing required argument `%s'", name);
+  console.error();
+  process.exit(1);
+};
+
+/**
+ * `Option` is missing an argument, but received `flag` or nothing.
+ *
+ * @param {String} option
+ * @param {String} flag
+ * @api private
+ */
+
+Command.prototype.optionMissingArgument = function(option, flag) {
+  console.error();
+  if (flag) {
+    console.error("  error: option `%s' argument missing, got `%s'", option.flags, flag);
+  } else {
+    console.error("  error: option `%s' argument missing", option.flags);
+  }
+  console.error();
+  process.exit(1);
+};
+
+/**
+ * Unknown option `flag`.
+ *
+ * @param {String} flag
+ * @api private
+ */
+
+Command.prototype.unknownOption = function(flag) {
+  if (this._allowUnknownOption) return;
+  console.error();
+  console.error("  error: unknown option `%s'", flag);
+  console.error();
+  process.exit(1);
+};
+
+/**
+ * Variadic argument with `name` is not the last argument as required.
+ *
+ * @param {String} name
+ * @api private
+ */
+
+Command.prototype.variadicArgNotLast = function(name) {
+  console.error();
+  console.error("  error: variadic arguments must be last `%s'", name);
+  console.error();
+  process.exit(1);
+};
+
+/**
+ * Set the program version to `str`.
+ *
+ * This method auto-registers the "-V, --version" flag
+ * which will print the version number when passed.
+ *
+ * @param {String} str
+ * @param {String} flags
+ * @return {Command} for chaining
+ * @api public
+ */
+
+Command.prototype.version = function(str, flags) {
+  if (0 == arguments.length) return this._version;
+  this._version = str;
+  flags = flags || '-V, --version';
+  this.option(flags, 'output the version number');
+  this.on('version', function() {
+    process.stdout.write(str + '\n');
+    process.exit(0);
+  });
+  return this;
+};
+
+/**
+ * Set the description to `str`.
+ *
+ * @param {String} str
+ * @return {String|Command}
+ * @api public
+ */
+
+Command.prototype.description = function(str) {
+  if (0 == arguments.length) return this._description;
+  this._description = str;
+  return this;
+};
+
+/**
+ * Set an alias for the command
+ *
+ * @param {String} alias
+ * @return {String|Command}
+ * @api public
+ */
+
+Command.prototype.alias = function(alias) {
+  if (0 == arguments.length) return this._alias;
+  this._alias = alias;
+  return this;
+};
+
+/**
+ * Set / get the command usage `str`.
+ *
+ * @param {String} str
+ * @return {String|Command}
+ * @api public
+ */
+
+Command.prototype.usage = function(str) {
+  var args = this._args.map(function(arg) {
+    return humanReadableArgName(arg);
+  });
+
+  var usage = '[options]'
+    + (this.commands.length ? ' [command]' : '')
+    + (this._args.length ? ' ' + args.join(' ') : '');
+
+  if (0 == arguments.length) return this._usage || usage;
+  this._usage = str;
+
+  return this;
+};
+
+/**
+ * Get the name of the command
+ *
+ * @param {String} name
+ * @return {String|Command}
+ * @api public
+ */
+
+Command.prototype.name = function() {
+  return this._name;
+};
+
+/**
+ * Return the largest option length.
+ *
+ * @return {Number}
+ * @api private
+ */
+
+Command.prototype.largestOptionLength = function() {
+  return this.options.reduce(function(max, option) {
+    return Math.max(max, option.flags.length);
+  }, 0);
+};
+
+/**
+ * Return help for options.
+ *
+ * @return {String}
+ * @api private
+ */
+
+Command.prototype.optionHelp = function() {
+  var width = this.largestOptionLength();
+
+  // Prepend the help information
+  return [pad('-h, --help', width) + '  ' + 'output usage information']
+    .concat(this.options.map(function(option) {
+      return pad(option.flags, width) + '  ' + offset(option.description, width + 2);
+      }))
+    .join('\n');
+};
+
+/**
+ * Return command help documentation.
+ *
+ * @return {String}
+ * @api private
+ */
+
+Command.prototype.commandHelp = function() {
+  if (!this.commands.length) return '';
+
+  var commands = this.commands.map(function(cmd) {
+    var args = cmd._args.map(function(arg) {
+      return humanReadableArgName(arg);
+    }).join(' ');
+
+    return [
+      cmd._name
+        + (cmd._alias
+          ? '|' + cmd._alias
+          : '')
+        + (cmd.options.length
+          ? ' [options]'
+          : '')
+        + ' ' + args
+    , cmd.description()
+    ];
+  });
+
+  var width = commands.reduce(function(max, command) {
+    return Math.max(max, command[0].length);
+  }, 0);
+
+  return [
+      ''
+    , '  Commands:'
+    , ''
+    , commands.map(function(cmd) {
+      return pad(cmd[0], width) + '  ' + offset(cmd[1], width + 2);
+    }).join('\n').replace(/^/gm, '    ')
+    , ''
+  ].join('\n');
+};
+
+/**
+ * Return program help documentation.
+ *
+ * @return {String}
+ * @api private
+ */
+
+Command.prototype.helpInformation = function() {
+  var desc = [];
+  if (this._description) {
+    desc = [
+      '  ' + this._description
+      , ''
+    ];
+  }
+
+  var cmdName = this._name;
+  if (this._alias) {
+    cmdName = cmdName + '|' + this._alias;
+  }
+  var usage = [
+    ''
+    ,'  Usage: ' + cmdName + ' ' + offset(this.usage(), 9)
+    , ''
+  ];
+
+  var cmds = [];
+  var commandHelp = this.commandHelp();
+  if (commandHelp) cmds = [commandHelp];
+
+  var options = [
+    '  Options:'
+    , ''
+    , '' + this.optionHelp().replace(/^/gm, '    ')
+    , ''
+    , ''
+  ];
+
+  return usage
+    .concat(cmds)
+    .concat(desc)
+    .concat(options)
+    .join('\n');
+};
+
+/**
+ * Output help information for this command
+ *
+ * @api public
+ */
+
+Command.prototype.outputHelp = function() {
+  process.stdout.write(this.helpInformation());
+  this.emit('--help');
+};
+
+/**
+ * Output help information and exit.
+ *
+ * @api public
+ */
+
+Command.prototype.help = function() {
+  this.outputHelp();
+  process.exit();
+};
+
+/**
+ * Camel-case the given `flag`
+ *
+ * @param {String} flag
+ * @return {String}
+ * @api private
+ */
+
+function camelcase(flag) {
+  return flag.split('-').reduce(function(str, word) {
+    return str + word[0].toUpperCase() + word.slice(1);
+  });
+}
+
+/**
+ * Pad `str` to `width`.
+ *
+ * @param {String} str
+ * @param {Number} width
+ * @return {String}
+ * @api private
+ */
+
+function pad(str, width) {
+  var len = Math.max(0, width - str.length);
+  return str + Array(len + 1).join(' ');
+}
+
+/**
+ * Prepend to each line of `str` spaced string of `offset` length.
+ *
+ * @param {String} str
+ * @param {Number} offset
+ * @param {Boolean} skipFirstLine
+ * @return {String}
+ * @api private
+ */
+function offset(str, offset, skipFirstLine) {
+  var res = String(str || '').replace(/^/gm, pad('', offset));
+  if (!skipFirstLine) {
+    res = res.replace(/^\s+/, '');
+  }
+  return res;
+}
+
+/**
+ * Output help information if necessary
+ *
+ * @param {Command} command to output help for
+ * @param {Array} array of options to search for -h or --help
+ * @api private
+ */
+
+function outputHelpIfNecessary(cmd, options) {
+  options = options || [];
+  for (var i = 0; i < options.length; i++) {
+    if (options[i] == '--help' || options[i] == '-h') {
+      cmd.outputHelp();
+      process.exit(0);
+
+      // used for test flow only
+      options.splice(i, 1);
+    }
+  }
+}
+
+/**
+ * Takes an argument an returns its human readable equivalent for help usage.
+ *
+ * @param {Object} arg
+ * @return {String}
+ * @api private
+ */
+
+function humanReadableArgName(arg) {
+  var nameOutput = arg.name + (arg.variadic === true ? '...' : '');
+
+  return arg.required
+    ? '<' + nameOutput + '>'
+    : '[' + nameOutput + ']'
+}
+
+/**
+ * Main CSSLint object.
+ * @class CSSLint
+ * @static
+ * @extends parserlib.util.EventTarget
+ */
+
+/* global parserlib, clone, Reporter */
+/* exported CSSLint */
+
+var CSSLint = (function(){
+    "use strict";
+
+    var rules           = [],
+        formatters      = [],
+        embeddedRuleset = /\/\*csslint([^\*]*)\*\//,
+        api             = new parserlib.util.EventTarget();
+
+    api.version = "@VERSION@";
+
+    //-------------------------------------------------------------------------
+    // Rule Management
+    //-------------------------------------------------------------------------
+
+    /**
+     * Adds a new rule to the engine.
+     * @param {Object} rule The rule to add.
+     * @method addRule
+     */
+    api.addRule = function(rule){
+        rules.push(rule);
+        rules[rule.id] = rule;
+    };
+
+    /**
+     * Clears all rule from the engine.
+     * @method clearRules
+     */
+    api.clearRules = function(){
+        rules = [];
+    };
+
+    /**
+     * Returns the rule objects.
+     * @return An array of rule objects.
+     * @method getRules
+     */
+    api.getRules = function(){
+        return [].concat(rules).sort(function(a,b){
+            return a.id > b.id ? 1 : 0;
+        });
+    };
+
+    /**
+     * Returns a ruleset configuration object with all current rules.
+     * @return A ruleset object.
+     * @method getRuleset
+     */
+    api.getRuleset = function() {
+        var ruleset = {},
+            i = 0,
+            len = rules.length;
+
+        while (i < len){
+            ruleset[rules[i++].id] = 1;    //by default, everything is a warning
+        }
+
+        return ruleset;
+    };
+
+    /**
+     * Returns a ruleset object based on embedded rules.
+     * @param {String} text A string of css containing embedded rules.
+     * @param {Object} ruleset A ruleset object to modify.
+     * @return {Object} A ruleset object.
+     * @method getEmbeddedRuleset
+     */
+    function applyEmbeddedRuleset(text, ruleset){
+        var valueMap,
+            embedded = text && text.match(embeddedRuleset),
+            rules = embedded && embedded[1];
+
+        if (rules) {
+            valueMap = {
+                "true": 2,  // true is error
+                "": 1,      // blank is warning
+                "false": 0, // false is ignore
+
+                "2": 2,     // explicit error
+                "1": 1,     // explicit warning
+                "0": 0      // explicit ignore
+            };
+
+            rules.toLowerCase().split(",").forEach(function(rule){
+                var pair = rule.split(":"),
+                    property = pair[0] || "",
+                    value = pair[1] || "";
+
+                ruleset[property.trim()] = valueMap[value.trim()];
+            });
+        }
+
+        return ruleset;
+    }
+
+    //-------------------------------------------------------------------------
+    // Formatters
+    //-------------------------------------------------------------------------
+
+    /**
+     * Adds a new formatter to the engine.
+     * @param {Object} formatter The formatter to add.
+     * @method addFormatter
+     */
+    api.addFormatter = function(formatter) {
+        // formatters.push(formatter);
+        formatters[formatter.id] = formatter;
+    };
+
+    /**
+     * Retrieves a formatter for use.
+     * @param {String} formatId The name of the format to retrieve.
+     * @return {Object} The formatter or undefined.
+     * @method getFormatter
+     */
+    api.getFormatter = function(formatId){
+        return formatters[formatId];
+    };
+
+    /**
+     * Formats the results in a particular format for a single file.
+     * @param {Object} result The results returned from CSSLint.verify().
+     * @param {String} filename The filename for which the results apply.
+     * @param {String} formatId The name of the formatter to use.
+     * @param {Object} options (Optional) for special output handling.
+     * @return {String} A formatted string for the results.
+     * @method format
+     */
+    api.format = function(results, filename, formatId, options) {
+        var formatter = this.getFormatter(formatId),
+            result = null;
+
+        if (formatter){
+            result = formatter.startFormat();
+            result += formatter.formatResults(results, filename, options || {});
+            result += formatter.endFormat();
+        }
+
+        return result;
+    };
+
+    /**
+     * Indicates if the given format is supported.
+     * @param {String} formatId The ID of the format to check.
+     * @return {Boolean} True if the format exists, false if not.
+     * @method hasFormat
+     */
+    api.hasFormat = function(formatId){
+        return formatters.hasOwnProperty(formatId);
+    };
+
+    //-------------------------------------------------------------------------
+    // Verification
+    //-------------------------------------------------------------------------
+
+    /**
+     * Starts the verification process for the given CSS text.
+     * @param {String} text The CSS text to verify.
+     * @param {Object} ruleset (Optional) List of rules to apply. If null, then
+     *      all rules are used. If a rule has a value of 1 then it's a warning,
+     *      a value of 2 means it's an error.
+     * @return {Object} Results of the verification.
+     * @method verify
+     */
+    api.verify = function(text, ruleset){
+
+        var i = 0,
+            reporter,
+            lines,
+            report,
+            parser = new parserlib.css.Parser({ starHack: true, ieFilters: true,
+                                                underscoreHack: true, strict: false });
+
+        // normalize line endings
+        lines = text.replace(/\n\r?/g, "$split$").split("$split$");
+
+        if (!ruleset){
+            ruleset = this.getRuleset();
+        }
+
+        if (embeddedRuleset.test(text)){
+            //defensively copy so that caller's version does not get modified
+            ruleset = clone(ruleset);
+            ruleset = applyEmbeddedRuleset(text, ruleset);
+        }
+
+        reporter = new Reporter(lines, ruleset);
+
+        ruleset.errors = 2;       //always report parsing errors as errors
+        for (i in ruleset){
+            if(ruleset.hasOwnProperty(i) && ruleset[i]){
+                if (rules[i]){
+                    rules[i].init(parser, reporter);
+                }
+            }
+        }
+
+
+        //capture most horrible error type
+        try {
+            parser.parse(text);
+        } catch (ex) {
+            reporter.error("Fatal error, cannot continue: " + ex.message, ex.line, ex.col, {});
+        }
+
+        report = {
+            messages    : reporter.messages,
+            stats       : reporter.stats,
+            ruleset     : reporter.ruleset
+        };
+
+        //sort by line numbers, rollups at the bottom
+        report.messages.sort(function (a, b){
+            if (a.rollup && !b.rollup){
+                return 1;
+            } else if (!a.rollup && b.rollup){
+                return -1;
+            } else {
+                return a.line - b.line;
+            }
+        });
+
+        return report;
+    };
+
+    //-------------------------------------------------------------------------
+    // Publish the API
+    //-------------------------------------------------------------------------
+
+    return api;
+
+})();
+
+/**
+ * An instance of Report is used to report results of the
+ * verification back to the main API.
+ * @class Reporter
+ * @constructor
+ * @param {String[]} lines The text lines of the source.
+ * @param {Object} ruleset The set of rules to work with, including if
+ *      they are errors or warnings.
+ */
+function Reporter(lines, ruleset){
+    "use strict";
+
+    /**
+     * List of messages being reported.
+     * @property messages
+     * @type String[]
+     */
+    this.messages = [];
+
+    /**
+     * List of statistics being reported.
+     * @property stats
+     * @type String[]
+     */
+    this.stats = [];
+
+    /**
+     * Lines of code being reported on. Used to provide contextual information
+     * for messages.
+     * @property lines
+     * @type String[]
+     */
+    this.lines = lines;
+
+    /**
+     * Information about the rules. Used to determine whether an issue is an
+     * error or warning.
+     * @property ruleset
+     * @type Object
+     */
+    this.ruleset = ruleset;
+}
+
+Reporter.prototype = {
+
+    //restore constructor
+    constructor: Reporter,
+
+    /**
+     * Report an error.
+     * @param {String} message The message to store.
+     * @param {int} line The line number.
+     * @param {int} col The column number.
+     * @param {Object} rule The rule this message relates to.
+     * @method error
+     */
+    error: function(message, line, col, rule){
+        "use strict";
+        this.messages.push({
+            type    : "error",
+            line    : line,
+            col     : col,
+            message : message,
+            evidence: this.lines[line-1],
+            rule    : rule || {}
+        });
+    },
+
+    /**
+     * Report an warning.
+     * @param {String} message The message to store.
+     * @param {int} line The line number.
+     * @param {int} col The column number.
+     * @param {Object} rule The rule this message relates to.
+     * @method warn
+     * @deprecated Use report instead.
+     */
+    warn: function(message, line, col, rule){
+        "use strict";
+        this.report(message, line, col, rule);
+    },
+
+    /**
+     * Report an issue.
+     * @param {String} message The message to store.
+     * @param {int} line The line number.
+     * @param {int} col The column number.
+     * @param {Object} rule The rule this message relates to.
+     * @method report
+     */
+    report: function(message, line, col, rule){
+        "use strict";
+        this.messages.push({
+            type    : this.ruleset[rule.id] === 2 ? "error" : "warning",
+            line    : line,
+            col     : col,
+            message : message,
+            evidence: this.lines[line-1],
+            rule    : rule
+        });
+    },
+
+    /**
+     * Report some informational text.
+     * @param {String} message The message to store.
+     * @param {int} line The line number.
+     * @param {int} col The column number.
+     * @param {Object} rule The rule this message relates to.
+     * @method info
+     */
+    info: function(message, line, col, rule){
+        "use strict";
+        this.messages.push({
+            type    : "info",
+            line    : line,
+            col     : col,
+            message : message,
+            evidence: this.lines[line-1],
+            rule    : rule
+        });
+    },
+
+    /**
+     * Report some rollup error information.
+     * @param {String} message The message to store.
+     * @param {Object} rule The rule this message relates to.
+     * @method rollupError
+     */
+    rollupError: function(message, rule){
+        "use strict";
+        this.messages.push({
+            type    : "error",
+            rollup  : true,
+            message : message,
+            rule    : rule
+        });
+    },
+
+    /**
+     * Report some rollup warning information.
+     * @param {String} message The message to store.
+     * @param {Object} rule The rule this message relates to.
+     * @method rollupWarn
+     */
+    rollupWarn: function(message, rule){
+        "use strict";
+        this.messages.push({
+            type    : "warning",
+            rollup  : true,
+            message : message,
+            rule    : rule
+        });
+    },
+
+    /**
+     * Report a statistic.
+     * @param {String} name The name of the stat to store.
+     * @param {Variant} value The value of the stat.
+     * @method stat
+     */
+    stat: function(name, value){
+        "use strict";
+        this.stats[name] = value;
+    }
+};
+
+//expose for testing purposes
+CSSLint._Reporter = Reporter;
+
+/*
+ * Utility functions that make life easier.
+ */
+CSSLint.Util = {
+    /*
+     * Adds all properties from supplier onto receiver,
+     * overwriting if the same name already exists on
+     * reciever.
+     * @param {Object} The object to receive the properties.
+     * @param {Object} The object to provide the properties.
+     * @return {Object} The receiver
+     */
+    mix: function(receiver, supplier){
+        "use strict";
+        var prop;
+
+        for (prop in supplier){
+            if (supplier.hasOwnProperty(prop)){
+                receiver[prop] = supplier[prop];
+            }
+        }
+
+        return prop;
+    },
+
+    /*
+     * Polyfill for array indexOf() method.
+     * @param {Array} values The array to search.
+     * @param {Variant} value The value to search for.
+     * @return {int} The index of the value if found, -1 if not.
+     */
+    indexOf: function(values, value){
+        "use strict";
+        if (values.indexOf){
+            return values.indexOf(value);
+        } else {
+            for (var i=0, len=values.length; i < len; i++){
+                if (values[i] === value){
+                    return i;
+                }
+            }
+            return -1;
+        }
+    },
+
+    /*
+     * Polyfill for array forEach() method.
+     * @param {Array} values The array to operate on.
+     * @param {Function} func The function to call on each item.
+     * @return {void}
+     */
+    forEach: function(values, func) {
+        "use strict";
+        if (values.forEach){
+            return values.forEach(func);
+        } else {
+            for (var i=0, len=values.length; i < len; i++){
+                func(values[i], i, values);
+            }
+        }
+    }
+};
+
+//     (c) 2012 Airbnb, Inc.
+//
+//     infinity.js may be freely distributed under the terms of the BSD
+//     license. For all licensing information, details, and documention:
+//     http://airbnb.github.com/infinity
+
+!function(window, Math, $) {
+  'use strict';
+
+
+  // Welcome To Infinity
+  // ===================
+  //
+  // infinity.js is a UITableView for the web. Use it to speed up scroll
+  // performance of long- or infinitely-scrolling lists of items.
+  //
+  // infinity.js has several caveats:
+  //
+  // 1. All DOM elements must either be visible or in the current layout.
+  // infinity.js does not support elements that will at some point affect the
+  // layout, but are currently hidden using `display:none`.
+  //
+  // 2. ListViews can't be nested.
+  //
+  // 3. Non-ListItem elements can't be the immediate children of ListView
+  // elements. Only ListItems can be immediate children of ListViews.
+  //
+  // 4. ListView elements can't have heights set directly on them. In most
+  // cases it is also likely that `min-height`s and `max-height`s will break.
+  // However, setting heights on ListItems is ok.
+  //
+  // If you're reading this, we probably want to hear from you. If the feeling
+  // is mutual: [get in touch.](http://www.airbnb.com/jobs)
+
+
+  // Initial Setup
+  // =============
+
+  // Cached objects
+  var $window = $(window);
+
+  // Packaging:
+  var oldInfinity = window.infinity,
+      infinity = window.infinity = {},
+      config = infinity.config = {};
+
+  // Constants:
+  var PAGE_ID_ATTRIBUTE = 'data-infinity-pageid',
+      NUM_BUFFER_PAGES = 1,
+      PAGES_ONSCREEN = NUM_BUFFER_PAGES * 2 + 1;
+
+  // Config:
+  config.PAGE_TO_SCREEN_RATIO = 3;
+  config.SCROLL_THROTTLE = 350;
+
+
+
+  // ListView Class
+  // ==============
+
+
+  // ### Constructor
+  //
+  // Creates a new instance of a ListView.
+  //
+  // Takes:
+  //
+  // - `$el`: a jQuery element.
+  // - `options`: an optional hash of options
+
+  function ListView($el, options) {
+    options = options || {};
+
+    this.$el = blankDiv();
+    this.$shadow = blankDiv();
+    $el.append(this.$el);
+    // don't append the shadow element -- it's meant to only be used for
+    // finding elements outside of the DOM
+
+    this.lazy = !!options.lazy;
+    this.lazyFn = options.lazy || null;
+
+    initBuffer(this);
+
+    this.top = this.$el.offset().top;
+    this.width = 0;
+    this.height = 0;
+
+    this.pages = [];
+    this.startIndex = 0;
+
+    DOMEvent.attach(this);
+  }
+
+
+  // ### initBuffer
+  //
+  // Private ListView method. Initializes the buffer element.
+
+  function initBuffer(listView) {
+    listView._$buffer = blankDiv()
+                        .prependTo(listView.$el);
+  }
+
+
+  // ### updateBuffer
+  //
+  // Private ListView method. Updates the buffer to correctly push forward the
+  // first page.
+
+  function updateBuffer(listView) {
+    var firstPage,
+        pages = listView.pages,
+        $buffer = listView._$buffer;
+
+    if(pages.length > 0) {
+      firstPage = pages[listView.startIndex];
+      $buffer.height(firstPage.top);
+    } else {
+      $buffer.height(0);
+    }
+  }
+
+  // ListView manipulation
+  // ---------------------
+
+
+  // ### append
+  //
+  // Appends a jQuery element or a ListItem to the ListView.
+  //
+  // Takes:
+  //
+  // - `obj`: a jQuery element, a string of valid HTML, or a ListItem.
+  //
+  // TODO: optimized batch appends
+
+  ListView.prototype.append = function(obj) {
+    if(!obj || !obj.length) return null;
+
+    var lastPage,
+        item = convertToItem(this, obj),
+        pages = this.pages;
+
+    this.height += item.height;
+    this.$el.height(this.height);
+
+    lastPage = pages[pages.length - 1];
+
+    if(!lastPage || !lastPage.hasVacancy()) {
+      lastPage = new Page(this);
+      pages.push(lastPage);
+    }
+
+    lastPage.append(item);
+    insertPagesInView(this);
+
+    return item;
+  };
+
+
+  // ### cacheCoordsFor
+  //
+  // Caches the coordinates for a given ListItem within the given ListView.
+  //
+  // Takes:
+  //
+  // - `listView`: a ListView.
+  // - `listItem`: the ListItem whose coordinates you want to cache.
+
+  function cacheCoordsFor(listView, listItem) {
+    listItem.$el.remove();
+
+    // WARNING: this will always break for prepends. Once support gets added for
+    // prepends, change this.
+    listView.$el.append(listItem.$el);
+    updateCoords(listItem, listView.height);
+    listItem.$el.remove();
+  }
+
+
+  // ### insertPagesInView
+  //
+  // Inserts any uninserted pages the given ListView owns.
+  //
+  // Takes:
+  //
+  // - `listView`: the ListView whose onscreen pages you'd like to insert.
+
+  function insertPagesInView(listView) {
+    var index, length, curr,
+        pages = listView.pages,
+        inserted = false,
+        inOrder = true;
+    index = listView.startIndex;
+    length = Math.min(index + PAGES_ONSCREEN, pages.length);
+
+    for(index; index < length; index++) {
+      curr = pages[index];
+      if(listView.lazy) curr.lazyload(listView.lazyFn);
+      if(inserted && curr.onscreen) inOrder = false;
+
+      if(!inOrder) {
+        curr.stash(listView.$shadow);
+        curr.appendTo(listView.$el);
+      } else if(!curr.onscreen) {
+        inserted = true;
+        curr.appendTo(listView.$el);
+      }
+    }
+  }
+
+
+  // ### updateStartIndex
+  //
+  // Updates a given ListView when the throttled scroll event fires. Attempts
+  // to do as little work as possible: if the `startIndex` doesn't change,
+  // it'll exit early. If the `startIndex` does change, it finds all pages
+  // that have been scrolled out of view and removes them, then inserts only
+  // pages that have been now been scrolled into view.
+  //
+  // Takes:
+  //
+  // - `listView`: the ListView needing to be updated.
+
+  function updateStartIndex(listView) {
+    var index, length, pages, lastIndex, nextLastIndex,
+        startIndex = listView.startIndex,
+        viewTop = $window.scrollTop() - listView.top,
+        viewHeight = $window.height(),
+        viewBottom = viewTop + viewHeight,
+        nextIndex = startIndexWithinRange(listView, viewTop, viewBottom);
+
+    if( nextIndex < 0 || nextIndex === startIndex) return startIndex;
+
+    pages = listView.pages;
+    startIndex = listView.startIndex;
+    lastIndex = Math.min(startIndex + PAGES_ONSCREEN, pages.length);
+    nextLastIndex = Math.min(nextIndex + PAGES_ONSCREEN, pages.length);
+
+    // sweep any invalid old pages
+    for(index = startIndex, length = lastIndex; index < length; index++) {
+      if(index < nextIndex || index >= nextLastIndex)
+        pages[index].stash(listView.$shadow);
+    }
+
+    listView.startIndex = nextIndex;
+
+    insertPagesInView(listView);
+    updateBuffer(listView);
+    return nextIndex;
+  }
+
+
+  // ### remove
+  //
+  // Removes the ListView from the DOM and cleans up after it.
+
+  ListView.prototype.remove = function() {
+    this.$el.remove();
+    this.cleanup();
+  };
+
+
+  // ### convertToItem
+  //
+  // Given an object that is either a ListItem instance, a jQuery element, or a
+  // string of valid HTML, makes sure to return either the ListItem itself or
+  // a new ListItem that wraps the element.
+  //
+  // Takes:
+  //
+  // - `listView`: the ListView instance that wants the item.
+  // - `possibleItem`: an object that is either a ListItem, a jQuery element,
+  // or a string of valid HTML.
+
+  function convertToItem(listView, possibleItem) {
+    var item;
+    if(possibleItem instanceof ListItem) return possibleItem;
+    if(typeof possibleItem === 'string') possibleItem = $(possibleItem);
+    item = new ListItem(possibleItem);
+    cacheCoordsFor(listView, item);
+    return item;
+  }
+
+
+  // ### tooSmall
+  //
+  // Alerts the given ListView that the given Page is too small. May result
+  // in modifications to the `pages` array.
+
+  function tooSmall(listView, page) {
+    // Naive solution:
+    repartition(listView);
+  }
+
+
+  // ### repartition
+  //
+  // Repartitions the pages array. This can be used for either defragmenting
+  // the array, or recalculating everything on screen resize.
+
+  function repartition(listView) {
+    var currPage, newPage, index, length, itemIndex, pageLength, currItems, currItem,
+        nextItem,
+        pages = listView.pages,
+        newPages = [];
+
+    newPage = new Page(listView);
+    newPages.push(newPage);
+
+    for(index = 0, length = pages.length; index < length; index++) {
+      currPage = pages[index];
+      currItems = currPage.items;
+      for(itemIndex = 0, pageLength = currItems.length; itemIndex < pageLength; itemIndex++) {
+        currItem = currItems[itemIndex];
+        nextItem = currItem.clone();
+        if(newPage.hasVacancy()) {
+          newPage.append(nextItem);
+        } else {
+          newPage = new Page(listView);
+          newPages.push(newPage);
+          newPage.append(nextItem);
+        }
+      }
+      currPage.remove();
+    }
+
+    listView.pages = newPages;
+    insertPagesInView(listView);
+  }
+
+
+  // ListView querying
+  // -----------------
+
+  // ### find
+  //
+  // Given a selector string or jQuery element, return the items that hold the
+  // given or matching elements.
+  //
+  // Note: this is slower than an ordinary jQuery find. However, using jQuery
+  // to find elements will be bug-prone, since most of the elements won't be in
+  // the DOM tree. Caching elements is usually important, but it's even more
+  // important to do here.
+  //
+  // Arguments:
+  //
+  // - `findObj`: A selector string, or a jQuery element.
+  //
+  // Returns a ListItem.
+
+  ListView.prototype.find = function(findObj) {
+    var items, $onscreen, $offscreen;
+
+    // If given a selector string, find everything matching onscreen and
+    // offscreen, and return both.
+    if(typeof findObj === 'string') {
+      $onscreen = this.$el.find(findObj);
+      $offscreen = this.$shadow.find(findObj);
+      return this.find($onscreen).concat(this.find($offscreen));
+    }
+
+    // Silly option, but might as well.
+    if(findObj instanceof ListItem) return [findObj];
+
+    // jQuery element
+    items = [];
+    findObj.each(function() {
+      var pageId, page, pageItems, index, length, currItem,
+          $itemEl = $(this).parentsUntil('[' + PAGE_ID_ATTRIBUTE + ']').andSelf().first(),
+          $pageEl = $itemEl.parent();
+
+
+      pageId = $pageEl.attr(PAGE_ID_ATTRIBUTE);
+      page = PageRegistry.lookup(pageId);
+      if(page) {
+        pageItems = page.items;
+        for(index = 0, length = pageItems.length; index < length; index++) {
+          currItem = pageItems[index];
+          if(currItem.$el.is($itemEl)) {
+            items.push(currItem);
+            break;
+          }
+        }
+      }
+    });
+
+    return items;
+  };
+
+  // ### startIndexWithinRange
+  //
+  // Finds the starting index for a listView, given a range. Wraps
+  // indexWithinRange.
+  //
+  // Takes:
+  //
+  // - `listView`: the ListView whose startIndex you're calculating.
+  // - `top`: the top of the range.
+  // - `bottom`: the bottom of the range.
+
+  function startIndexWithinRange(listView, top, bottom) {
+    var index = indexWithinRange(listView, top, bottom);
+    index = Math.max(index - NUM_BUFFER_PAGES, 0);
+    index = Math.min(index, listView.pages.length);
+    return index;
+  }
+
+
+  // ### indexWithinRange
+  //
+  // Finds the index of the page closest to being within a given range. It's
+  // less useful than its wrapper function startIndexWithinRange, and you
+  // probably won't need to call this unwrapped version.
+  //
+  // Takes:
+  //
+  // - `listView`: the ListView instance whose pages you're looking at.
+  // - `top`: the top of the range.
+  // - `bottom`: the bottom of the range.
+
+  function indexWithinRange(listView, top, bottom) {
+    var index, length, curr, startIndex, midpoint, diff, prevDiff,
+        pages = listView.pages,
+        rangeMidpoint = top + (bottom - top)/2;
+
+    // Start looking at the index of the page last contained by the screen --
+    // not the first page in the onscreen pages
+    startIndex = Math.min(listView.startIndex + NUM_BUFFER_PAGES,
+                          pages.length - 1);
+
+    if(pages.length <= 0) return -1;
+
+    curr = pages[startIndex];
+    midpoint = curr.top + curr.height/2;
+    prevDiff = rangeMidpoint - midpoint;
+    if(prevDiff < 0) {
+      // Search above
+      for(index = startIndex - 1; index >= 0; index--) {
+        curr = pages[index];
+        midpoint = curr.top + curr.height/2;
+        diff = rangeMidpoint - midpoint;
+        if(diff > 0) {
+          if(diff < -prevDiff) return index;
+          return index + 1;
+        }
+        prevDiff = diff;
+      }
+      return 0;
+    } else if (prevDiff > 0) {
+      // Search below
+      for(index = startIndex + 1, length = pages.length; index < length; index++) {
+        curr = pages[index];
+        midpoint = curr.top + curr.height/2;
+        diff = rangeMidpoint - midpoint;
+        if(diff < 0) {
+          if(-diff < prevDiff) return index;
+          return index - 1;
+        }
+        prevDiff = diff;
+      }
+      return pages.length - 1;
+    }
+
+    // Perfect hit! Return it.
+    return startIndex;
+  }
+
+
+  // ListView cleanup
+  // ----------------
+
+  ListView.prototype.cleanup = function() {
+    var pages = this.pages,
+        page;
+    DOMEvent.detach(this);
+    while(page = pages.pop()) {
+      page.cleanup();
+    }
+  };
+
+
+  // ListView event binding
+  // ----------------------
+  //
+  // Internal scroll and resize  binding and throttling. Allows ListViews to
+  // bind to a throttled scroll event (and debounced resize event), and updates
+  // them as it fires.
+
+  var DOMEvent = (function() {
+    var eventIsBound = false,
+        scrollScheduled = false,
+        resizeTimeout = null,
+        boundViews = [];
+
+
+    // ### scrollHandler
+    //
+    // Callback called on scroll. Schedules a `scrollAll` callback if needed,
+    // and disallows future scheduling.
+
+    function scrollHandler() {
+      if(!scrollScheduled) {
+        setTimeout(scrollAll, config.SCROLL_THROTTLE);
+        scrollScheduled = true;
+      }
+    }
+
+
+    // ### scrollAll
+    //
+    // Callback passed to the setTimeout throttle. Calls `scrollListView` on
+    // every bound ListView, and then allows new scroll events to be
+    // scheduled.
+
+    function scrollAll() {
+      var index, length;
+      for(index = 0, length = boundViews.length; index < length; index++) {
+        updateStartIndex(boundViews[index]);
+      }
+      scrollScheduled = false;
+    }
+
+
+    // ### resizeHandler
+    //
+    // Callback called on resize. Debounces a `resizeAll` callback.
+
+    function resizeHandler() {
+      if(resizeTimeout) clearTimeout(resizeTimeout);
+      resizeTimeout = setTimeout(resizeAll, 200);
+    }
+
+
+    // ### resizeAll
+    //
+    // Handles resizing all ListViews. Just calls `repartition` on them for
+    // now.
+
+    function resizeAll() {
+      var index, curr;
+      for(index = 0; curr = boundViews[index]; index++) {
+        repartition(curr);
+      }
+    }
+
+    return {
+
+      // ### attach
+      //
+      // Binds a given ListView to a throttled scroll event. Does not create
+      // multiple event handlers if called by multiple ListViews.
+      //
+      // Takes:
+      //
+      // - `listView`: a ListView that is not currently bound to the scroll
+      //   event.
+
+      attach: function(listView) {
+        if(!eventIsBound) {
+          $window.on('scroll', scrollHandler);
+          $window.on('resize', resizeHandler);
+          eventIsBound = true;
+        }
+        boundViews.push(listView);
+      },
+
+
+      // ### detach
+      //
+      // Detaches a bound ListView from the throttled scroll event. If no
+      // ListViews remain bound to the throttled scroll, unbinds the scroll
+      // handler from the window's scroll event.
+      //
+      // Returns true if the listView was successfully detached, and false
+      // otherwise.
+      //
+      // Takes:
+      //
+      // - `listView`: a ListView that is currently bound to the scroll event.
+
+      detach: function(listView) {
+        var index, length;
+        for(index = 0, length = boundViews.length; index < length; index++) {
+          if(boundViews[index] === listView) {
+            boundViews.splice(index, 1);
+            if(boundViews.length === 0) {
+              $window.off('scroll', scrollHandler);
+              $window.off('resize', resizeHandler);
+              eventIsBound = false;
+            }
+            return true;
+          }
+        }
+        return false;
+      }
+    };
+  }());
+
+
+  // Page class
+  // ==========
+  //
+  // An internal class used for ordering items into roughly screen-sized pages.
+  // Pages are removed and added to the DOM wholesale as they come in and out
+  // of view.
+
+  function Page(parent) {
+    this.parent = parent;
+
+    this.items = [];
+    this.$el = blankDiv();
+
+    this.id = PageRegistry.generatePageId(this);
+    this.$el.attr(PAGE_ID_ATTRIBUTE, this.id);
+
+    this.top = 0;
+    this.bottom = 0;
+    this.width = 0;
+    this.height = 0;
+
+    this.lazyloaded = false;
+
+    this.onscreen = false;
+  }
+
+
+  // ### append
+  //
+  // Appends a ListItem to the Page.
+  //
+  // Takes:
+  //
+  // - `item`: a ListItem.
+
+  Page.prototype.append = function(item) {
+    var items = this.items;
+
+    // Recompute coords, sizing.
+    if(items.length === 0) this.top = item.top;
+    this.bottom = item.bottom;
+    this.width = this.width > item.width ? this.width : item.width;
+    this.height = this.bottom - this.top;
+
+    items.push(item);
+    item.parent = this;
+    this.$el.append(item.$el);
+
+    this.lazyloaded = false;
+  };
+
+
+  // ### prepend
+  //
+  // Prepends a ListItem to the Page.
+  //
+  // Takes:
+  //
+  // - `item`: a ListItem.
+
+  Page.prototype.prepend = function(item) {
+    var items = this.items;
+
+    // Recompute coords, sizing.
+    this.bottom += item.height;
+    this.width = this.width > item.width ? this.width : item.width;
+    this.height = this.bottom - this.top;
+
+    items.push(item);
+    item.parent = this;
+    this.$el.prepend(item.$el);
+
+    this.lazyloaded = false;
+  };
+
+
+  // ### hasVacancy
+  //
+  // Returns false if the Page is at max capacity; false otherwise.
+
+  Page.prototype.hasVacancy = function() {
+    return this.height < $window.height() * config.PAGE_TO_SCREEN_RATIO;
+  };
+
+
+  // ### appendTo
+  //
+  // Proxies to jQuery to append the Page to the given jQuery element.
+
+  Page.prototype.appendTo = function($el) {
+    if(!this.onscreen) {
+      this.$el.appendTo($el);
+      this.onscreen = true;
+    }
+  };
+
+
+  // ### prependTo
+  //
+  // Proxies to jQuery to prepend the Page to the given jQuery element.
+
+  Page.prototype.prependTo = function($el) {
+    if(!this.onscreen) {
+      this.$el.prependTo($el);
+      this.onscreen = true;
+    }
+  };
+
+  // ### stash
+  //
+  // Temporarily stash the onscreen page under a different element.
+
+  Page.prototype.stash = function($el) {
+    if(this.onscreen) {
+      this.$el.appendTo($el);
+      this.onscreen = false;
+    }
+  };
+
+
+  // ### remove
+  //
+  // Removes the Page from the DOM and cleans up after it.
+
+  Page.prototype.remove = function() {
+    if(this.onscreen) {
+      this.$el.remove();
+      this.onscreen = false;
+    }
+    this.cleanup();
+  };
+
+
+  // ### cleanup
+  //
+  // Cleans up the Page without removing it.
+
+  Page.prototype.cleanup = function() {
+    var items = this.items,
+        item;
+
+    this.parent = null;
+    PageRegistry.remove(this);
+    while (item = items.pop()) {
+      item.cleanup();
+    }
+  };
+
+
+  // ### lazyload
+  //
+  // Runs the given lazy-loading callback on all unloaded page content.
+  //
+  // Takes:
+  //
+  // - `callback`: a function of the form `function([$el]){}`. Will run on
+  // each unloaded element, and will use the element as its calling context.
+
+  Page.prototype.lazyload = function(callback) {
+    var $el = this.$el,
+        index, length;
+    if (!this.lazyloaded) {
+      for (index = 0, length = $el.length; index < length; index++) {
+        callback.call($el[index], $el[index]);
+      }
+      this.lazyloaded = true;
+    }
+  };
+
+
+  // Page Registry
+  // ------------
+
+  var PageRegistry = (function() {
+    var pages = [];
+    return {
+      generatePageId: function(page) {
+        return pages.push(page) - 1;
+      },
+      lookup: function(id) {
+        return pages[id] || null;
+      },
+      remove: function(page) {
+        var id = page.id;
+        if(!pages[id]) return false;
+        pages[id] = null;
+        return true;
+      }
+    };
+  }());
+
+
+  // ### removeItemFromPage
+  //
+  // Removes a given ListItem from the given Page.
+
+  function removeItemFromPage(item, page) {
+    var index, length, foundIndex,
+        items = page.items;
+    for(index = 0, length = items.length; index < length; index++) {
+      if(items[index] === item) {
+        foundIndex = index;
+        break;
+      }
+    }
+
+    if(foundIndex == null) return false;
+
+    items.splice(foundIndex, 1);
+    page.bottom -= item.height;
+    page.height = page.bottom - page.top;
+    if(page.hasVacancy()) tooSmall(page.parent, page);
+
+    return true;
+  }
+
+
+  // ListItem class
+  // ==============
+  //
+  // An individual item in the ListView.
+  //
+  // Has cached top, bottom, width, and height properties, determined from
+  // jQuery. This positioning data will be determined when the ListItem is
+  // inserted into a ListView; it can't be determined ahead of time.
+  //
+  // All positioning data is relative to the containing ListView.
+
+  function ListItem($el) {
+    this.$el = $el;
+
+    this.parent = null;
+
+    this.top = 0;
+    this.bottom = 0;
+    this.width = 0;
+    this.height = 0;
+  }
+
+
+  // ### clone
+  //
+  // Clones the ListItem.
+  ListItem.prototype.clone = function() {
+    var item = new ListItem(this.$el);
+    item.top = this.top;
+    item.bottom = this.bottom;
+    item.width = this.width;
+    item.height = this.height;
+    return item;
+  };
+
+  // ### remove
+  //
+  // Removes the ListItem and its elements from the page, and cleans up after
+  // them.
+
+  ListItem.prototype.remove = function() {
+    this.$el.remove();
+    removeItemFromPage(this, this.parent);
+    this.cleanup();
+  };
+
+
+  // ### cleanup
+  //
+  // Cleans up after the ListItem without removing it from the page.
+
+  ListItem.prototype.cleanup = function() {
+    this.parent = null;
+  };
+
+
+  // ### updateCoords
+  //
+  // Updates the coordinates of the given ListItem, assuming a given y-offset
+  // from the parent ListView.
+  //
+  // Takes:
+  //
+  //  - `listItem`: the ListItem whose cached coordinates you want to update.
+  //  - `yOffset`: the y-offset of the ListItem from its ListView parent.
+
+  function updateCoords(listItem, yOffset) {
+    var $el = listItem.$el;
+
+    listItem.top = yOffset;
+    listItem.height = $el.outerHeight(true);
+    listItem.bottom = listItem.top + listItem.height;
+    listItem.width = $el.width();
+  }
+
+
+
+  // Helper functions
+  // ================
+
+
+  // ### blankDiv
+  //
+  // Returns a new, empty `<div>` jQuery element. The `<div>` will have its
+  // border, margin, and padding set to zero or none, as appropriate.
+
+  function blankDiv() {
+    return $('<div>').css({
+      margin: 0,
+      padding: 0,
+      border: 'none'
+    });
+  }
+
+
+  // ### pxToInt
+  //
+  // Converts pixel values returned by jQuery to base-10 ints.
+  //
+  // Takes:
+  //
+  // - `px`: a string value, which starts with a number and is
+  //   postfixed with the string `'px'`.
+
+  //function pxToInt(px) {
+  //  return parseInt(px, 10);
+  //}
+
+
+  // Export
+  // ======
+
+  // Classes:
+  infinity.ListView = ListView;
+  infinity.Page = Page;
+  infinity.ListItem = ListItem;
+
+  //jQuery plugin
+  function registerPlugin(infinity) {
+    var ListView;
+    if(infinity) {
+      ListView = infinity.ListView;
+
+      $.fn.listView = function (options) {
+        return new ListView(this, options);
+      };
+    }
+    else {
+      delete $.fn.listView;
+    }
+  }
+
+  registerPlugin(infinity);
+
+  // Destroy own packaging:
+  infinity.noConflict = function() {
+    window.infinity = oldInfinity;
+    registerPlugin(oldInfinity);
+    return infinity;
+  };
+
+}(window, Math, jQuery);
+
+
+/*
+ * BackgroundCheck
+ * http://kennethcachia.com/background-check
+ *
+ * v1.2.2
+ */
+
+(function (root, factory) {
+
+  if (typeof define === 'function' && define.amd) {
+    define(factory);
+  } else {
+    root.BackgroundCheck = factory(root);
+  }
+
+}(this, function () {
+
+  'use strict';
+
+  var resizeEvent = window.orientation !== undefined ? 'orientationchange' : 'resize';
+  var supported;
+  var canvas;
+  var context;
+  var throttleDelay;
+  var viewport;
+  var attrs = {};
+
+
+  /*
+   * Initializer
+   */
+  function init(a) {
+
+    if (a === undefined || a.targets === undefined) {
+      throw 'Missing attributes';
+    }
+
+    // Default values
+    attrs.debug         = checkAttr(a.debug, false);
+    attrs.debugOverlay  = checkAttr(a.debugOverlay, false);
+    attrs.targets       = getElements(a.targets);
+    attrs.images        = getElements(a.images || 'img', true);
+    attrs.changeParent  = checkAttr(a.changeParent, false);
+    attrs.threshold     = checkAttr(a.threshold, 50);
+    attrs.minComplexity = checkAttr(a.minComplexity, 30);
+    attrs.minOverlap    = checkAttr(a.minOverlap, 50);
+    attrs.windowEvents  = checkAttr(a.windowEvents, true);
+    attrs.maxDuration   = checkAttr(a.maxDuration, 500);
+
+    attrs.mask = checkAttr(a.mask, {
+      r: 0,
+      g: 255,
+      b: 0
+    });
+
+    attrs.classes = checkAttr(a.classes, {
+      dark: 'background--dark',
+      light: 'background--light',
+      complex: 'background--complex'
+    });
+
+    if (supported === undefined) {
+      checkSupport();
+
+      if (supported) {
+        canvas.style.position = 'fixed';
+        canvas.style.top = '0px';
+        canvas.style.left = '0px';
+        canvas.style.width = '100%';
+        canvas.style.height = '100%';
+
+        window.addEventListener(resizeEvent, throttle.bind(null, function () {
+          resizeCanvas();
+          check();
+        }));
+
+        window.addEventListener('scroll', throttle.bind(null, check));
+
+        resizeCanvas();
+        check();
+      }
+    }
+  }
+
+
+  /*
+   * Destructor
+   */
+  function destroy() {
+    supported = null;
+    canvas = null;
+    context = null;
+    attrs = {};
+
+    if (throttleDelay) {
+      clearTimeout(throttleDelay);
+    }
+  }
+
+
+  /*
+   * Output debug logs
+   */
+  function log(msg) {
+
+    if (get('debug')) {
+      console.log(msg);
+    }
+  }
+
+
+  /*
+   * Get attribute value, use a default
+   * when undefined
+   */
+  function checkAttr(value, def) {
+    checkType(value, typeof def);
+    return (value === undefined) ? def : value;
+  }
+
+
+  /*
+   * Reject unwanted types
+   */
+  function checkType(value, type) {
+
+    if (value !== undefined && typeof value !== type) {
+      throw 'Incorrect attribute type';
+    }
+  }
+
+
+  /*
+   * Convert elements with background-image
+   * to Images
+   */
+  function checkForCSSImages(els) {
+    var el;
+    var url;
+    var list = [];
+
+    for (var e = 0; e < els.length; e++) {
+      el = els[e];
+      list.push(el);
+
+      if (el.tagName !== 'IMG') {
+        url = window.getComputedStyle(el).backgroundImage;
+
+        // Ignore multiple backgrounds
+        if (url.split(/,url|, url/).length > 1) {
+          throw 'Multiple backgrounds are not supported';
+        }
+
+        if (url && url !== 'none') {
+          list[e] = {
+            img: new Image(),
+            el: list[e]
+          };
+
+          url = url.slice(4, -1);
+          url = url.replace(/"/g, '');
+
+          list[e].img.src = url;
+          log('CSS Image - ' + url);
+        } else {
+          throw 'Element is not an <img> but does not have a background-image';
+        }
+      }
+    }
+
+    return list;
+  }
+
+
+  /*
+   * Check for String, Element or NodeList
+   */
+  function getElements(selector, convertToImages) {
+    var els = selector;
+
+    if (typeof selector === 'string') {
+      els = document.querySelectorAll(selector);
+    } else if (selector && selector.nodeType === 1) {
+      els = [selector];
+    }
+
+    if (!els || els.length === 0 || els.length === undefined) {
+      throw 'Elements not found';
+    } else {
+
+      if (convertToImages) {
+        els = checkForCSSImages(els);
+      }
+
+      els = Array.prototype.slice.call(els);
+    }
+
+    return els;
+  }
+
+
+  /*
+   * Check if browser supports <canvas>
+   */
+  function checkSupport() {
+    canvas = document.createElement('canvas');
+
+    if (canvas && canvas.getContext) {
+      context = canvas.getContext('2d');
+      supported = true;
+    } else {
+      supported = false;
+    }
+
+    showDebugOverlay();
+  }
+
+
+  /*
+   * Show <canvas> on top of page
+   */
+  function showDebugOverlay() {
+
+    if (get('debugOverlay')) {
+      canvas.style.opacity = 0.5;
+      canvas.style.pointerEvents = 'none';
+      document.body.appendChild(canvas);
+    } else {
+
+      // Check if it was previously added
+      if (canvas.parentNode) {
+        canvas.parentNode.removeChild(canvas);
+      }
+    }
+  }
+
+
+  /*
+   * Stop if it's slow
+   */
+  function kill(start) {
+    var duration = new Date().getTime() - start;
+
+    log('Duration: ' + duration + 'ms');
+
+    if (duration > get('maxDuration')) {
+      // Log a message even when debug is false
+      console.log('BackgroundCheck - Killed');
+      removeClasses();
+      destroy();
+    }
+  }
+
+
+  /*
+   * Set width and height of <canvas>
+   */
+  function resizeCanvas() {
+    viewport = {
+      left: 0,
+      top: 0,
+      right: document.body.clientWidth,
+      bottom: window.innerHeight
+    };
+
+    canvas.width = document.body.clientWidth;
+    canvas.height = window.innerHeight;
+  }
+
+
+  /*
+   * Process px and %, discard anything else
+   */
+  function getValue(css, parent, delta) {
+    var value;
+    var percentage;
+
+    if (css.indexOf('px') !== -1) {
+      value = parseFloat(css);
+    } else if (css.indexOf('%') !== -1) {
+      value = parseFloat(css);
+      percentage = value / 100;
+      value = percentage * parent;
+
+      if (delta) {
+        value -= delta * percentage;
+      }
+    } else {
+      value = parent;
+    }
+
+    return value;
+  }
+
+
+  /*
+   * Calculate top, left, width and height
+   * using the object's CSS
+   */
+  function calculateAreaFromCSS(obj) {
+    var css = window.getComputedStyle(obj.el);
+
+    // Force no-repeat and padding-box
+    obj.el.style.backgroundRepeat = 'no-repeat';
+    obj.el.style.backgroundOrigin = 'padding-box';
+
+    // Background Size
+    var size = css.backgroundSize.split(' ');
+    var width = size[0];
+    var height = size[1] === undefined ? 'auto' : size[1];
+
+    var parentRatio = obj.el.clientWidth / obj.el.clientHeight;
+    var imgRatio = obj.img.naturalWidth / obj.img.naturalHeight;
+
+    if (width === 'cover') {
+
+      if (parentRatio >= imgRatio) {
+        width = '100%';
+        height = 'auto';
+      } else {
+        width = 'auto';
+        size[0] = 'auto';
+        height = '100%';
+      }
+
+    } else if (width === 'contain') {
+
+      if (1 / parentRatio < 1 / imgRatio) {
+        width = 'auto';
+        size[0] = 'auto';
+        height = '100%';
+      } else {
+        width = '100%';
+        height = 'auto';
+      }
+    }
+
+    if (width === 'auto') {
+      width = obj.img.naturalWidth;
+    } else {
+      width = getValue(width, obj.el.clientWidth);
+    }
+
+    if (height === 'auto') {
+      height = (width / obj.img.naturalWidth) * obj.img.naturalHeight;
+    } else {
+      height = getValue(height, obj.el.clientHeight);
+    }
+
+    if (size[0] === 'auto' && size[1] !== 'auto') {
+      width = (height / obj.img.naturalHeight) * obj.img.naturalWidth;
+    }
+
+    var position = css.backgroundPosition;
+
+    // Fix inconsistencies between browsers
+    if (position === 'top') {
+      position = '50% 0%';
+    } else if (position === 'left') {
+      position = '0% 50%';
+    } else if (position === 'right') {
+      position = '100% 50%';
+    } else if (position === 'bottom') {
+      position = '50% 100%';
+    } else if (position === 'center') {
+      position = '50% 50%';
+    }
+
+    position = position.split(' ');
+
+    var x;
+    var y;
+
+    // Two-value syntax vs Four-value syntax
+    if (position.length === 4) {
+      x = position[1];
+      y = position[3];
+    } else {
+      x = position[0];
+      y = position[1];
+    }
+
+    // Use a default value
+    y = y || '50%';
+
+    // Background Position
+    x = getValue(x, obj.el.clientWidth, width);
+    y = getValue(y, obj.el.clientHeight, height);
+
+    // Take care of ex: background-position: right 20px bottom 20px;
+    if (position.length === 4) {
+
+      if (position[0] === 'right') {
+        x = obj.el.clientWidth - obj.img.naturalWidth - x;
+      }
+
+      if (position[2] === 'bottom') {
+        y = obj.el.clientHeight - obj.img.naturalHeight - y;
+      }
+    }
+
+    x += obj.el.getBoundingClientRect().left;
+    y += obj.el.getBoundingClientRect().top;
+
+    return {
+      left: Math.floor(x),
+      right: Math.floor(x + width),
+      top: Math.floor(y),
+      bottom: Math.floor(y + height),
+      width: Math.floor(width),
+      height: Math.floor(height)
+    };
+  }
+
+
+  /*
+   * Get Bounding Client Rect
+   */
+  function getArea(obj) {
+    var area;
+    var image;
+    var parent;
+
+    if (obj.nodeType) {
+      var rect = obj.getBoundingClientRect();
+
+      // Clone ClientRect for modification purposes
+      area = {
+        left: rect.left,
+        right: rect.right,
+        top: rect.top,
+        bottom: rect.bottom,
+        width: rect.width,
+        height: rect.height
+      };
+
+      parent = obj.parentNode;
+      image = obj;
+    } else {
+      area = calculateAreaFromCSS(obj);
+      parent = obj.el;
+      image = obj.img;
+    }
+
+    parent = parent.getBoundingClientRect();
+
+    area.imageTop = 0;
+    area.imageLeft = 0;
+    area.imageWidth = image.naturalWidth;
+    area.imageHeight = image.naturalHeight;
+
+    var ratio = area.imageHeight / area.height;
+    var delta;
+
+    // Stay within the parent's boundary
+    if (area.top < parent.top) {
+      delta = parent.top - area.top;
+      area.imageTop = ratio * delta;
+      area.imageHeight -= ratio * delta;
+      area.top += delta;
+      area.height -= delta;
+    }
+
+    if (area.left < parent.left) {
+      delta = parent.left - area.left;
+      area.imageLeft += ratio * delta;
+      area.imageWidth -= ratio * delta;
+      area.width -= delta;
+      area.left += delta;
+    }
+
+    if (area.bottom > parent.bottom) {
+      delta = area.bottom - parent.bottom;
+      area.imageHeight -= ratio * delta;
+      area.height -= delta;
+    }
+
+    if (area.right > parent.right) {
+      delta = area.right - parent.right;
+      area.imageWidth -= ratio * delta;
+      area.width -= delta;
+    }
+
+    area.imageTop = Math.floor(area.imageTop);
+    area.imageLeft = Math.floor(area.imageLeft);
+    area.imageHeight = Math.floor(area.imageHeight);
+    area.imageWidth = Math.floor(area.imageWidth);
+
+    return area;
+  }
+
+
+  /*
+   * Render image on canvas
+   */
+  function drawImage(image) {
+    var area = getArea(image);
+
+    image = image.nodeType ? image : image.img;
+
+    if (area.imageWidth > 0 && area.imageHeight > 0 && area.width > 0 && area.height > 0) {
+      context.drawImage(image,
+                        area.imageLeft, area.imageTop, area.imageWidth, area.imageHeight,
+                        area.left, area.top, area.width, area.height);
+    } else {
+      log('Skipping image - ' + image.src + ' - area too small');
+    }
+  }
+
+
+  /*
+   * Add/remove classes
+   */
+  function classList(node, name, mode) {
+    var className = node.className;
+
+    switch (mode) {
+    case 'add':
+      className += ' ' + name;
+      break;
+    case 'remove':
+      var pattern = new RegExp('(?:^|\\s)' + name + '(?!\\S)', 'g');
+      className = className.replace(pattern, '');
+      break;
+    }
+
+    node.className = className.trim();
+  }
+
+
+  /*
+   * Remove classes from element or
+   * their parents, depending on checkParent
+   */
+  function removeClasses(el) {
+    var targets = el ? [el] : get('targets');
+    var target;
+
+    for (var t = 0; t < targets.length; t++) {
+      target = targets[t];
+      target = get('changeParent') ? target.parentNode : target;
+
+      classList(target, get('classes').light, 'remove');
+      classList(target, get('classes').dark, 'remove');
+      classList(target, get('classes').complex, 'remove');
+    }
+  }
+
+
+  /*
+   * Calculate average pixel brightness of a region
+   * and add 'light' or 'dark' accordingly
+   */
+  function calculatePixelBrightness(target) {
+    var dims = target.getBoundingClientRect();
+    var brightness;
+    var data;
+    var pixels = 0;
+    var delta;
+    var deltaSqr = 0;
+    var mean = 0;
+    var variance;
+    var minOverlap = 0;
+    var mask = get('mask');
+
+    if (dims.width > 0 && dims.height > 0) {
+      removeClasses(target);
+
+      target = get('changeParent') ? target.parentNode : target;
+      data = context.getImageData(dims.left, dims.top, dims.width, dims.height).data;
+
+      for (var p = 0; p < data.length; p += 4) {
+
+        if (data[p] === mask.r && data[p + 1] === mask.g && data[p + 2] === mask.b) {
+          minOverlap++;
+        } else {
+          pixels++;
+          brightness = (0.2126 * data[p]) + (0.7152 * data[p + 1]) + (0.0722 * data[p + 2]);
+          delta = brightness - mean;
+          deltaSqr += delta * delta;
+          mean = mean + delta / pixels;
+        }
+      }
+
+      if (minOverlap <= (data.length / 4) * (1 - (get('minOverlap') / 100))) {
+        variance = Math.sqrt(deltaSqr / pixels) / 255;
+        mean = mean / 255;
+        log('Target: ' + target.className +  ' lum: ' + mean + ' var: ' + variance);
+        classList(target, mean <= (get('threshold') / 100) ? get('classes').dark : get('classes').light, 'add');
+
+        if (variance > get('minComplexity') / 100) {
+          classList(target, get('classes').complex, 'add');
+        }
+      }
+    }
+  }
+
+
+  /*
+   * Test if a is within b's boundary
+   */
+  function isInside(a, b) {
+    a = (a.nodeType ? a : a.el).getBoundingClientRect();
+    b = b === viewport ? b : (b.nodeType ? b : b.el).getBoundingClientRect();
+
+    return !(a.right < b.left || a.left > b.right || a.top > b.bottom || a.bottom < b.top);
+  }
+
+
+  /*
+   * Process all targets (checkTarget is undefined)
+   * or a single target (checkTarget is a previously set target)
+   *
+   * When not all images are loaded, checkTarget is an image
+   * to avoid processing all targets multiple times
+   */
+  function processTargets(checkTarget) {
+    var start = new Date().getTime();
+    var mode = (checkTarget && (checkTarget.tagName === 'IMG' || checkTarget.img)) ? 'image' : 'targets';
+    var found = checkTarget ? false : true;
+    var total = get('targets').length;
+    var target;
+
+    for (var t = 0; t < total; t++) {
+      target = get('targets')[t];
+
+      if (isInside(target, viewport)) {
+        if (mode === 'targets' && (!checkTarget || checkTarget === target)) {
+          found = true;
+          calculatePixelBrightness(target);
+        } else if (mode === 'image' && isInside(target, checkTarget)) {
+          calculatePixelBrightness(target);
+        }
+      }
+    }
+
+    if (mode === 'targets' && !found) {
+      throw checkTarget + ' is not a target';
+    }
+
+    kill(start);
+  }
+
+
+  /*
+   * Find the element's zIndex. Also checks
+   * the zIndex of its parent
+   */
+  function getZIndex(el) {
+    var calculate = function (el) {
+      var zindex = 0;
+
+      if (window.getComputedStyle(el).position !== 'static') {
+        zindex = parseInt(window.getComputedStyle(el).zIndex, 10) || 0;
+
+        // Reserve zindex = 0 for elements with position: static;
+        if (zindex >= 0) {
+          zindex++;
+        }
+      }
+
+      return zindex;
+    };
+
+    var parent = el.parentNode;
+    var zIndexParent = parent ? calculate(parent) : 0;
+    var zIndexEl = calculate(el);
+
+    return (zIndexParent * 100000) + zIndexEl;
+  }
+
+
+  /*
+   * Check zIndexes
+   */
+  function sortImagesByZIndex(images) {
+    var sorted = false;
+
+    images.sort(function (a, b) {
+      a = a.nodeType ? a : a.el;
+      b = b.nodeType ? b : b.el;
+
+      var pos = a.compareDocumentPosition(b);
+      var reverse = 0;
+
+      a = getZIndex(a);
+      b = getZIndex(b);
+
+      if (a > b) {
+        sorted = true;
+      }
+
+      // Reposition if zIndex is the same but the elements are not
+      // sorted according to their document position
+      if (a === b && pos === 2) {
+        reverse = 1;
+      } else if (a === b && pos === 4) {
+        reverse = -1;
+      }
+
+      return reverse || a - b;
+    });
+
+    log('Sorted: ' + sorted);
+
+    if (sorted) {
+      log(images);
+    }
+
+    return sorted;
+  }
+
+
+  /*
+   * Main function
+   */
+  function check(target, avoidClear, imageLoaded) {
+
+    if (supported) {
+      var mask = get('mask');
+
+      log('--- BackgroundCheck ---');
+      log('onLoad event: ' + (imageLoaded && imageLoaded.src));
+
+      if (avoidClear !== true) {
+        context.clearRect(0, 0, canvas.width, canvas.height);
+        context.fillStyle = 'rgb(' + mask.r + ', ' + mask.g + ', ' + mask.b + ')';
+        context.fillRect(0, 0, canvas.width, canvas.height);
+      }
+
+      var processImages = imageLoaded ? [imageLoaded] : get('images');
+      var sorted = sortImagesByZIndex(processImages);
+
+      var image;
+      var imageNode;
+      var loading = false;
+
+      for (var i = 0; i < processImages.length; i++) {
+        image = processImages[i];
+
+        if (isInside(image, viewport)) {
+          imageNode = image.nodeType ? image : image.img;
+
+          if (imageNode.naturalWidth === 0) {
+            loading = true;
+            log('Loading... ' + image.src);
+
+            imageNode.removeEventListener('load', check);
+
+            if (sorted) {
+              // Sorted -- redraw all images
+              imageNode.addEventListener('load', check.bind(null, null, false, null));
+            } else {
+              // Not sorted -- just draw one image
+              imageNode.addEventListener('load', check.bind(null, target, true, image));
+            }
+          } else {
+            log('Drawing: ' + image.src);
+            drawImage(image);
+          }
+        }
+      }
+
+      if (!imageLoaded && !loading) {
+        processTargets(target);
+      } else if (imageLoaded) {
+        processTargets(imageLoaded);
+      }
+    }
+  }
+
+
+  /*
+   * Throttle events
+   */
+  function throttle(callback) {
+
+    if (get('windowEvents') === true) {
+
+      if (throttleDelay) {
+        clearTimeout(throttleDelay);
+      }
+
+      throttleDelay = setTimeout(callback, 200);
+    }
+  }
+
+
+  /*
+   * Setter
+   */
+  function set(property, newValue) {
+
+    if (attrs[property] === undefined) {
+      throw 'Unknown property - ' + property;
+    } else if (newValue === undefined) {
+      throw 'Missing value for ' + property;
+    }
+
+    if (property === 'targets' || property === 'images') {
+
+      try {
+        newValue = getElements(property === 'images' && !newValue ? 'img' : newValue, property === 'images' ? true : false);
+      } catch (err) {
+        newValue = [];
+        throw err;
+      }
+    } else {
+      checkType(newValue, typeof attrs[property]);
+    }
+
+    removeClasses();
+    attrs[property] = newValue;
+    check();
+
+    if (property === 'debugOverlay') {
+      showDebugOverlay();
+    }
+  }
+
+
+  /*
+   * Getter
+   */
+  function get(property) {
+
+    if (attrs[property] === undefined) {
+      throw 'Unknown property - ' + property;
+    }
+
+    return attrs[property];
+  }
+
+
+  /*
+   * Get position and size of all images.
+   * Used for testing purposes
+   */
+  function getImageData() {
+    var images = get('images');
+    var area;
+    var data = [];
+
+    for (var i = 0; i < images.length; i++) {
+      area = getArea(images[i]);
+      data.push(area);
+    }
+
+    return data;
+  }
+
+
+  return {
+    /*
+     * Init and destroy
+     */
+    init: init,
+    destroy: destroy,
+
+    /*
+     * Expose main function
+     */
+    refresh: check,
+
+    /*
+     * Setters and getters
+     */
+    set: set,
+    get: get,
+
+    /*
+     * Return image data
+     */
+    getImageData: getImageData
+  };
+
+}));
+
+/**
+ * Copyright 2013-2015, Facebook, Inc.
+ * All rights reserved.
+ *
+ * This source code is licensed under the BSD-style license found in the
+ * LICENSE file in the root directory of this source tree. An additional grant
+ * of patent rights can be found in the PATENTS file in the same directory.
+ *
+ * @providesModule ReactMultiChild
+ * @typechecks static-only
+ */
+
+'use strict';
+
+var ReactComponentEnvironment = require('ReactComponentEnvironment');
+var ReactMultiChildUpdateTypes = require('ReactMultiChildUpdateTypes');
+
+var ReactReconciler = require('ReactReconciler');
+var ReactChildReconciler = require('ReactChildReconciler');
+
+/**
+ * Updating children of a component may trigger recursive updates. The depth is
+ * used to batch recursive updates to render markup more efficiently.
+ *
+ * @type {number}
+ * @private
+ */
+var updateDepth = 0;
+
+/**
+ * Queue of update configuration objects.
+ *
+ * Each object has a `type` property that is in `ReactMultiChildUpdateTypes`.
+ *
+ * @type {array<object>}
+ * @private
+ */
+var updateQueue = [];
+
+/**
+ * Queue of markup to be rendered.
+ *
+ * @type {array<string>}
+ * @private
+ */
+var markupQueue = [];
+
+/**
+ * Enqueues markup to be rendered and inserted at a supplied index.
+ *
+ * @param {string} parentID ID of the parent component.
+ * @param {string} markup Markup that renders into an element.
+ * @param {number} toIndex Destination index.
+ * @private
+ */
+function enqueueMarkup(parentID, markup, toIndex) {
+  // NOTE: Null values reduce hidden classes.
+  updateQueue.push({
+    parentID: parentID,
+    parentNode: null,
+    type: ReactMultiChildUpdateTypes.INSERT_MARKUP,
+    markupIndex: markupQueue.push(markup) - 1,
+    textContent: null,
+    fromIndex: null,
+    toIndex: toIndex
+  });
+}
+
+/**
+ * Enqueues moving an existing element to another index.
+ *
+ * @param {string} parentID ID of the parent component.
+ * @param {number} fromIndex Source index of the existing element.
+ * @param {number} toIndex Destination index of the element.
+ * @private
+ */
+function enqueueMove(parentID, fromIndex, toIndex) {
+  // NOTE: Null values reduce hidden classes.
+  updateQueue.push({
+    parentID: parentID,
+    parentNode: null,
+    type: ReactMultiChildUpdateTypes.MOVE_EXISTING,
+    markupIndex: null,
+    textContent: null,
+    fromIndex: fromIndex,
+    toIndex: toIndex
+  });
+}
+
+/**
+ * Enqueues removing an element at an index.
+ *
+ * @param {string} parentID ID of the parent component.
+ * @param {number} fromIndex Index of the element to remove.
+ * @private
+ */
+function enqueueRemove(parentID, fromIndex) {
+  // NOTE: Null values reduce hidden classes.
+  updateQueue.push({
+    parentID: parentID,
+    parentNode: null,
+    type: ReactMultiChildUpdateTypes.REMOVE_NODE,
+    markupIndex: null,
+    textContent: null,
+    fromIndex: fromIndex,
+    toIndex: null
+  });
+}
+
+/**
+ * Enqueues setting the text content.
+ *
+ * @param {string} parentID ID of the parent component.
+ * @param {string} textContent Text content to set.
+ * @private
+ */
+function enqueueTextContent(parentID, textContent) {
+  // NOTE: Null values reduce hidden classes.
+  updateQueue.push({
+    parentID: parentID,
+    parentNode: null,
+    type: ReactMultiChildUpdateTypes.TEXT_CONTENT,
+    markupIndex: null,
+    textContent: textContent,
+    fromIndex: null,
+    toIndex: null
+  });
+}
+
+/**
+ * Processes any enqueued updates.
+ *
+ * @private
+ */
+function processQueue() {
+  if (updateQueue.length) {
+    ReactComponentEnvironment.processChildrenUpdates(
+      updateQueue,
+      markupQueue
+    );
+    clearQueue();
+  }
+}
+
+/**
+ * Clears any enqueued updates.
+ *
+ * @private
+ */
+function clearQueue() {
+  updateQueue.length = 0;
+  markupQueue.length = 0;
+}
+
+/**
+ * ReactMultiChild are capable of reconciling multiple children.
+ *
+ * @class ReactMultiChild
+ * @internal
+ */
+var ReactMultiChild = {
+
+  /**
+   * Provides common functionality for components that must reconcile multiple
+   * children. This is used by `ReactDOMComponent` to mount, update, and
+   * unmount child components.
+   *
+   * @lends {ReactMultiChild.prototype}
+   */
+  Mixin: {
+
+    /**
+     * Generates a "mount image" for each of the supplied children. In the case
+     * of `ReactDOMComponent`, a mount image is a string of markup.
+     *
+     * @param {?object} nestedChildren Nested child maps.
+     * @return {array} An array of mounted representations.
+     * @internal
+     */
+    mountChildren: function(nestedChildren, transaction, context) {
+      var children = ReactChildReconciler.instantiateChildren(
+        nestedChildren, transaction, context
+      );
+      this._renderedChildren = children;
+      var mountImages = [];
+      var index = 0;
+      for (var name in children) {
+        if (children.hasOwnProperty(name)) {
+          var child = children[name];
+          // Inlined for performance, see `ReactInstanceHandles.createReactID`.
+          var rootID = this._rootNodeID + name;
+          var mountImage = ReactReconciler.mountComponent(
+            child,
+            rootID,
+            transaction,
+            context
+          );
+          child._mountIndex = index;
+          mountImages.push(mountImage);
+          index++;
+        }
+      }
+      return mountImages;
+    },
+
+    /**
+     * Replaces any rendered children with a text content string.
+     *
+     * @param {string} nextContent String of content.
+     * @internal
+     */
+    updateTextContent: function(nextContent) {
+      updateDepth++;
+      var errorThrown = true;
+      try {
+        var prevChildren = this._renderedChildren;
+        // Remove any rendered children.
+        ReactChildReconciler.unmountChildren(prevChildren);
+        // TODO: The setTextContent operation should be enough
+        for (var name in prevChildren) {
+          if (prevChildren.hasOwnProperty(name)) {
+            this._unmountChildByName(prevChildren[name], name);
+          }
+        }
+        // Set new text content.
+        this.setTextContent(nextContent);
+        errorThrown = false;
+      } finally {
+        updateDepth--;
+        if (!updateDepth) {
+          if (errorThrown) {
+            clearQueue();
+          } else {
+            processQueue();
+          }
+        }
+      }
+    },
+
+    /**
+     * Updates the rendered children with new children.
+     *
+     * @param {?object} nextNestedChildren Nested child maps.
+     * @param {ReactReconcileTransaction} transaction
+     * @internal
+     */
+    updateChildren: function(nextNestedChildren, transaction, context) {
+      updateDepth++;
+      var errorThrown = true;
+      try {
+        this._updateChildren(nextNestedChildren, transaction, context);
+        errorThrown = false;
+      } finally {
+        updateDepth--;
+        if (!updateDepth) {
+          if (errorThrown) {
+            clearQueue();
+          } else {
+            processQueue();
+          }
+        }
+
+      }
+    },
+
+    /**
+     * Improve performance by isolating this hot code path from the try/catch
+     * block in `updateChildren`.
+     *
+     * @param {?object} nextNestedChildren Nested child maps.
+     * @param {ReactReconcileTransaction} transaction
+     * @final
+     * @protected
+     */
+    _updateChildren: function(nextNestedChildren, transaction, context) {
+      var prevChildren = this._renderedChildren;
+      var nextChildren = ReactChildReconciler.updateChildren(
+        prevChildren, nextNestedChildren, transaction, context
+      );
+      this._renderedChildren = nextChildren;
+      if (!nextChildren && !prevChildren) {
+        return;
+      }
+      var name;
+      // `nextIndex` will increment for each child in `nextChildren`, but
+      // `lastIndex` will be the last index visited in `prevChildren`.
+      var lastIndex = 0;
+      var nextIndex = 0;
+      for (name in nextChildren) {
+        if (!nextChildren.hasOwnProperty(name)) {
+          continue;
+        }
+        var prevChild = prevChildren && prevChildren[name];
+        var nextChild = nextChildren[name];
+        if (prevChild === nextChild) {
+          this.moveChild(prevChild, nextIndex, lastIndex);
+          lastIndex = Math.max(prevChild._mountIndex, lastIndex);
+          prevChild._mountIndex = nextIndex;
+        } else {
+          if (prevChild) {
+            // Update `lastIndex` before `_mountIndex` gets unset by unmounting.
+            lastIndex = Math.max(prevChild._mountIndex, lastIndex);
+            this._unmountChildByName(prevChild, name);
+          }
+          // The child must be instantiated before it's mounted.
+          this._mountChildByNameAtIndex(
+            nextChild, name, nextIndex, transaction, context
+          );
+        }
+        nextIndex++;
+      }
+      // Remove children that are no longer present.
+      for (name in prevChildren) {
+        if (prevChildren.hasOwnProperty(name) &&
+            !(nextChildren && nextChildren.hasOwnProperty(name))) {
+          this._unmountChildByName(prevChildren[name], name);
+        }
+      }
+    },
+
+    /**
+     * Unmounts all rendered children. This should be used to clean up children
+     * when this component is unmounted.
+     *
+     * @internal
+     */
+    unmountChildren: function() {
+      var renderedChildren = this._renderedChildren;
+      ReactChildReconciler.unmountChildren(renderedChildren);
+      this._renderedChildren = null;
+    },
+
+    /**
+     * Moves a child component to the supplied index.
+     *
+     * @param {ReactComponent} child Component to move.
+     * @param {number} toIndex Destination index of the element.
+     * @param {number} lastIndex Last index visited of the siblings of `child`.
+     * @protected
+     */
+    moveChild: function(child, toIndex, lastIndex) {
+      // If the index of `child` is less than `lastIndex`, then it needs to
+      // be moved. Otherwise, we do not need to move it because a child will be
+      // inserted or moved before `child`.
+      if (child._mountIndex < lastIndex) {
+        enqueueMove(this._rootNodeID, child._mountIndex, toIndex);
+      }
+    },
+
+    /**
+     * Creates a child component.
+     *
+     * @param {ReactComponent} child Component to create.
+     * @param {string} mountImage Markup to insert.
+     * @protected
+     */
+    createChild: function(child, mountImage) {
+      enqueueMarkup(this._rootNodeID, mountImage, child._mountIndex);
+    },
+
+    /**
+     * Removes a child component.
+     *
+     * @param {ReactComponent} child Child to remove.
+     * @protected
+     */
+    removeChild: function(child) {
+      enqueueRemove(this._rootNodeID, child._mountIndex);
+    },
+
+    /**
+     * Sets this text content string.
+     *
+     * @param {string} textContent Text content to set.
+     * @protected
+     */
+    setTextContent: function(textContent) {
+      enqueueTextContent(this._rootNodeID, textContent);
+    },
+
+    /**
+     * Mounts a child with the supplied name.
+     *
+     * NOTE: This is part of `updateChildren` and is here for readability.
+     *
+     * @param {ReactComponent} child Component to mount.
+     * @param {string} name Name of the child.
+     * @param {number} index Index at which to insert the child.
+     * @param {ReactReconcileTransaction} transaction
+     * @private
+     */
+    _mountChildByNameAtIndex: function(
+      child,
+      name,
+      index,
+      transaction,
+      context) {
+      // Inlined for performance, see `ReactInstanceHandles.createReactID`.
+      var rootID = this._rootNodeID + name;
+      var mountImage = ReactReconciler.mountComponent(
+        child,
+        rootID,
+        transaction,
+        context
+      );
+      child._mountIndex = index;
+      this.createChild(child, mountImage);
+    },
+
+    /**
+     * Unmounts a rendered child by name.
+     *
+     * NOTE: This is part of `updateChildren` and is here for readability.
+     *
+     * @param {ReactComponent} child Component to unmount.
+     * @param {string} name Name of the child in `this._renderedChildren`.
+     * @private
+     */
+    _unmountChildByName: function(child, name) {
+      this.removeChild(child);
+      child._mountIndex = null;
+    }
+
+  }
+
+};
+
+module.exports = ReactMultiChild;
+
+/**
+ * Copyright 2013-2015, Facebook, Inc.
+ * All rights reserved.
+ *
+ * This source code is licensed under the BSD-style license found in the
+ * LICENSE file in the root directory of this source tree. An additional grant
+ * of patent rights can be found in the PATENTS file in the same directory.
+ *
+ * @providesModule ReactOwner
+ */
+
+'use strict';
+
+var invariant = require('invariant');
+
+/**
+ * ReactOwners are capable of storing references to owned components.
+ *
+ *   var MyComponent = React.createClass({
+ *     render: function() {
+ *       return (
+ *         <div onClick={this.handleClick}>
+ *           <CustomComponent ref="custom" />
+ *         </div>
+ *       );
+ *     },
+ *     handleClick: function() {
+ *       this.refs.custom.handleClick();
+ *     },
+ *     componentDidMount: function() {
+ *       this.refs.custom.initialize();
+ *     }
+ *   });
+ */
+var ReactOwner = {
+
+  /**
+   * @param {?object} object
+   * @return {boolean} True if `object` is a valid owner.
+   * @final
+   */
+  isValidOwner: function(object) {
+    return !!(
+      object &&
+      typeof object.attachRef === 'function' &&
+      typeof object.detachRef === 'function'
+    );
+  },
+
+  /**
+   * Adds a component by ref to an owner component.
+   *
+   * @param {ReactComponent} component Component to reference.
+   * @param {string} ref Name by which to refer to the component.
+   * @param {ReactOwner} owner Component on which to record the ref.
+   * @final
+   * @internal
+   */
+  addComponentAsRefTo: function(component, ref, owner) {
+    invariant(
+      ReactOwner.isValidOwner(owner),
+      'addComponentAsRefTo(...): Only a ReactOwner can have refs. This ' +
+      'usually means that you\'re trying to add a ref to a component that ' +
+      'doesn\'t have an owner (that is, was not created inside of another ' +
+      'component\'s `render` method). Try rendering this component inside of ' +
+      'a new top-level component which will hold the ref.'
+    );
+    owner.attachRef(ref, component);
+  },
+
+  /**
+   * Removes a component by ref from an owner component.
+   *
+   * @param {ReactComponent} component Component to dereference.
+   * @param {string} ref Name of the ref to remove.
+   * @param {ReactOwner} owner Component on which the ref is recorded.
+   * @final
+   * @internal
+   */
+  removeComponentAsRefFrom: function(component, ref, owner) {
+    invariant(
+      ReactOwner.isValidOwner(owner),
+      'removeComponentAsRefFrom(...): Only a ReactOwner can have refs. This ' +
+      'usually means that you\'re trying to remove a ref to a component that ' +
+      'doesn\'t have an owner (that is, was not created inside of another ' +
+      'component\'s `render` method). Try rendering this component inside of ' +
+      'a new top-level component which will hold the ref.'
+    );
+    // Check that `component` is still the current ref because we do not want to
+    // detach the ref if another component stole it.
+    if (owner.getPublicInstance().refs[ref] === component.getPublicInstance()) {
+      owner.detachRef(ref);
+    }
+  }
+
+};
+
+module.exports = ReactOwner;
+
+
+/**
+ * Module dependencies.
+ */
+
+var parser = require('socket.io-parser');
+var debug = require('debug')('socket.io:client');
+
+/**
+ * Module exports.
+ */
+
+module.exports = Client;
+
+/**
+ * Client constructor.
+ *
+ * @param {Server} server instance
+ * @param {Socket} connection
+ * @api private
+ */
+
+function Client(server, conn){
+  this.server = server;
+  this.conn = conn;
+  this.encoder = new parser.Encoder();
+  this.decoder = new parser.Decoder();
+  this.id = conn.id;
+  this.request = conn.request;
+  this.setup();
+  this.sockets = [];
+  this.nsps = {};
+  this.connectBuffer = [];
+}
+
+/**
+ * Sets up event listeners.
+ *
+ * @api private
+ */
+
+Client.prototype.setup = function(){
+  this.onclose = this.onclose.bind(this);
+  this.ondata = this.ondata.bind(this);
+  this.onerror = this.onerror.bind(this);
+  this.ondecoded = this.ondecoded.bind(this);
+
+  this.decoder.on('decoded', this.ondecoded);
+  this.conn.on('data', this.ondata);
+  this.conn.on('error', this.onerror);
+  this.conn.on('close', this.onclose);
+};
+
+/**
+ * Connects a client to a namespace.
+ *
+ * @param {String} namespace name
+ * @api private
+ */
+
+Client.prototype.connect = function(name){
+  debug('connecting to namespace %s', name);
+  if (!this.server.nsps[name]) {
+    this.packet({ type: parser.ERROR, nsp: name, data : 'Invalid namespace'}, false, false, true);
+    return;
+  }
+  var nsp = this.server.of(name);
+  if ('/' != name && !this.nsps['/']) {
+    this.connectBuffer.push(name);
+    return;
+  }
+
+  var self = this;
+  var socket = nsp.add(this, function(){
+    self.sockets.push(socket);
+    self.nsps[nsp.name] = socket;
+
+    if ('/' == nsp.name && self.connectBuffer.length > 0) {
+      self.connectBuffer.forEach(self.connect, self);
+      self.connectBuffer = [];
+    }
+  });
+};
+
+/**
+ * Disconnects from all namespaces and closes transport.
+ *
+ * @api private
+ */
+
+Client.prototype.disconnect = function(){
+  var socket;
+  // we don't use a for loop because the length of
+  // `sockets` changes upon each iteration
+  while (socket = this.sockets.shift()) {
+    socket.disconnect();
+  }
+  this.close();
+};
+
+/**
+ * Removes a socket. Called by each `Socket`.
+ *
+ * @api private
+ */
+
+Client.prototype.remove = function(socket){
+  var i = this.sockets.indexOf(socket);
+  if (~i) {
+    var nsp = this.sockets[i].nsp.name;
+    this.sockets.splice(i, 1);
+    delete this.nsps[nsp];
+  } else {
+    debug('ignoring remove for %s', socket.id);
+  }
+};
+
+/**
+ * Closes the underlying connection.
+ *
+ * @api private
+ */
+
+Client.prototype.close = function(){
+  if ('open' == this.conn.readyState) {
+    debug('forcing transport close');
+    this.conn.close();
+    this.onclose('forced server close');
+  }
+};
+
+/**
+ * Writes a packet to the transport.
+ *
+ * @param {Object} packet object
+ * @param {Boolean} whether packet is already encoded
+ * @param {Boolean} whether packet is volatile
+ * @param {Boolean} whether packet should be compressed
+ * @api private
+ */
+
+Client.prototype.packet = function(packet, preEncoded, volatile, compress){
+  var self = this;
+
+  // this writes to the actual connection
+  function writeToEngine(encodedPackets) {
+    if (volatile && !self.conn.transport.writable) return;
+    for (var i = 0; i < encodedPackets.length; i++) {
+      self.conn.write(encodedPackets[i], { compress: compress });
+    }
+  }
+
+  if ('open' == this.conn.readyState) {
+    debug('writing packet %j', packet);
+    if(!preEncoded) { // not broadcasting, need to encode
+      this.encoder.encode(packet, function (encodedPackets) { // encode, then write results to engine
+        writeToEngine(encodedPackets);
+      });
+    } else { // a broadcast pre-encodes a packet
+      writeToEngine(packet);
+    }
+  } else {
+    debug('ignoring packet write %j', packet);
+  }
+};
+
+/**
+ * Called with incoming transport data.
+ *
+ * @api private
+ */
+
+Client.prototype.ondata = function(data){
+  // try/catch is needed for protocol violations (GH-1880)
+  try {
+    this.decoder.add(data);
+  } catch(e) {
+    this.onerror(e);
+  }
+};
+
+/**
+ * Called when parser fully decodes a packet.
+ *
+ * @api private
+ */
+
+Client.prototype.ondecoded = function(packet) {
+  if (parser.CONNECT == packet.type) {
+    this.connect(packet.nsp);
+  } else {
+    var socket = this.nsps[packet.nsp];
+    if (socket) {
+      socket.onpacket(packet);
+    } else {
+      debug('no socket for namespace %s', packet.nsp);
+    }
+  }
+};
+
+/**
+ * Handles an error.
+ *
+ * @param {Objcet} error object
+ * @api private
+ */
+
+Client.prototype.onerror = function(err){
+  this.sockets.forEach(function(socket){
+    socket.onerror(err);
+  });
+  this.onclose('client error');
+};
+
+/**
+ * Called upon transport close.
+ *
+ * @param {String} reason
+ * @api private
+ */
+
+Client.prototype.onclose = function(reason){
+  debug('client close with reason %s', reason);
+
+  // ignore a potential subsequent `close` event
+  this.destroy();
+
+  // `nsps` and `sockets` are cleaned up seamlessly
+  var socket;
+  while (socket = this.sockets.shift()) {
+    socket.onclose(reason);
+  }
+
+  this.decoder.destroy(); // clean up decoder
+};
+
+/**
+ * Cleans up event listeners.
+ *
+ * @api private
+ */
+
+Client.prototype.destroy = function(){
+  this.conn.removeListener('data', this.ondata);
+  this.conn.removeListener('error', this.onerror);
+  this.conn.removeListener('close', this.onclose);
+  this.decoder.removeListener('decoded', this.ondecoded);
+};
+
+
+/**
+ * Module dependencies.
+ */
+
+var http = require('http');
+var read = require('fs').readFileSync;
+var parse = require('url').parse;
+var engine = require('engine.io');
+var client = require('socket.io-client');
+var clientVersion = require('socket.io-client/package').version;
+var Client = require('./client');
+var Namespace = require('./namespace');
+var Adapter = require('socket.io-adapter');
+var debug = require('debug')('socket.io:server');
+var url = require('url');
+
+/**
+ * Module exports.
+ */
+
+module.exports = Server;
+
+/**
+ * Socket.IO client source.
+ */
+
+var clientSource = read(require.resolve('socket.io-client/socket.io.js'), 'utf-8');
+
+/**
+ * Server constructor.
+ *
+ * @param {http.Server|Number|Object} http server, port or options
+ * @param {Object} options
+ * @api public
+ */
+
+function Server(srv, opts){
+  if (!(this instanceof Server)) return new Server(srv, opts);
+  if ('object' == typeof srv && !srv.listen) {
+    opts = srv;
+    srv = null;
+  }
+  opts = opts || {};
+  this.nsps = {};
+  this.path(opts.path || '/socket.io');
+  this.serveClient(false !== opts.serveClient);
+  this.adapter(opts.adapter || Adapter);
+  this.origins(opts.origins || '*:*');
+  this.sockets = this.of('/');
+  if (srv) this.attach(srv, opts);
+}
+
+/**
+ * Server request verification function, that checks for allowed origins
+ *
+ * @param {http.IncomingMessage} request
+ * @param {Function} callback to be called with the result: `fn(err, success)`
+ */
+
+Server.prototype.checkRequest = function(req, fn) {
+  var origin = req.headers.origin || req.headers.referer;
+
+  // file:// URLs produce a null Origin which can't be authorized via echo-back
+  if ('null' == origin || null == origin) origin = '*';
+
+  if (!!origin && typeof(this._origins) == 'function') return this._origins(origin, fn);
+  if (this._origins.indexOf('*:*') !== -1) return fn(null, true);
+  if (origin) {
+    try {
+      var parts = url.parse(origin);
+      var defaultPort = 'https:' == parts.protocol ? 443 : 80;
+      parts.port = parts.port != null
+        ? parts.port
+        : defaultPort;
+      var ok =
+        ~this._origins.indexOf(parts.hostname + ':' + parts.port) ||
+        ~this._origins.indexOf(parts.hostname + ':*') ||
+        ~this._origins.indexOf('*:' + parts.port);
+      return fn(null, !!ok);
+    } catch (ex) {
+    }
+  }
+  fn(null, false);
+};
+
+/**
+ * Sets/gets whether client code is being served.
+ *
+ * @param {Boolean} whether to serve client code
+ * @return {Server|Boolean} self when setting or value when getting
+ * @api public
+ */
+
+Server.prototype.serveClient = function(v){
+  if (!arguments.length) return this._serveClient;
+  this._serveClient = v;
+  return this;
+};
+
+/**
+ * Old settings for backwards compatibility
+ */
+
+var oldSettings = {
+  "transports": "transports",
+  "heartbeat timeout": "pingTimeout",
+  "heartbeat interval": "pingInterval",
+  "destroy buffer size": "maxHttpBufferSize"
+};
+
+/**
+ * Backwards compatiblity.
+ *
+ * @api public
+ */
+
+Server.prototype.set = function(key, val){
+  if ('authorization' == key && val) {
+    this.use(function(socket, next) {
+      val(socket.request, function(err, authorized) {
+        if (err) return next(new Error(err));
+        if (!authorized) return next(new Error('Not authorized'));
+        next();
+      });
+    });
+  } else if ('origins' == key && val) {
+    this.origins(val);
+  } else if ('resource' == key) {
+    this.path(val);
+  } else if (oldSettings[key] && this.eio[oldSettings[key]]) {
+    this.eio[oldSettings[key]] = val;
+  } else {
+    console.error('Option %s is not valid. Please refer to the README.', key);
+  }
+
+  return this;
+};
+
+/**
+ * Sets the client serving path.
+ *
+ * @param {String} pathname
+ * @return {Server|String} self when setting or value when getting
+ * @api public
+ */
+
+Server.prototype.path = function(v){
+  if (!arguments.length) return this._path;
+  this._path = v.replace(/\/$/, '');
+  return this;
+};
+
+/**
+ * Sets the adapter for rooms.
+ *
+ * @param {Adapter} pathname
+ * @return {Server|Adapter} self when setting or value when getting
+ * @api public
+ */
+
+Server.prototype.adapter = function(v){
+  if (!arguments.length) return this._adapter;
+  this._adapter = v;
+  for (var i in this.nsps) {
+    if (this.nsps.hasOwnProperty(i)) {
+      this.nsps[i].initAdapter();
+    }
+  }
+  return this;
+};
+
+/**
+ * Sets the allowed origins for requests.
+ *
+ * @param {String} origins
+ * @return {Server|Adapter} self when setting or value when getting
+ * @api public
+ */
+
+Server.prototype.origins = function(v){
+  if (!arguments.length) return this._origins;
+
+  this._origins = v;
+  return this;
+};
+
+/**
+ * Attaches socket.io to a server or port.
+ *
+ * @param {http.Server|Number} server or port
+ * @param {Object} options passed to engine.io
+ * @return {Server} self
+ * @api public
+ */
+
+Server.prototype.listen =
+Server.prototype.attach = function(srv, opts){
+  if ('function' == typeof srv) {
+    var msg = 'You are trying to attach socket.io to an express ' +
+    'request handler function. Please pass a http.Server instance.';
+    throw new Error(msg);
+  }
+
+  // handle a port as a string
+  if (Number(srv) == srv) {
+    srv = Number(srv);
+  }
+
+  if ('number' == typeof srv) {
+    debug('creating http server and binding to %d', srv);
+    var port = srv;
+    srv = http.Server(function(req, res){
+      res.writeHead(404);
+      res.end();
+    });
+    srv.listen(port);
+
+  }
+
+  // set engine.io path to `/socket.io`
+  opts = opts || {};
+  opts.path = opts.path || this.path();
+  // set origins verification
+  opts.allowRequest = this.checkRequest.bind(this);
+
+  // initialize engine
+  debug('creating engine.io instance with opts %j', opts);
+  this.eio = engine.attach(srv, opts);
+
+  // attach static file serving
+  if (this._serveClient) this.attachServe(srv);
+
+  // Export http server
+  this.httpServer = srv;
+
+  // bind to engine events
+  this.bind(this.eio);
+
+  return this;
+};
+
+/**
+ * Attaches the static file serving.
+ *
+ * @param {Function|http.Server} http server
+ * @api private
+ */
+
+Server.prototype.attachServe = function(srv){
+  debug('attaching client serving req handler');
+  var url = this._path + '/socket.io.js';
+  var evs = srv.listeners('request').slice(0);
+  var self = this;
+  srv.removeAllListeners('request');
+  srv.on('request', function(req, res) {
+    if (0 === req.url.indexOf(url)) {
+      self.serve(req, res);
+    } else {
+      for (var i = 0; i < evs.length; i++) {
+        evs[i].call(srv, req, res);
+      }
+    }
+  });
+};
+
+/**
+ * Handles a request serving `/socket.io.js`
+ *
+ * @param {http.Request} req
+ * @param {http.Response} res
+ * @api private
+ */
+
+Server.prototype.serve = function(req, res){
+  var etag = req.headers['if-none-match'];
+  if (etag) {
+    if (clientVersion == etag) {
+      debug('serve client 304');
+      res.writeHead(304);
+      res.end();
+      return;
+    }
+  }
+
+  debug('serve client source');
+  res.setHeader('Content-Type', 'application/javascript');
+  res.setHeader('ETag', clientVersion);
+  res.writeHead(200);
+  res.end(clientSource);
+};
+
+/**
+ * Binds socket.io to an engine.io instance.
+ *
+ * @param {engine.Server} engine.io (or compatible) server
+ * @return {Server} self
+ * @api public
+ */
+
+Server.prototype.bind = function(engine){
+  this.engine = engine;
+  this.engine.on('connection', this.onconnection.bind(this));
+  return this;
+};
+
+/**
+ * Called with each incoming transport connection.
+ *
+ * @param {engine.Socket} socket
+ * @return {Server} self
+ * @api public
+ */
+
+Server.prototype.onconnection = function(conn){
+  debug('incoming connection with id %s', conn.id);
+  var client = new Client(this, conn);
+  client.connect('/');
+  return this;
+};
+
+/**
+ * Looks up a namespace.
+ *
+ * @param {String} nsp name
+ * @param {Function} optional, nsp `connection` ev handler
+ * @api public
+ */
+
+Server.prototype.of = function(name, fn){
+  if (String(name)[0] !== '/') name = '/' + name;
+
+  if (!this.nsps[name]) {
+    debug('initializing namespace %s', name);
+    var nsp = new Namespace(this, name);
+    this.nsps[name] = nsp;
+  }
+  if (fn) this.nsps[name].on('connect', fn);
+  return this.nsps[name];
+};
+
+/**
+ * Closes server connection
+ *
+ * @api public
+ */
+
+Server.prototype.close = function(){
+  this.nsps['/'].sockets.forEach(function(socket){
+    socket.onclose();
+  });
+
+  this.engine.close();
+
+  if(this.httpServer){
+    this.httpServer.close();
+  }
+};
+
+/**
+ * Expose main namespace (/).
+ */
+
+['on', 'to', 'in', 'use', 'emit', 'send', 'write', 'clients'].forEach(function(fn){
+  Server.prototype[fn] = function(){
+    var nsp = this.sockets[fn];
+    return nsp.apply(this.sockets, arguments);
+  };
+});
+
+Namespace.flags.forEach(function(flag){
+  Server.prototype.__defineGetter__(flag, function(name){
+    this.flags.push(name);
+    return this;
+  });
+});
+
+/**
+ * BC with `io.listen`
+ */
+
+Server.listen = Server;
+
+
+/**
+ * Module dependencies.
+ */
+
+var Socket = require('./socket');
+var Emitter = require('events').EventEmitter;
+var parser = require('socket.io-parser');
+var debug = require('debug')('socket.io:namespace');
+var hasBin = require('has-binary');
+
+/**
+ * Module exports.
+ */
+
+module.exports = exports = Namespace;
+
+/**
+ * Blacklisted events.
+ */
+
+exports.events = [
+  'connect',    // for symmetry with client
+  'connection',
+  'newListener'
+];
+
+/**
+ * Flags.
+ */
+
+exports.flags = ['json'];
+
+/**
+ * `EventEmitter#emit` reference.
+ */
+
+var emit = Emitter.prototype.emit;
+
+/**
+ * Namespace constructor.
+ *
+ * @param {Server} server instance
+ * @param {Socket} name
+ * @api private
+ */
+
+function Namespace(server, name){
+  this.name = name;
+  this.server = server;
+  this.sockets = [];
+  this.connected = {};
+  this.fns = [];
+  this.ids = 0;
+  this.acks = {};
+  this.initAdapter();
+}
+
+/**
+ * Inherits from `EventEmitter`.
+ */
+
+Namespace.prototype.__proto__ = Emitter.prototype;
+
+/**
+ * Apply flags from `Socket`.
+ */
+
+exports.flags.forEach(function(flag){
+  Namespace.prototype.__defineGetter__(flag, function(){
+    this.flags = this.flags || {};
+    this.flags[flag] = true;
+    return this;
+  });
+});
+
+/**
+ * Initializes the `Adapter` for this nsp.
+ * Run upon changing adapter by `Server#adapter`
+ * in addition to the constructor.
+ *
+ * @api private
+ */
+
+Namespace.prototype.initAdapter = function(){
+  this.adapter = new (this.server.adapter())(this);
+};
+
+/**
+ * Sets up namespace middleware.
+ *
+ * @return {Namespace} self
+ * @api public
+ */
+
+Namespace.prototype.use = function(fn){
+  this.fns.push(fn);
+  return this;
+};
+
+/**
+ * Executes the middleware for an incoming client.
+ *
+ * @param {Socket} socket that will get added
+ * @param {Function} last fn call in the middleware
+ * @api private
+ */
+
+Namespace.prototype.run = function(socket, fn){
+  var fns = this.fns.slice(0);
+  if (!fns.length) return fn(null);
+
+  function run(i){
+    fns[i](socket, function(err){
+      // upon error, short-circuit
+      if (err) return fn(err);
+
+      // if no middleware left, summon callback
+      if (!fns[i + 1]) return fn(null);
+
+      // go on to next
+      run(i + 1);
+    });
+  }
+
+  run(0);
+};
+
+/**
+ * Targets a room when emitting.
+ *
+ * @param {String} name
+ * @return {Namespace} self
+ * @api public
+ */
+
+Namespace.prototype.to =
+Namespace.prototype['in'] = function(name){
+  this.rooms = this.rooms || [];
+  if (!~this.rooms.indexOf(name)) this.rooms.push(name);
+  return this;
+};
+
+/**
+ * Adds a new client.
+ *
+ * @return {Socket}
+ * @api private
+ */
+
+Namespace.prototype.add = function(client, fn){
+  debug('adding socket to nsp %s', this.name);
+  var socket = new Socket(this, client);
+  var self = this;
+  this.run(socket, function(err){
+    process.nextTick(function(){
+      if ('open' == client.conn.readyState) {
+        if (err) return socket.error(err.data || err.message);
+
+        // track socket
+        self.sockets.push(socket);
+
+        // it's paramount that the internal `onconnect` logic
+        // fires before user-set events to prevent state order
+        // violations (such as a disconnection before the connection
+        // logic is complete)
+        socket.onconnect();
+        if (fn) fn();
+
+        // fire user-set events
+        self.emit('connect', socket);
+        self.emit('connection', socket);
+      } else {
+        debug('next called after client was closed - ignoring socket');
+      }
+    });
+  });
+  return socket;
+};
+
+/**
+ * Removes a client. Called by each `Socket`.
+ *
+ * @api private
+ */
+
+Namespace.prototype.remove = function(socket){
+  var i = this.sockets.indexOf(socket);
+  if (~i) {
+    this.sockets.splice(i, 1);
+  } else {
+    debug('ignoring remove for %s', socket.id);
+  }
+};
+
+/**
+ * Emits to all clients.
+ *
+ * @return {Namespace} self
+ * @api public
+ */
+
+Namespace.prototype.emit = function(ev){
+  if (~exports.events.indexOf(ev)) {
+    emit.apply(this, arguments);
+  } else {
+    // set up packet object
+    var args = Array.prototype.slice.call(arguments);
+    var parserType = parser.EVENT; // default
+    if (hasBin(args)) { parserType = parser.BINARY_EVENT; } // binary
+
+    var packet = { type: parserType, data: args };
+
+    if ('function' == typeof args[args.length - 1]) {
+      throw new Error('Callbacks are not supported when broadcasting');
+    }
+
+    this.adapter.broadcast(packet, {
+      rooms: this.rooms,
+      flags: this.flags
+    });
+
+    delete this.rooms;
+    delete this.flags;
+  }
+  return this;
+};
+
+/**
+ * Sends a `message` event to all clients.
+ *
+ * @return {Namespace} self
+ * @api public
+ */
+
+Namespace.prototype.send =
+Namespace.prototype.write = function(){
+  var args = Array.prototype.slice.call(arguments);
+  args.unshift('message');
+  this.emit.apply(this, args);
+  return this;
+};
+
+/**
+ * Gets a list of clients.
+ *
+ * @return {Namespace} self
+ * @api public
+ */
+
+Namespace.prototype.clients = function(fn){
+  this.adapter.clients(this.rooms, fn);
+  return this;
+};
+
+
+/**
+ * Module dependencies.
+ */
+
+var Emitter = require('events').EventEmitter;
+var parser = require('socket.io-parser');
+var url = require('url');
+var debug = require('debug')('socket.io:socket');
+var hasBin = require('has-binary');
+
+/**
+ * Module exports.
+ */
+
+module.exports = exports = Socket;
+
+/**
+ * Blacklisted events.
+ *
+ * @api public
+ */
+
+exports.events = [
+  'error',
+  'connect',
+  'disconnect',
+  'newListener',
+  'removeListener'
+];
+
+/**
+ * Flags.
+ *
+ * @api private
+ */
+
+var flags = [
+  'json',
+  'volatile',
+  'broadcast'
+];
+
+/**
+ * `EventEmitter#emit` reference.
+ */
+
+var emit = Emitter.prototype.emit;
+
+/**
+ * Interface to a `Client` for a given `Namespace`.
+ *
+ * @param {Namespace} nsp
+ * @param {Client} client
+ * @api public
+ */
+
+function Socket(nsp, client){
+  this.nsp = nsp;
+  this.server = nsp.server;
+  this.adapter = this.nsp.adapter;
+  this.id = client.id;
+  this.request = client.request;
+  this.client = client;
+  this.conn = client.conn;
+  this.rooms = [];
+  this.acks = {};
+  this.connected = true;
+  this.disconnected = false;
+  this.handshake = this.buildHandshake();
+}
+
+/**
+ * Inherits from `EventEmitter`.
+ */
+
+Socket.prototype.__proto__ = Emitter.prototype;
+
+/**
+ * Apply flags from `Socket`.
+ */
+
+flags.forEach(function(flag){
+  Socket.prototype.__defineGetter__(flag, function(){
+    this.flags = this.flags || {};
+    this.flags[flag] = true;
+    return this;
+  });
+});
+
+/**
+ * `request` engine.io shorcut.
+ *
+ * @api public
+ */
+
+Socket.prototype.__defineGetter__('request', function(){
+  return this.conn.request;
+});
+
+/**
+ * Builds the `handshake` BC object
+ *
+ * @api private
+ */
+
+Socket.prototype.buildHandshake = function(){
+  return {
+    headers: this.request.headers,
+    time: (new Date) + '',
+    address: this.conn.remoteAddress,
+    xdomain: !!this.request.headers.origin,
+    secure: !!this.request.connection.encrypted,
+    issued: +(new Date),
+    url: this.request.url,
+    query: url.parse(this.request.url, true).query || {}
+  };
+};
+
+/**
+ * Emits to this client.
+ *
+ * @return {Socket} self
+ * @api public
+ */
+
+Socket.prototype.emit = function(ev){
+  if (~exports.events.indexOf(ev)) {
+    emit.apply(this, arguments);
+  } else {
+    var args = Array.prototype.slice.call(arguments);
+    var packet = {};
+    packet.type = hasBin(args) ? parser.BINARY_EVENT : parser.EVENT;
+    packet.data = args;
+
+    // access last argument to see if it's an ACK callback
+    if ('function' == typeof args[args.length - 1]) {
+      if (this._rooms || (this.flags && this.flags.broadcast)) {
+        throw new Error('Callbacks are not supported when broadcasting');
+      }
+
+      debug('emitting packet with ack id %d', this.nsp.ids);
+      this.acks[this.nsp.ids] = args.pop();
+      packet.id = this.nsp.ids++;
+    }
+
+    if (this._rooms || (this.flags && this.flags.broadcast)) {
+      this.adapter.broadcast(packet, {
+        except: [this.id],
+        rooms: this._rooms,
+        flags: this.flags
+      });
+    } else {
+      // dispatch packet
+      this.packet(packet);
+    }
+
+    // reset flags
+    delete this._rooms;
+    delete this.flags;
+  }
+  return this;
+};
+
+/**
+ * Targets a room when broadcasting.
+ *
+ * @param {String} name
+ * @return {Socket} self
+ * @api public
+ */
+
+Socket.prototype.to =
+Socket.prototype.in = function(name){
+  this._rooms = this._rooms || [];
+  if (!~this._rooms.indexOf(name)) this._rooms.push(name);
+  return this;
+};
+
+/**
+ * Sends a `message` event.
+ *
+ * @return {Socket} self
+ * @api public
+ */
+
+Socket.prototype.send =
+Socket.prototype.write = function(){
+  var args = Array.prototype.slice.call(arguments);
+  args.unshift('message');
+  this.emit.apply(this, args);
+  return this;
+};
+
+/**
+ * Writes a packet.
+ *
+ * @param {Object} packet object
+ * @api private
+ */
+
+Socket.prototype.packet = function(packet, preEncoded){
+  packet.nsp = this.nsp.name;
+  var volatile = this.flags && this.flags.volatile;
+  var compress = !this.flags || false !== this.flags.compress;
+  this.client.packet(packet, preEncoded, volatile, compress);
+};
+
+/**
+ * Joins a room.
+ *
+ * @param {String} room
+ * @param {Function} optional, callback
+ * @return {Socket} self
+ * @api private
+ */
+
+Socket.prototype.join = function(room, fn){
+  debug('joining room %s', room);
+  var self = this;
+  if (~this.rooms.indexOf(room)) return this;
+  this.adapter.add(this.id, room, function(err){
+    if (err) return fn && fn(err);
+    debug('joined room %s', room);
+    self.rooms.push(room);
+    fn && fn(null);
+  });
+  return this;
+};
+
+/**
+ * Leaves a room.
+ *
+ * @param {String} room
+ * @param {Function} optional, callback
+ * @return {Socket} self
+ * @api private
+ */
+
+Socket.prototype.leave = function(room, fn){
+  debug('leave room %s', room);
+  var self = this;
+  this.adapter.del(this.id, room, function(err){
+    if (err) return fn && fn(err);
+    debug('left room %s', room);
+    var idx = self.rooms.indexOf(room);
+    if (idx >= 0) {
+      self.rooms.splice(idx, 1);
+    }
+    fn && fn(null);
+  });
+  return this;
+};
+
+/**
+ * Leave all rooms.
+ *
+ * @api private
+ */
+
+Socket.prototype.leaveAll = function(){
+  this.adapter.delAll(this.id);
+  this.rooms = [];
+};
+
+/**
+ * Called by `Namespace` upon succesful
+ * middleware execution (ie: authorization).
+ *
+ * @api private
+ */
+
+Socket.prototype.onconnect = function(){
+  debug('socket connected - writing packet');
+  this.join(this.id);
+  this.packet({ type: parser.CONNECT });
+  this.nsp.connected[this.id] = this;
+};
+
+/**
+ * Called with each packet. Called by `Client`.
+ *
+ * @param {Object} packet
+ * @api private
+ */
+
+Socket.prototype.onpacket = function(packet){
+  debug('got packet %j', packet);
+  switch (packet.type) {
+    case parser.EVENT:
+      this.onevent(packet);
+      break;
+
+    case parser.BINARY_EVENT:
+      this.onevent(packet);
+      break;
+
+    case parser.ACK:
+      this.onack(packet);
+      break;
+
+    case parser.BINARY_ACK:
+      this.onack(packet);
+      break;
+
+    case parser.DISCONNECT:
+      this.ondisconnect();
+      break;
+
+    case parser.ERROR:
+      this.emit('error', packet.data);
+  }
+};
+
+/**
+ * Called upon event packet.
+ *
+ * @param {Object} packet object
+ * @api private
+ */
+
+Socket.prototype.onevent = function(packet){
+  var args = packet.data || [];
+  debug('emitting event %j', args);
+
+  if (null != packet.id) {
+    debug('attaching ack callback to event');
+    args.push(this.ack(packet.id));
+  }
+
+  emit.apply(this, args);
+};
+
+/**
+ * Produces an ack callback to emit with an event.
+ *
+ * @param {Number} packet id
+ * @api private
+ */
+
+Socket.prototype.ack = function(id){
+  var self = this;
+  var sent = false;
+  return function(){
+    // prevent double callbacks
+    if (sent) return;
+    var args = Array.prototype.slice.call(arguments);
+    debug('sending ack %j', args);
+
+    var type = hasBin(args) ? parser.BINARY_ACK : parser.ACK;
+    self.packet({
+      id: id,
+      type: type,
+      data: args
+    });
+  };
+};
+
+/**
+ * Called upon ack packet.
+ *
+ * @api private
+ */
+
+Socket.prototype.onack = function(packet){
+  var ack = this.acks[packet.id];
+  if ('function' == typeof ack) {
+    debug('calling ack %s with %j', packet.id, packet.data);
+    ack.apply(this, packet.data);
+    delete this.acks[packet.id];
+  } else {
+    debug('bad ack %s', packet.id);
+  }
+};
+
+/**
+ * Called upon client disconnect packet.
+ *
+ * @api private
+ */
+
+Socket.prototype.ondisconnect = function(){
+  debug('got disconnect packet');
+  this.onclose('client namespace disconnect');
+};
+
+/**
+ * Handles a client error.
+ *
+ * @api private
+ */
+
+Socket.prototype.onerror = function(err){
+  if (this.listeners('error').length) {
+    this.emit('error', err);
+  } else {
+    console.error('Missing error handler on `socket`.');
+    console.error(err.stack);
+  }
+};
+
+/**
+ * Called upon closing. Called by `Client`.
+ *
+ * @param {String} reason
+ * @param {Error} optional error object
+ * @api private
+ */
+
+Socket.prototype.onclose = function(reason){
+  if (!this.connected) return this;
+  debug('closing socket - reason %s', reason);
+  this.leaveAll();
+  this.nsp.remove(this);
+  this.client.remove(this);
+  this.connected = false;
+  this.disconnected = true;
+  delete this.nsp.connected[this.id];
+  this.emit('disconnect', reason);
+};
+
+/**
+ * Produces an `error` packet.
+ *
+ * @param {Object} error object
+ * @api private
+ */
+
+Socket.prototype.error = function(err){
+  this.packet({ type: parser.ERROR, data: err });
+};
+
+/**
+ * Disconnects this client.
+ *
+ * @param {Boolean} if `true`, closes the underlying connection
+ * @return {Socket} self
+ * @api public
+ */
+
+Socket.prototype.disconnect = function(close){
+  if (!this.connected) return this;
+  if (close) {
+    this.client.disconnect();
+  } else {
+    this.packet({ type: parser.DISCONNECT });
+    this.onclose('server namespace disconnect');
+  }
+  return this;
+};
+
+/**
+ * Sets the compress flag.
+ *
+ * @param {Boolean} if `true`, compresses the sending data
+ * @return {Socket} self
+ * @api public
+ */
+
+Socket.prototype.compress = function(compress){
+  this.flags = this.flags || {};
+  this.flags.compress = compress;
+  return this;
+};
+
+(function(ionic) {
+'use strict';
+
+  var ITEM_CLASS = 'item';
+  var ITEM_CONTENT_CLASS = 'item-content';
+  var ITEM_SLIDING_CLASS = 'item-sliding';
+  var ITEM_OPTIONS_CLASS = 'item-options';
+  var ITEM_PLACEHOLDER_CLASS = 'item-placeholder';
+  var ITEM_REORDERING_CLASS = 'item-reordering';
+  var ITEM_REORDER_BTN_CLASS = 'item-reorder';
+
+  var DragOp = function() {};
+  DragOp.prototype = {
+    start: function(e) {
+    },
+    drag: function(e) {
+    },
+    end: function(e) {
+    },
+    isSameItem: function(item) {
+      return false;
+    }
+  };
+
+  var SlideDrag = function(opts) {
+    this.dragThresholdX = opts.dragThresholdX || 10;
+    this.el = opts.el;
+    this.item = opts.item;
+    this.canSwipe = opts.canSwipe;
+  };
+
+  SlideDrag.prototype = new DragOp();
+
+  SlideDrag.prototype.start = function(e) {
+    var content, buttons, offsetX, buttonsWidth;
+
+    if (!this.canSwipe()) {
+      return;
+    }
+
+    if (e.target.classList.contains(ITEM_CONTENT_CLASS)) {
+      content = e.target;
+    } else if (e.target.classList.contains(ITEM_CLASS)) {
+      content = e.target.querySelector('.' + ITEM_CONTENT_CLASS);
+    } else {
+      content = ionic.DomUtil.getParentWithClass(e.target, ITEM_CONTENT_CLASS);
+    }
+
+    // If we don't have a content area as one of our children (or ourselves), skip
+    if (!content) {
+      return;
+    }
+
+    // Make sure we aren't animating as we slide
+    content.classList.remove(ITEM_SLIDING_CLASS);
+
+    // Grab the starting X point for the item (for example, so we can tell whether it is open or closed to start)
+    offsetX = parseFloat(content.style[ionic.CSS.TRANSFORM].replace('translate3d(', '').split(',')[0]) || 0;
+
+    // Grab the buttons
+    buttons = content.parentNode.querySelector('.' + ITEM_OPTIONS_CLASS);
+    if (!buttons) {
+      return;
+    }
+    buttons.classList.remove('invisible');
+
+    buttonsWidth = buttons.offsetWidth;
+
+    this._currentDrag = {
+      buttons: buttons,
+      buttonsWidth: buttonsWidth,
+      content: content,
+      startOffsetX: offsetX
+    };
+  };
+
+  /**
+   * Check if this is the same item that was previously dragged.
+   */
+  SlideDrag.prototype.isSameItem = function(op) {
+    if (op._lastDrag && this._currentDrag) {
+      return this._currentDrag.content == op._lastDrag.content;
+    }
+    return false;
+  };
+
+  SlideDrag.prototype.clean = function(isInstant) {
+    var lastDrag = this._lastDrag;
+
+    if (!lastDrag || !lastDrag.content) return;
+
+    lastDrag.content.style[ionic.CSS.TRANSITION] = '';
+    lastDrag.content.style[ionic.CSS.TRANSFORM] = '';
+    if (isInstant) {
+      lastDrag.content.style[ionic.CSS.TRANSITION] = 'none';
+      makeInvisible();
+      ionic.requestAnimationFrame(function() {
+        lastDrag.content.style[ionic.CSS.TRANSITION] = '';
+      });
+    } else {
+      ionic.requestAnimationFrame(function() {
+        setTimeout(makeInvisible, 250);
+      });
+    }
+    function makeInvisible() {
+      lastDrag.buttons && lastDrag.buttons.classList.add('invisible');
+    }
+  };
+
+  SlideDrag.prototype.drag = ionic.animationFrameThrottle(function(e) {
+    var buttonsWidth;
+
+    // We really aren't dragging
+    if (!this._currentDrag) {
+      return;
+    }
+
+    // Check if we should start dragging. Check if we've dragged past the threshold,
+    // or we are starting from the open state.
+    if (!this._isDragging &&
+        ((Math.abs(e.gesture.deltaX) > this.dragThresholdX) ||
+        (Math.abs(this._currentDrag.startOffsetX) > 0))) {
+      this._isDragging = true;
+    }
+
+    if (this._isDragging) {
+      buttonsWidth = this._currentDrag.buttonsWidth;
+
+      // Grab the new X point, capping it at zero
+      var newX = Math.min(0, this._currentDrag.startOffsetX + e.gesture.deltaX);
+
+      // If the new X position is past the buttons, we need to slow down the drag (rubber band style)
+      if (newX < -buttonsWidth) {
+        // Calculate the new X position, capped at the top of the buttons
+        newX = Math.min(-buttonsWidth, -buttonsWidth + (((e.gesture.deltaX + buttonsWidth) * 0.4)));
+      }
+
+      this._currentDrag.content.$$ionicOptionsOpen = newX !== 0;
+
+      this._currentDrag.content.style[ionic.CSS.TRANSFORM] = 'translate3d(' + newX + 'px, 0, 0)';
+      this._currentDrag.content.style[ionic.CSS.TRANSITION] = 'none';
+    }
+  });
+
+  SlideDrag.prototype.end = function(e, doneCallback) {
+    var self = this;
+
+    // There is no drag, just end immediately
+    if (!self._currentDrag) {
+      doneCallback && doneCallback();
+      return;
+    }
+
+    // If we are currently dragging, we want to snap back into place
+    // The final resting point X will be the width of the exposed buttons
+    var restingPoint = -self._currentDrag.buttonsWidth;
+
+    // Check if the drag didn't clear the buttons mid-point
+    // and we aren't moving fast enough to swipe open
+    if (e.gesture.deltaX > -(self._currentDrag.buttonsWidth / 2)) {
+
+      // If we are going left but too slow, or going right, go back to resting
+      if (e.gesture.direction == "left" && Math.abs(e.gesture.velocityX) < 0.3) {
+        restingPoint = 0;
+
+      } else if (e.gesture.direction == "right") {
+        restingPoint = 0;
+      }
+
+    }
+
+    ionic.requestAnimationFrame(function() {
+      if (restingPoint === 0) {
+        self._currentDrag.content.style[ionic.CSS.TRANSFORM] = '';
+        var buttons = self._currentDrag.buttons;
+        setTimeout(function() {
+          buttons && buttons.classList.add('invisible');
+        }, 250);
+      } else {
+        self._currentDrag.content.style[ionic.CSS.TRANSFORM] = 'translate3d(' + restingPoint + 'px,0,0)';
+      }
+      self._currentDrag.content.style[ionic.CSS.TRANSITION] = '';
+
+
+      // Kill the current drag
+      if (!self._lastDrag) {
+        self._lastDrag = {};
+      }
+      ionic.extend(self._lastDrag, self._currentDrag);
+      if (self._currentDrag) {
+        self._currentDrag.buttons = null;
+        self._currentDrag.content = null;
+      }
+      self._currentDrag = null;
+
+      // We are done, notify caller
+      doneCallback && doneCallback();
+    });
+  };
+
+  var ReorderDrag = function(opts) {
+    var self = this;
+
+    self.dragThresholdY = opts.dragThresholdY || 0;
+    self.onReorder = opts.onReorder;
+    self.listEl = opts.listEl;
+    self.el = self.item = opts.el;
+    self.scrollEl = opts.scrollEl;
+    self.scrollView = opts.scrollView;
+    // Get the True Top of the list el http://www.quirksmode.org/js/findpos.html
+    self.listElTrueTop = 0;
+    if (self.listEl.offsetParent) {
+      var obj = self.listEl;
+      do {
+        self.listElTrueTop += obj.offsetTop;
+        obj = obj.offsetParent;
+      } while (obj);
+    }
+  };
+
+  ReorderDrag.prototype = new DragOp();
+
+  ReorderDrag.prototype._moveElement = function(e) {
+    var y = e.gesture.center.pageY +
+      this.scrollView.getValues().top -
+      (this._currentDrag.elementHeight / 2) -
+      this.listElTrueTop;
+    this.el.style[ionic.CSS.TRANSFORM] = 'translate3d(0, ' + y + 'px, 0)';
+  };
+
+  ReorderDrag.prototype.deregister = function() {
+    this.listEl = this.el = this.scrollEl = this.scrollView = null;
+  };
+
+  ReorderDrag.prototype.start = function(e) {
+    var content;
+
+    var startIndex = ionic.DomUtil.getChildIndex(this.el, this.el.nodeName.toLowerCase());
+    var elementHeight = this.el.scrollHeight;
+    var placeholder = this.el.cloneNode(true);
+
+    placeholder.classList.add(ITEM_PLACEHOLDER_CLASS);
+
+    this.el.parentNode.insertBefore(placeholder, this.el);
+    this.el.classList.add(ITEM_REORDERING_CLASS);
+
+    this._currentDrag = {
+      elementHeight: elementHeight,
+      startIndex: startIndex,
+      placeholder: placeholder,
+      scrollHeight: scroll,
+      list: placeholder.parentNode
+    };
+
+    this._moveElement(e);
+  };
+
+  ReorderDrag.prototype.drag = ionic.animationFrameThrottle(function(e) {
+    // We really aren't dragging
+    var self = this;
+    if (!this._currentDrag) {
+      return;
+    }
+
+    var scrollY = 0;
+    var pageY = e.gesture.center.pageY;
+    var offset = this.listElTrueTop;
+
+    //If we have a scrollView, check scroll boundaries for dragged element and scroll if necessary
+    if (this.scrollView) {
+
+      var container = this.scrollView.__container;
+      scrollY = this.scrollView.getValues().top;
+
+      var containerTop = container.offsetTop;
+      var pixelsPastTop = containerTop - pageY + this._currentDrag.elementHeight / 2;
+      var pixelsPastBottom = pageY + this._currentDrag.elementHeight / 2 - containerTop - container.offsetHeight;
+
+      if (e.gesture.deltaY < 0 && pixelsPastTop > 0 && scrollY > 0) {
+        this.scrollView.scrollBy(null, -pixelsPastTop);
+        //Trigger another drag so the scrolling keeps going
+        ionic.requestAnimationFrame(function() {
+          self.drag(e);
+        });
+      }
+      if (e.gesture.deltaY > 0 && pixelsPastBottom > 0) {
+        if (scrollY < this.scrollView.getScrollMax().top) {
+          this.scrollView.scrollBy(null, pixelsPastBottom);
+          //Trigger another drag so the scrolling keeps going
+          ionic.requestAnimationFrame(function() {
+            self.drag(e);
+          });
+        }
+      }
+    }
+
+    // Check if we should start dragging. Check if we've dragged past the threshold,
+    // or we are starting from the open state.
+    if (!this._isDragging && Math.abs(e.gesture.deltaY) > this.dragThresholdY) {
+      this._isDragging = true;
+    }
+
+    if (this._isDragging) {
+      this._moveElement(e);
+
+      this._currentDrag.currentY = scrollY + pageY - offset;
+
+      // this._reorderItems();
+    }
+  });
+
+  // When an item is dragged, we need to reorder any items for sorting purposes
+  ReorderDrag.prototype._getReorderIndex = function() {
+    var self = this;
+
+    var placeholder = self._currentDrag.placeholder;
+    var siblings = Array.prototype.slice.call(self._currentDrag.placeholder.parentNode.children)
+      .filter(function(el) {
+        return el.nodeName === self.el.nodeName && el !== self.el;
+      });
+
+    var dragOffsetTop = self._currentDrag.currentY;
+    var el;
+    for (var i = 0, len = siblings.length; i < len; i++) {
+      el = siblings[i];
+      if (i === len - 1) {
+        if (dragOffsetTop > el.offsetTop) {
+          return i;
+        }
+      } else if (i === 0) {
+        if (dragOffsetTop < el.offsetTop + el.offsetHeight) {
+          return i;
+        }
+      } else if (dragOffsetTop > el.offsetTop - el.offsetHeight / 2 &&
+                 dragOffsetTop < el.offsetTop + el.offsetHeight) {
+        return i;
+      }
+    }
+    return self._currentDrag.startIndex;
+  };
+
+  ReorderDrag.prototype.end = function(e, doneCallback) {
+    if (!this._currentDrag) {
+      doneCallback && doneCallback();
+      return;
+    }
+
+    var placeholder = this._currentDrag.placeholder;
+    var finalIndex = this._getReorderIndex();
+
+    // Reposition the element
+    this.el.classList.remove(ITEM_REORDERING_CLASS);
+    this.el.style[ionic.CSS.TRANSFORM] = '';
+
+    placeholder.parentNode.insertBefore(this.el, placeholder);
+    placeholder.parentNode.removeChild(placeholder);
+
+    this.onReorder && this.onReorder(this.el, this._currentDrag.startIndex, finalIndex);
+
+    this._currentDrag = {
+      placeholder: null,
+      content: null
+    };
+    this._currentDrag = null;
+    doneCallback && doneCallback();
+  };
+
+
+
+  /**
+   * The ListView handles a list of items. It will process drag animations, edit mode,
+   * and other operations that are common on mobile lists or table views.
+   */
+  ionic.views.ListView = ionic.views.View.inherit({
+    initialize: function(opts) {
+      var self = this;
+
+      opts = ionic.extend({
+        onReorder: function(el, oldIndex, newIndex) {},
+        virtualRemoveThreshold: -200,
+        virtualAddThreshold: 200,
+        canSwipe: function() {
+          return true;
+        }
+      }, opts);
+
+      ionic.extend(self, opts);
+
+      if (!self.itemHeight && self.listEl) {
+        self.itemHeight = self.listEl.children[0] && parseInt(self.listEl.children[0].style.height, 10);
+      }
+
+      self.onRefresh = opts.onRefresh || function() {};
+      self.onRefreshOpening = opts.onRefreshOpening || function() {};
+      self.onRefreshHolding = opts.onRefreshHolding || function() {};
+
+      window.ionic.onGesture('release', function(e) {
+        self._handleEndDrag(e);
+      }, self.el);
+
+      window.ionic.onGesture('drag', function(e) {
+        self._handleDrag(e);
+      }, self.el);
+      // Start the drag states
+      self._initDrag();
+    },
+
+    /**
+     * Be sure to cleanup references.
+     */
+    deregister: function() {
+      this.el = this.listEl = this.scrollEl = this.scrollView = null;
+
+      // ensure no scrolls have been left frozen
+      if (this.isScrollFreeze) {
+        self.scrollView.freeze(false);
+      }
+    },
+
+    /**
+     * Called to tell the list to stop refreshing. This is useful
+     * if you are refreshing the list and are done with refreshing.
+     */
+    stopRefreshing: function() {
+      var refresher = this.el.querySelector('.list-refresher');
+      refresher.style.height = '0';
+    },
+
+    /**
+     * If we scrolled and have virtual mode enabled, compute the window
+     * of active elements in order to figure out the viewport to render.
+     */
+    didScroll: function(e) {
+      var self = this;
+
+      if (self.isVirtual) {
+        var itemHeight = self.itemHeight;
+
+        // TODO: This would be inaccurate if we are windowed
+        var totalItems = self.listEl.children.length;
+
+        // Grab the total height of the list
+        var scrollHeight = e.target.scrollHeight;
+
+        // Get the viewport height
+        var viewportHeight = self.el.parentNode.offsetHeight;
+
+        // scrollTop is the current scroll position
+        var scrollTop = e.scrollTop;
+
+        // High water is the pixel position of the first element to include (everything before
+        // that will be removed)
+        var highWater = Math.max(0, e.scrollTop + self.virtualRemoveThreshold);
+
+        // Low water is the pixel position of the last element to include (everything after
+        // that will be removed)
+        var lowWater = Math.min(scrollHeight, Math.abs(e.scrollTop) + viewportHeight + self.virtualAddThreshold);
+
+        // Compute how many items per viewport size can show
+        var itemsPerViewport = Math.floor((lowWater - highWater) / itemHeight);
+
+        // Get the first and last elements in the list based on how many can fit
+        // between the pixel range of lowWater and highWater
+        var first = parseInt(Math.abs(highWater / itemHeight), 10);
+        var last = parseInt(Math.abs(lowWater / itemHeight), 10);
+
+        // Get the items we need to remove
+        self._virtualItemsToRemove = Array.prototype.slice.call(self.listEl.children, 0, first);
+
+        // Grab the nodes we will be showing
+        var nodes = Array.prototype.slice.call(self.listEl.children, first, first + itemsPerViewport);
+
+        self.renderViewport && self.renderViewport(highWater, lowWater, first, last);
+      }
+    },
+
+    didStopScrolling: function(e) {
+      if (this.isVirtual) {
+        for (var i = 0; i < this._virtualItemsToRemove.length; i++) {
+          var el = this._virtualItemsToRemove[i];
+          //el.parentNode.removeChild(el);
+          this.didHideItem && this.didHideItem(i);
+        }
+        // Once scrolling stops, check if we need to remove old items
+
+      }
+    },
+
+    /**
+     * Clear any active drag effects on the list.
+     */
+    clearDragEffects: function(isInstant) {
+      if (this._lastDragOp) {
+        this._lastDragOp.clean && this._lastDragOp.clean(isInstant);
+        this._lastDragOp.deregister && this._lastDragOp.deregister();
+        this._lastDragOp = null;
+      }
+    },
+
+    _initDrag: function() {
+      // Store the last one
+      if (this._lastDragOp) {
+        this._lastDragOp.deregister && this._lastDragOp.deregister();
+      }
+      this._lastDragOp = this._dragOp;
+
+      this._dragOp = null;
+    },
+
+    // Return the list item from the given target
+    _getItem: function(target) {
+      while (target) {
+        if (target.classList && target.classList.contains(ITEM_CLASS)) {
+          return target;
+        }
+        target = target.parentNode;
+      }
+      return null;
+    },
+
+
+    _startDrag: function(e) {
+      var self = this;
+
+      var didStart = false;
+
+      self._isDragging = false;
+
+      var lastDragOp = self._lastDragOp;
+      var item;
+
+      // If we have an open SlideDrag and we're scrolling the list. Clear it.
+      if (self._didDragUpOrDown && lastDragOp instanceof SlideDrag) {
+          lastDragOp.clean && lastDragOp.clean();
+      }
+
+      // Check if this is a reorder drag
+      if (ionic.DomUtil.getParentOrSelfWithClass(e.target, ITEM_REORDER_BTN_CLASS) && (e.gesture.direction == 'up' || e.gesture.direction == 'down')) {
+        item = self._getItem(e.target);
+
+        if (item) {
+          self._dragOp = new ReorderDrag({
+            listEl: self.el,
+            el: item,
+            scrollEl: self.scrollEl,
+            scrollView: self.scrollView,
+            onReorder: function(el, start, end) {
+              self.onReorder && self.onReorder(el, start, end);
+            }
+          });
+          self._dragOp.start(e);
+          e.preventDefault();
+        }
+      }
+
+      // Or check if this is a swipe to the side drag
+      else if (!self._didDragUpOrDown && (e.gesture.direction == 'left' || e.gesture.direction == 'right') && Math.abs(e.gesture.deltaX) > 5) {
+
+        // Make sure this is an item with buttons
+        item = self._getItem(e.target);
+        if (item && item.querySelector('.item-options')) {
+          self._dragOp = new SlideDrag({
+            el: self.el,
+            item: item,
+            canSwipe: self.canSwipe
+          });
+          self._dragOp.start(e);
+          e.preventDefault();
+          self.isScrollFreeze = self.scrollView.freeze(true);
+        }
+      }
+
+      // If we had a last drag operation and this is a new one on a different item, clean that last one
+      if (lastDragOp && self._dragOp && !self._dragOp.isSameItem(lastDragOp) && e.defaultPrevented) {
+        lastDragOp.clean && lastDragOp.clean();
+      }
+    },
+
+
+    _handleEndDrag: function(e) {
+      var self = this;
+
+      if (self.scrollView) {
+        self.isScrollFreeze = self.scrollView.freeze(false);
+      }
+
+      self._didDragUpOrDown = false;
+
+      if (!self._dragOp) {
+        return;
+      }
+
+      self._dragOp.end(e, function() {
+        self._initDrag();
+      });
+    },
+
+    /**
+     * Process the drag event to move the item to the left or right.
+     */
+    _handleDrag: function(e) {
+      var self = this, content, buttons;
+
+      if (Math.abs(e.gesture.deltaY) > 5) {
+        self._didDragUpOrDown = true;
+      }
+
+      // If we get a drag event, make sure we aren't in another drag, then check if we should
+      // start one
+      if (!self.isDragging && !self._dragOp) {
+        self._startDrag(e);
+      }
+
+      // No drag still, pass it up
+      if (!self._dragOp) {
+        return;
+      }
+
+      e.gesture.srcEvent.preventDefault();
+      self._dragOp.drag(e);
+    }
+
+  });
+
+})(ionic);
+
+(function(ionic) {
+'use strict';
+
+  ionic.views.Toggle = ionic.views.View.inherit({
+    initialize: function(opts) {
+      var self = this;
+
+      this.el = opts.el;
+      this.checkbox = opts.checkbox;
+      this.track = opts.track;
+      this.handle = opts.handle;
+      this.openPercent = -1;
+      this.onChange = opts.onChange || function() {};
+
+      this.triggerThreshold = opts.triggerThreshold || 20;
+
+      this.dragStartHandler = function(e) {
+        self.dragStart(e);
+      };
+      this.dragHandler = function(e) {
+        self.drag(e);
+      };
+      this.holdHandler = function(e) {
+        self.hold(e);
+      };
+      this.releaseHandler = function(e) {
+        self.release(e);
+      };
+
+      this.dragStartGesture = ionic.onGesture('dragstart', this.dragStartHandler, this.el);
+      this.dragGesture = ionic.onGesture('drag', this.dragHandler, this.el);
+      this.dragHoldGesture = ionic.onGesture('hold', this.holdHandler, this.el);
+      this.dragReleaseGesture = ionic.onGesture('release', this.releaseHandler, this.el);
+    },
+
+    destroy: function() {
+      ionic.offGesture(this.dragStartGesture, 'dragstart', this.dragStartGesture);
+      ionic.offGesture(this.dragGesture, 'drag', this.dragGesture);
+      ionic.offGesture(this.dragHoldGesture, 'hold', this.holdHandler);
+      ionic.offGesture(this.dragReleaseGesture, 'release', this.releaseHandler);
+    },
+
+    tap: function(e) {
+      if(this.el.getAttribute('disabled') !== 'disabled') {
+        this.val( !this.checkbox.checked );
+      }
+    },
+
+    dragStart: function(e) {
+      if(this.checkbox.disabled) return;
+
+      this._dragInfo = {
+        width: this.el.offsetWidth,
+        left: this.el.offsetLeft,
+        right: this.el.offsetLeft + this.el.offsetWidth,
+        triggerX: this.el.offsetWidth / 2,
+        initialState: this.checkbox.checked
+      };
+
+      // Stop any parent dragging
+      e.gesture.srcEvent.preventDefault();
+
+      // Trigger hold styles
+      this.hold(e);
+    },
+
+    drag: function(e) {
+      var self = this;
+      if(!this._dragInfo) { return; }
+
+      // Stop any parent dragging
+      e.gesture.srcEvent.preventDefault();
+
+      ionic.requestAnimationFrame(function(amount) {
+        if (!self._dragInfo) { return; }
+
+        var slidePageLeft = self.track.offsetLeft + (self.handle.offsetWidth / 2);
+        var slidePageRight = self.track.offsetLeft + self.track.offsetWidth - (self.handle.offsetWidth / 2);
+        var dx = e.gesture.deltaX;
+
+        var px = e.gesture.touches[0].pageX - self._dragInfo.left;
+        var mx = self._dragInfo.width - self.triggerThreshold;
+
+        // The initial state was on, so "tend towards" on
+        if(self._dragInfo.initialState) {
+          if(px < self.triggerThreshold) {
+            self.setOpenPercent(0);
+          } else if(px > self._dragInfo.triggerX) {
+            self.setOpenPercent(100);
+          }
+        } else {
+          // The initial state was off, so "tend towards" off
+          if(px < self._dragInfo.triggerX) {
+            self.setOpenPercent(0);
+          } else if(px > mx) {
+            self.setOpenPercent(100);
+          }
+        }
+      });
+    },
+
+    endDrag: function(e) {
+      this._dragInfo = null;
+    },
+
+    hold: function(e) {
+      this.el.classList.add('dragging');
+    },
+    release: function(e) {
+      this.el.classList.remove('dragging');
+      this.endDrag(e);
+    },
+
+
+    setOpenPercent: function(openPercent) {
+      // only make a change if the new open percent has changed
+      if(this.openPercent < 0 || (openPercent < (this.openPercent - 3) || openPercent > (this.openPercent + 3) ) ) {
+        this.openPercent = openPercent;
+
+        if(openPercent === 0) {
+          this.val(false);
+        } else if(openPercent === 100) {
+          this.val(true);
+        } else {
+          var openPixel = Math.round( (openPercent / 100) * this.track.offsetWidth - (this.handle.offsetWidth) );
+          openPixel = (openPixel < 1 ? 0 : openPixel);
+          this.handle.style[ionic.CSS.TRANSFORM] = 'translate3d(' + openPixel + 'px,0,0)';
+        }
+      }
+    },
+
+    val: function(value) {
+      if(value === true || value === false) {
+        if(this.handle.style[ionic.CSS.TRANSFORM] !== "") {
+          this.handle.style[ionic.CSS.TRANSFORM] = "";
+        }
+        this.checkbox.checked = value;
+        this.openPercent = (value ? 100 : 0);
+        this.onChange && this.onChange();
+      }
+      return this.checkbox.checked;
+    }
+
+  });
+
+})(ionic);
+
+(function(document, ionic) {
+  'use strict';
+
+  // Ionic CSS polyfills
+  ionic.CSS = {};
+
+  (function() {
+
+    // transform
+    var i, keys = ['webkitTransform', 'transform', '-webkit-transform', 'webkit-transform',
+                   '-moz-transform', 'moz-transform', 'MozTransform', 'mozTransform', 'msTransform'];
+
+    for (i = 0; i < keys.length; i++) {
+      if (document.documentElement.style[keys[i]] !== undefined) {
+        ionic.CSS.TRANSFORM = keys[i];
+        break;
+      }
+    }
+
+    // transition
+    keys = ['webkitTransition', 'mozTransition', 'msTransition', 'transition'];
+    for (i = 0; i < keys.length; i++) {
+      if (document.documentElement.style[keys[i]] !== undefined) {
+        ionic.CSS.TRANSITION = keys[i];
+        break;
+      }
+    }
+
+    // The only prefix we care about is webkit for transitions.
+    var isWebkit = ionic.CSS.TRANSITION.indexOf('webkit') > -1;
+
+    // transition duration
+    ionic.CSS.TRANSITION_DURATION = (isWebkit ? '-webkit-' : '') + 'transition-duration';
+
+    // To be sure transitionend works everywhere, include *both* the webkit and non-webkit events
+    ionic.CSS.TRANSITIONEND = (isWebkit ?  'webkitTransitionEnd ' : '') + 'transitionend';
+  })();
+
+  // https:devongovett/1381839
+  if (!("classList" in document.documentElement) && Object.defineProperty && typeof HTMLElement !== 'undefined') {
+    Object.defineProperty(HTMLElement.prototype, 'classList', {
+      get: function() {
+        var self = this;
+        function update(fn) {
+          return function() {
+            var x, classes = self.className.split(/\s+/);
+
+            for (x = 0; x < arguments.length; x++) {
+              fn(classes, classes.indexOf(arguments[x]), arguments[x]);
+            }
+
+            self.className = classes.join(" ");
+          };
+        }
+
+        return {
+          add: update(function(classes, index, value) {
+            ~index || classes.push(value);
+          }),
+
+          remove: update(function(classes, index) {
+            ~index && classes.splice(index, 1);
+          }),
+
+          toggle: update(function(classes, index, value) {
+            ~index ? classes.splice(index, 1) : classes.push(value);
+          }),
+
+          contains: function(value) {
+            return !!~self.className.split(/\s+/).indexOf(value);
+          },
+
+          item: function(i) {
+            return self.className.split(/\s+/)[i] || null;
+          }
+        };
+
+      }
+    });
+  }
+
+})(document, ionic);
+
+window.ionic = window.ionic || {};
+window.ionic.views = {};
+window.ionic.version = '<%= pkg.version %>';
