@@ -1,0 +1,4305 @@
+Imports Microsoft.CodeAnalysis.Diagnostics
+
+<DiagnosticAnalyzer(LanguageNames.VisualBasic)>
+Public Class MisAssignmentConstructor_Analyzer1Analyzer
+  Inherits Diagnostics.DiagnosticAnalyzer
+
+
+
+  Public Const DiagnosticId = "MA_001"
+  Friend Const Title = "Did you mean to assign to a parameter arguement?"
+  Friend Const MessageFormat = "Did you mean to assign to a parameter arguement? (Parameter name '{0}') "
+  Friend Const Category = "Naming"
+
+  Friend Shared Rule As New DiagnosticDescriptor(DiagnosticId, Title, MessageFormat, Category, DiagnosticSeverity.Warning, isEnabledByDefault:=True)
+
+  Public Overrides ReadOnly Property SupportedDiagnostics As ImmutableArray(Of DiagnosticDescriptor)
+    Get
+      Return ImmutableArray.Create(Rule)
+    End Get
+  End Property
+
+  Public Overrides Sub Initialize(context As AnalysisContext)
+    context.RegisterSyntaxNodeAction(Of SyntaxKind)(AddressOf AnalyzeNode, SyntaxKind.SubNewStatement)
+  End Sub
+
+  Public Sub AnalyzeNode(context As SyntaxNodeAnalysisContext)
+    Dim constructor = TryCast(context.Node, Syntax.SubNewStatementSyntax)
+    If constructor Is Nothing Then Exit Sub
+    Dim st = constructor.SyntaxTree
+    Dim names = constructor.ParameterList.Parameters.Select(Function(p) p.Identifier.Identifier.GetIdentifierText)
+    For Each statement In DirectCast(constructor.Parent, ConstructorBlockSyntax).Statements.OfType(Of AssignmentStatementSyntax).Where(Function(a) TypeOf a.Left Is SimpleNameSyntax)
+      Dim lhs_Id = CType(statement.Left, SimpleNameSyntax).Identifier
+      If names.Contains(lhs_Id.GetIdentifierText()) Then context.ReportDiagnostic(Diagnostic.Create(Rule, Location.Create(st, statement.Left.Span), lhs_Id))
+    Next
+  End Sub
+End Class
+
+<ExportCodeFixProvider("MisAssignmentConstructor_Analyzer1CodeFixProvider", LanguageNames.VisualBasic), [Shared]>
+Public Class MisAssignmentConstructor_Analyzer1CodeFixProvider
+  Inherits CodeFixProvider
+
+  Public NotOverridable Overrides Function GetFixableDiagnosticIds() As ImmutableArray(Of String)
+    Return ImmutableArray.Create(MisAssignmentConstructor_Analyzer1Analyzer.DiagnosticId)
+  End Function
+
+  Public NotOverridable Overrides Function GetFixAllProvider() As FixAllProvider
+    Return WellKnownFixAllProviders.BatchFixer
+  End Function
+
+  Public NotOverridable Overrides Async Function ComputeFixesAsync(context As CodeFixContext) As Task
+    Dim root = Await context.Document.GetSyntaxRootAsync(context.CancellationToken)
+    Dim diagnostic = context.Diagnostics.First
+    Dim diagnosticSpan = diagnostic.Location.SourceSpan
+    Dim declarations = root.FindToken(diagnosticSpan.Start).Parent.AncestorsAndSelf().OfType(Of SimpleNameSyntax)()
+    If declarations.Any Then
+      Dim ID_Node = declarations.First
+      Dim Assignment_Statement = TryCast(ID_Node.Parent, AssignmentStatementSyntax)
+      If Assignment_Statement Is Nothing Then Return
+      context.RegisterFix(CodeAction.Create("Prefix with underscore", Function(c) Prefix_WithUnderscore(context.Document, Assignment_Statement, c)), diagnostic)
+      context.RegisterFix(CodeAction.Create("Prefix with Me.", Function(c) Prefix_WithMeDot(context.Document, Assignment_Statement, c)), diagnostic)
+    End If
+    Return
+  End Function
+
+  Private Async Function Prefix_WithUnderscore(document As Document, assignment_statement As AssignmentStatementSyntax, cancellationToken As CancellationToken) As Task(Of Solution)
+    Dim LHS = DirectCast(assignment_statement.Left, SimpleNameSyntax)
+    Dim _LHS = LHS.WithIdentifier(SyntaxFactory.Identifier("_" & LHS.Identifier.Text))
+    Dim semanticModel = Await document.GetSemanticModelAsync(cancellationToken)
+    Dim root = Await semanticModel.SyntaxTree.GetRootAsync
+    Dim tree = root.ReplaceNode(LHS, _LHS).SyntaxTree
+    Dim newSolution = document.WithSyntaxRoot(Await tree.GetRootAsync)
+    Return newSolution.Project.Solution
+  End Function
+
+  Private Async Function Prefix_WithMeDot(document As Document, assignment_statement As AssignmentStatementSyntax, cancellationToken As CancellationToken) As Task(Of Solution)
+    Dim LHS = DirectCast(assignment_statement.Left, SimpleNameSyntax)
+    Dim _LHS = SyntaxFactory.ExpressionStatement(SyntaxFactory.InvocationExpression(SyntaxFactory.SimpleMemberAccessExpression(SyntaxFactory.MeExpression, SyntaxFactory.IdentifierName(LHS.Identifier.Text))))
+    Dim ass = SyntaxFactory.SimpleAssignmentStatement(_LHS.Expression, assignment_statement.Right)
+    Dim semanticModel = Await document.GetSemanticModelAsync(cancellationToken)
+    Dim root = Await semanticModel.SyntaxTree.GetRootAsync
+    Dim tree = root.ReplaceNode(Of SyntaxNode)(assignment_statement, ass).SyntaxTree
+    Dim newSolution = document.WithSyntaxRoot(Await tree.GetRootAsync)
+    Return newSolution.Project.Solution
+  End Function
+End Class
+
+Imports System.Reflection
+Imports System.Runtime.InteropServices
+
+' General Information about an assembly is controlled through the following
+' set of attributes. Change these attribute values to modify the information
+' associated with an assembly.
+
+' Review the values of the assembly attributes
+
+<Assembly: AssemblyTitle("Analyzer_VB")>
+<Assembly: AssemblyDescription("")>
+<Assembly: AssemblyCompany("")>
+<Assembly: AssemblyProduct("Analyzer_VB")>
+<Assembly: AssemblyCopyright("Copyright ©  2014")>
+<Assembly: AssemblyTrademark("")>
+
+<Assembly: ComVisible(False)>
+
+' Version information for an assembly consists of the following four values:
+'
+'      Major Version
+'      Minor Version
+'      Build Number
+'      Revision
+'
+' You can specify all the values or you can default the Build and Revision Numbers
+' by using the '*' as shown below:
+<Assembly: AssemblyVersion("1.0.*")>
+<Assembly: AssemblyFileVersion("1.0.0.0")>
+
+#include once "console_process.bi"
+
+constructor ConsoleProcess(byref exe as string, byref args as string = "")
+    '# store executable name for future references
+
+    '# executable with spaces?
+    if (instr(exe, " ")) then
+        _executable = !"\"" + exe + !"\""
+    else
+        _executable = exe
+    end if
+
+    _arguments = args
+    _pid = 0
+end constructor
+
+destructor ConsoleProcess()
+    '# avoid HANDLE leakage
+    if (_process_info.hProcess) then
+        CloseHandle(_process_info.hProcess)
+    end if
+end destructor
+
+property ConsoleProcess.executable() as string
+    return _executable
+end property
+
+property ConsoleProcess.arguments() as string
+    return _arguments
+end property
+
+property ConsoleProcess.pid() as integer
+    return _pid
+end property
+
+property ConsoleProcess.directory() as string
+    return _directory
+end property
+
+property ConsoleProcess.directory(byref new_directory as string)
+    _directory = new_directory
+end property
+
+function ConsoleProcess.start() as integer
+    '# assume nothing worked
+    dim result as integer = 0
+    dim success as integer = 0
+
+    '# Process Information and context
+    dim cmdline as string
+    dim context as STARTUPINFO
+    dim proc_sa as SECURITY_ATTRIBUTES = type(sizeof(SECURITY_ATTRIBUTES), NULL, TRUE)
+
+    '# Std* pipes redirection
+    dim as HANDLE StdInRd, StdOutRd, StdErrRd
+    dim as HANDLE StdInWr, StdOutWr, StdErrWr
+
+    '# create pipes for SdtIn and ensure is not inherited (Write)
+    success = CreatePipe(@StdInRd, @StdInWr, @proc_sa, 0)
+    if (success) then
+        success = SetHandleInformation(StdInWr, HANDLE_FLAG_INHERIT, 0)
+    end if
+
+    if (redirected) then
+        '# open _redirect_filename for append and use for StdOutWr
+        StdOutWr = CreateFile( _
+            _redirect_filename, _                   '# LPCTSTR lpFileName
+            GENERIC_WRITE, _                        '# DWORD dwDesiredAccess
+            (FILE_SHARE_READ or FILE_SHARE_WRITE), _ '# DWORD dwShareMode
+            @proc_sa, _                             '# LPSECURITY_ATTRIBUTES lpSecurityAttributes
+            OPEN_ALWAYS, _                          '# DWORD dwCreationDisposition
+            FILE_ATTRIBUTE_NORMAL, _                '# DWORD dwFlagsAndAttributes
+            NULL _                                  '# HANDLE hTemplateFile
+        )
+
+        '# fail to open the file?
+        if (StdOutWr = INVALID_HANDLE_VALUE) then
+            success = not success
+        else
+            '# StdErr == StdOut
+            StdErrWr = StdOutWr
+            '# worked, move file pointer to end of the file
+            SetFilePointer(StdOutWr, 0, NULL, FILE_END)
+        end if
+    else
+        '# create pipes for StdOut and ensure is not inherited (Read)
+        success = CreatePipe(@StdOutRd, @StdOutWr, @proc_sa, 0)
+        if (success) then
+            success = SetHandleInformation(StdOutRd, HANDLE_FLAG_INHERIT, 0)
+        end if
+
+        '# create pipes for StdErr and ensure is not inherited (Read)
+        success = CreatePipe(@StdErrRd, @StdOutWr, @proc_sa, 0)
+        if (success) then
+            success = SetHandleInformation(StdErrRd, HANDLE_FLAG_INHERIT, 0)
+        end if
+    end if
+
+    '# assume we have the pipes or file handle
+    if (success) then
+
+        '# Allocate a console, services don't have one
+        '# (we don't care about the result of it)
+        AllocConsole
+
+        '# set Std* for context
+        with context
+            .cb         = sizeof(context)
+            .hStdInput  = StdInRd
+            .hStdOutput = StdOutWr
+            .hStdError  = StdErrWr
+            .dwFlags    = STARTF_USESTDHANDLES
+        end with
+
+        '# build command line (for LpCommandLine)
+        cmdline = _executable + " " + _arguments
+
+        success = CreateProcess( _
+            NULL, _                 '# LPCTSTR lpApplicationName
+            cmdline, _              '# LPTSTR lpCommandLine
+            NULL, _                 '# LPSECURITY_ATTRIBUTES lpProcessAttributes
+            NULL, _                 '# LPSECURITY_ATTRIBUTES lpThreadAttributes
+            TRUE, _                 '# BOOL bInheritHandles
+            NORMAL_PRIORITY_CLASS, _'# DWORD dwCreationFlags
+            NULL, _                 '# LPVOID lpEnvironment
+            _directory, _           '# LPCTSTR lpCurrentDirectory
+            @context, _             '# LPSTARTUPINFO lpStartupInfo
+            @_process_info _        '# LPPROCESS_INFORMATION lpProcessInformation
+        )
+        if (success) then
+            '# clean unused handle
+            CloseHandle(_process_info.hThread)
+            _process_info.hThread = NULL
+
+            _pid = _process_info.dwProcessId
+            result = success
+        else
+        end if
+    end if
+
+    '# cleanup
+    CloseHandle(StdInRd)
+    CloseHandle(StdInWr)
+    CloseHandle(StdOutRd)
+    CloseHandle(StdOutWr)
+    CloseHandle(StdErrRd)
+    CloseHandle(StdErrWr)
+
+    return result
+end function
+
+function ConsoleProcess.exit_code() as uinteger
+    static previous_code as uinteger
+    dim result as uinteger
+    dim success as integer
+
+    '# do we have a process to work with?
+    if (_process_info.hProcess) then
+        success = GetExitCodeProcess(_process_info.hProcess, @result)
+        if (success) then
+            previous_code = result
+
+            '# free handle if not required
+            if not (result = STILL_ACTIVE) then
+                CloseHandle(_process_info.hProcess)
+                _process_info.hProcess = NULL
+            end if
+        end if
+    else
+        result = previous_code
+    end if
+
+    return result
+end function
+
+function ConsoleProcess.running() as integer
+    return (exit_code = STILL_ACTIVE)
+end function
+
+function ConsoleProcess.terminate(byval default_timeout as integer = 5) as integer
+    dim result as integer
+    dim success as integer
+    dim wait_code as integer
+    dim timeout as integer = default_timeout * 1000 '# milliseconds
+
+    if (running) then
+        '# hook our handler routine
+        success = SetConsoleCtrlHandler(@handler_routine, TRUE)
+        if (success) then
+            '# send CTRL_C_EVENT and wait for result
+            success = GenerateConsoleCtrlEvent(CTRL_C_EVENT, 0)
+            if (success) then
+                wait_code = WaitForSingleObject(_process_info.hProcess, timeout)
+                result = not (wait_code = WAIT_TIMEOUT)
+            end if
+
+            '# didn't work? send Ctrl+Break and wait
+            if not (result) then
+                success = GenerateConsoleCtrlEvent(CTRL_BREAK_EVENT, 0)
+                if (success) then
+                    wait_code = WaitForSingleObject(_process_info.hProcess, timeout)
+                    result = not (wait_code = WAIT_TIMEOUT)
+                end if
+            end if
+        end if
+
+        '# remove to restore functionality
+        success = SetConsoleCtrlHandler(@handler_routine, FALSE)
+    end if
+
+    return result
+end function
+
+function ConsoleProcess.kill() as integer
+    dim result as integer
+
+    if (running) then
+        result = TerminateProcess(_process_info.hProcess, 0)
+    end if
+
+    return result
+end function
+
+function ConsoleProcess.redirect(byref redirect_filename as string) as integer
+    dim result as integer = 0
+
+    if not (running) then
+        if (len(redirect_filename) > 0) then
+            _redirect_filename = redirect_filename
+            result = not result
+        end if
+    end if
+
+    return result
+end function
+
+function ConsoleProcess.redirected() as integer
+    return (len(_redirect_filename) > 0)
+end function
+
+function ConsoleProcess.handler_routine(byval dwCtrlType as DWORD) as BOOL
+    dim result as BOOL
+
+    '# shall we process dwCtrlType?
+    select case dwCtrlType
+    case CTRL_C_EVENT, CTRL_BREAK_EVENT:
+        result = TRUE
+    case else:
+        result = FALSE
+    end select
+
+    return result
+end function
+
+
+VERSION 1.0 CLASS
+BEGIN
+  MultiUse = -1  'True
+END
+Attribute VB_Name = "ArrayEx"
+Attribute VB_GlobalNameSpace = False
+Attribute VB_Creatable = False
+Attribute VB_PredeclaredId = False
+Attribute VB_Exposed = False
+'+----                                                                   --+
+'|                             Ariawase 0.6.0                              |
+'|                Ariawase is free library for VBA cowboys.                |
+'|          The Project Page: https://github.com/vbaidiot/Ariawase         |
+'+--                                                                   ----+
+Option Explicit
+
+Private xItems As Variant
+Private xLength As Long
+Private xIndex As Long
+
+Private Sub Class_Initialize()
+    xIndex = -1
+    xLength = -1 + 32
+    ReDim xItems(xLength - 1)
+End Sub
+
+Private Sub Extend()
+    If xIndex < xLength Then GoTo Escape
+    xLength = xLength + 1 'possible overflow (Err.Raise 6)
+    xLength = -1 + xLength + xLength
+    ReDim Preserve xItems(xLength - 1)
+
+Escape:
+End Sub
+
+Public Function AddVal(ByVal val As Variant)
+    xIndex = xIndex + 1
+    Extend
+    Let xItems(xIndex) = val
+End Function
+
+Public Function AddObj(ByVal obj As Variant)
+    xIndex = xIndex + 1
+    Extend
+    Set xItems(xIndex) = obj
+End Function
+
+Public Function ToArray() As Variant
+    Dim arr As Variant: arr = xItems
+    If xIndex > -1 Then
+        ReDim Preserve arr(xIndex)
+    Else
+        arr = Array()
+    End If
+    ToArray = arr
+End Function
+
+Attribute VB_Name = "Assert"
+'+----                                                                   --+
+'|                             Ariawase 0.6.0                              |
+'|                Ariawase is free library for VBA cowboys.                |
+'|          The Project Page: https://github.com/vbaidiot/Ariawase         |
+'+--                                                                   ----+
+Option Explicit
+Option Private Module
+
+Private Const TestClassSuffix As String = "Test"
+Private Const TestProcSuffix As String = "_Test"
+
+Private Const AssertModule As String = "Assert"
+Private Const GeneratedProc As String = "TestRunner"
+Private Const CommentLineInGeneratedProc As Long = 1
+
+Private Const ResultLineLen As Long = 76
+
+Private xStartTime As Single
+Private xEndTime As Single
+Private xSuccSubCount As Long
+Private xFailSubCount As Long
+
+Private xAssertIx As Long
+Private xFailMsgs As Collection
+
+Private Property Get VBProject() As Object
+    Dim app As Object: Set app = Application
+    Select Case app.Name
+        Case "Microsoft Word":   Set VBProject = app.MacroContainer.VBProject
+        Case "Microsoft Excel":  Set VBProject = app.ThisWorkbook.VBProject
+        Case "Microsoft Access": Set VBProject = app.VBE.ActiveVBProject
+        Case Else: Err.Raise 17
+    End Select
+End Property
+
+Private Function ProcNames(ByVal vbcompo As Object) As Collection
+    Dim cdmdl As Object:     Set cdmdl = vbcompo.CodeModule
+    Dim procs As Collection: Set procs = New Collection
+    Dim proc As Variant:     proc = ""
+
+    Dim i As Long
+    For i = 1 + cdmdl.CountOfDeclarationLines To cdmdl.CountOfLines
+        If proc <> cdmdl.ProcOfLine(i, 0) Then
+            proc = cdmdl.ProcOfLine(i, 0)
+            procs.Add proc
+        End If
+    Next
+
+    Set ProcNames = procs
+End Function
+
+Private Sub WriteResult(ByVal res As String)
+    Debug.Print res
+End Sub
+
+Private Sub TestStart(ByVal clsName As String)
+    WriteResult String$(ResultLineLen, "-")
+    WriteResult clsName
+    WriteResult String$(ResultLineLen, "-")
+
+    xSuccSubCount = 0
+    xFailSubCount = 0
+    xStartTime = Timer
+End Sub
+
+Private Sub TestEnd()
+    xEndTime = Timer
+
+    WriteResult String$(ResultLineLen, "=")
+    WriteResult _
+          xSuccSubCount & " succeeded, " & xFailSubCount & " failed," _
+        & " took " & Format$(xEndTime - xStartTime, "0.00") & " seconds."
+End Sub
+
+Private Function CheckTestProcName(ByVal proc As String) As Boolean
+    CheckTestProcName = Right$(proc, Len(TestProcSuffix)) = TestProcSuffix
+End Function
+
+Private Function CheckTestClassName(ByVal clsName As String) As Boolean
+    CheckTestClassName = Right$(clsName, Len(TestClassSuffix)) = TestClassSuffix
+End Function
+
+Private Sub RunTestSub(ByVal obj As Object, ByVal proc As String)
+    xAssertIx = 1
+    Set xFailMsgs = New Collection
+
+    CallByName obj, proc, VbMethod
+
+    If xFailMsgs.Count < 1 Then
+        WriteResult "+ " & proc
+        IncrPre xSuccSubCount
+    Else
+        WriteResult "- " & proc
+        WriteResult "  " & Join(ClctToArr(xFailMsgs), vbCrLf & "  ")
+        IncrPre xFailSubCount
+    End If
+End Sub
+
+Public Sub RunTestOf(ByVal clsObj As Object)
+    Dim clsName As String: clsName = TypeName(clsObj)
+    If Not CheckTestClassName(clsName) Then Err.Raise 5
+
+    Dim proc As Variant, procs As Collection
+    Set procs = ProcNames(VBProject.VBComponents(clsName))
+
+    TestStart clsName
+    For Each proc In procs
+        If CheckTestProcName(proc) Then RunTestSub clsObj, proc
+    Next
+    TestEnd
+End Sub
+
+Public Sub RunTest()
+    Call TestRunner
+End Sub
+
+Private Sub TestRunner()
+    ' NOTE: This is auto-generated code - don't modify contents of this procedure with the code editor.
+End Sub
+
+Public Sub TestRunnerClear()
+    Dim asrt As Object: Set asrt = VBProject.VBComponents(AssertModule).CodeModule
+    Dim st0 As Long: st0 = asrt.ProcStartLine(GeneratedProc, 0)
+    Dim st1 As Long: st1 = asrt.ProcBodyLine(GeneratedProc, 0)
+    Dim cnt As Long: cnt = asrt.ProcCountLines(GeneratedProc, 0)
+
+    asrt.DeleteLines _
+        st1 + (1 + CommentLineInGeneratedProc), _
+        cnt - ((st1 - st0) + 2 + CommentLineInGeneratedProc)
+End Sub
+
+Public Sub TestRunnerGenerate()
+    Dim asrt As Object: Set asrt = VBProject.VBComponents(AssertModule).CodeModule
+    Dim st1 As Long: st1 = asrt.ProcBodyLine(GeneratedProc, 0)
+    Dim pos As Long: pos = st1 + (1 + CommentLineInGeneratedProc)
+
+    Dim vbcompo As Object, ln As String
+    For Each vbcompo In VBProject.VBComponents
+        If vbcompo.Type = 2 And CheckTestClassName(vbcompo.Name) Then
+            ln = "Assert.RunTestOf New " & vbcompo.Name
+            asrt.InsertLines pos, vbTab & ln
+            IncrPre pos
+        End If
+    Next
+End Sub
+
+Private Sub AssertDone( _
+    ByVal isa As Boolean, ByVal cond As Boolean, ByVal msg As String, ByVal exp As Variant, ByVal act As Variant _
+    )
+
+    If isa <> cond Then
+        Push xFailMsgs, "[" & xAssertIx & "] " & msg & ":"
+        Push xFailMsgs, "  Expected: " & IIf(isa, "", "Not ") & "<" & Dump(exp) & ">"
+        Push xFailMsgs, "  But was:  <" & Dump(act) & ">"
+    End If
+    IncrPre xAssertIx
+End Sub
+
+Public Sub IsNullVal(ByVal x As Variant, Optional ByVal msg As String = "")
+    AssertDone True, IsNull(x), msg, Null, x
+End Sub
+
+Public Sub IsNotNullVal(ByVal x As Variant, Optional ByVal msg As String = "")
+    AssertDone False, IsNull(x), msg, Null, x
+End Sub
+
+Public Sub IsInstanceOfTypeName( _
+    ByVal expType As String, ByVal x As Variant, Optional ByVal msg As String = "" _
+    )
+
+    Dim t As String: t = TypeName(x)
+    AssertDone True, expType = t, msg, expType, t
+End Sub
+
+Public Sub IsNotInstanceOfTypeName( _
+    ByVal expType As String, ByVal x As Variant, Optional ByVal msg As String = "" _
+    )
+
+    Dim t As String: t = TypeName(x)
+    AssertDone False, expType = t, msg, expType, t
+End Sub
+
+Public Sub AreEq( _
+    ByVal exp As Variant, ByVal act As Variant, Optional ByVal msg As String = "" _
+    )
+
+    AssertDone True, Eq(exp, act), msg, exp, act
+End Sub
+
+Public Sub AreNotEq( _
+    ByVal exp As Variant, ByVal act As Variant, Optional ByVal msg As String = "" _
+    )
+
+    AssertDone False, Eq(exp, act), msg, exp, act
+End Sub
+
+Public Sub AreEqual( _
+    ByVal exp As Variant, ByVal act As Variant, Optional ByVal msg As String = "" _
+    )
+
+    AssertDone True, Equals(exp, act), msg, exp, act
+End Sub
+
+Public Sub AreNotEqual( _
+    ByVal exp As Variant, ByVal act As Variant, Optional ByVal msg As String = "" _
+    )
+
+    AssertDone False, Equals(exp, act), msg, exp, act
+End Sub
+
+Public Sub AreEqualArr( _
+    ByVal exp As Variant, ByVal act As Variant, Optional ByVal msg As String = "" _
+    )
+
+    AssertDone True, ArrEquals(exp, act), msg, exp, act
+End Sub
+
+Public Sub AreNotEqualArr( _
+    ByVal exp As Variant, ByVal act As Variant, Optional ByVal msg As String = "" _
+    )
+
+    AssertDone False, ArrEquals(exp, act), msg, exp, act
+End Sub
+
+Public Sub Fail(Optional ByVal msg As String = "")
+    If Len(msg) > 0 Then
+        Err.Raise 1004, AssertModule, msg
+    Else
+        Err.Raise 1004, AssertModule
+    End If
+End Sub
+
+Public Sub IsErrFunc( _
+    ByVal errnum As Variant, _
+    ByVal fun As Func, ByVal params As Variant, _
+    Optional ByVal msg As String = "" _
+    )
+
+    If Not (IsEmpty(errnum) Or IsNumeric(errnum)) Then Err.Raise 5
+    If Not IsArray(params) Then Err.Raise 5
+
+    On Error GoTo Catch
+
+    Dim act As Variant: act = Empty
+
+    Dim buf As Variant, ret As Boolean
+    fun.CallByPtr buf, params
+    AssertDone True, ret, msg, errnum, act
+    GoTo Escape
+
+Catch:
+    act = Err.Number
+    ret = IsEmpty(errnum) Or act = errnum
+    Resume Next
+
+Escape:
+End Sub
+
+Public Sub IsErrMethod( _
+    ByVal errnum As Variant, _
+    ByVal obj As Object, ByVal proc As String, ByVal params As Variant, _
+    Optional ByVal msg As String = "" _
+    )
+
+    If Not (IsEmpty(errnum) Or IsNumeric(errnum)) Then Err.Raise 5
+    If Not IsArray(params) Then Err.Raise 5
+    If LBound(params) <> 0 Then Err.Raise 5
+
+    On Error GoTo Catch
+
+    Dim act As Variant: act = Empty
+
+    Dim i As Long, ret As Boolean
+    Dim ubParam As Long: ubParam = UBound(params)
+    Dim ps() As Variant: ReDim ps(ubParam)
+    For i = 0 To ubParam
+        If IsObject(params(i)) Then
+            Set ps(i) = params(i)
+        Else
+            Let ps(i) = params(i)
+        End If
+    Next
+    rtcCallByName obj, StrPtr(proc), VbMethod, ps
+
+    AssertDone True, ret, msg, errnum, act
+    GoTo Escape
+
+Catch:
+    act = Err.Number
+    ret = IsEmpty(errnum) Or act = errnum
+    Resume Next
+
+Escape:
+End Sub
+
+VERSION 1.0 CLASS
+BEGIN
+  MultiUse = -1  'True
+END
+Attribute VB_Name = "CdoMail"
+Attribute VB_GlobalNameSpace = False
+Attribute VB_Creatable = False
+Attribute VB_PredeclaredId = False
+Attribute VB_Exposed = False
+'+----                                                                   --+
+'|                             Ariawase 0.6.0                              |
+'|                Ariawase is free library for VBA cowboys.                |
+'|          The Project Page: https://github.com/vbaidiot/Ariawase         |
+'+--                                                                   ----+
+Option Explicit
+
+' @seealso http://msdn.microsoft.com/en-us/library/ms526266.aspx
+
+Private Enum CdoSendUsing
+    cdoSendUsingPickup = 1
+    cdoSendUsingPort = 2
+End Enum
+
+' @seealso http://msdn.microsoft.com/en-us/library/ms872853.aspx
+Private Const uriCdoConf As String = "http://schemas.microsoft.com/cdo/configuration/"
+Private Const cdoSendUsingMethod  As String = uriCdoConf & "sendusing"
+Private Const cdoSMTPServer       As String = uriCdoConf & "smtpserver"
+Private Const cdoSMTPServerPort   As String = uriCdoConf & "smtpserverport"
+Private Const cdoSMTPAuthenticate As String = uriCdoConf & "smtpauthenticate"
+Private Const cdoSMTPUseSSL       As String = uriCdoConf & "smtpusessl"
+Private Const cdoSendUserName     As String = uriCdoConf & "sendusername"
+Private Const cdoSendPassword     As String = uriCdoConf & "sendpassword"
+Private Const cdoLanguageCode     As String = uriCdoConf & "languagecode"
+
+Private xMyMailAddr As String
+Private xConf As Object 'Is CDO.Configuration
+
+Private xMsg As Object 'Is CDO.Message
+
+Public Sub Configure( _
+    ByVal myMailAddr As String, _
+    Optional ByVal smtpServer As String, _
+    Optional ByVal smtpAuth As CdoProtocolsAuthentication = cdoAnonymous, _
+    Optional ByVal sndUser As String, _
+    Optional ByVal sndPassword As String, _
+    Optional ByVal useSSL As Boolean = False _
+    )
+
+    xMyMailAddr = myMailAddr
+
+    Dim smtpAddrPort As Variant: smtpAddrPort = Split(smtpServer, ":")
+    If UBound(smtpAddrPort) < 0 Then
+        Set xConf = Nothing
+        GoTo Escape
+    End If
+
+    Set xConf = CreateObject("CDO.Configuration")
+    With xConf.Fields
+        .Item(cdoSendUsingMethod) = CdoSendUsing.cdoSendUsingPort
+        .Item(cdoSMTPServer) = smtpAddrPort(0)
+        Select Case UBound(smtpAddrPort)
+            Case 0: .Item(cdoSMTPServerPort) = 25
+            Case 1: .Item(cdoSMTPServerPort) = smtpAddrPort(1)
+            Case Else: Err.Raise 5
+        End Select
+
+        .Item(cdoSMTPAuthenticate) = smtpAuth
+        .Item(cdoSendUserName) = sndUser
+        .Item(cdoSendPassword) = sndPassword
+        .Item(cdoSMTPUseSSL) = useSSL
+    End With
+    xConf.Fields.Update
+
+Escape:
+End Sub
+
+Public Sub NewMail()
+    If Len(xMyMailAddr) < 1 Then Err.Raise 5
+
+    Set xMsg = CreateObject("CDO.Message")
+    Set xMsg.Configuration = xConf
+    'xMsg.Fields.Item("urn:schemas:mailheader:X-Mailer") = "Microsoft CDO for Windows 2000"
+    'xMsg.Fields.Update()
+    xMsg.From = xMyMailAddr
+End Sub
+
+Private Function GetAddrList(ByVal addlst As Variant) As String
+    If IsArray(addlst) Then GetAddrList = Join(addlst, "; ") Else GetAddrList = CStr(addlst)
+End Function
+
+Public Sub SetAddress( _
+    ByVal addrTo As Variant, _
+    Optional ByVal addrCC As Variant = Empty, _
+    Optional ByVal addrBCC As Variant = Empty _
+    )
+
+    xMsg.To = GetAddrList(addrTo)
+    xMsg.CC = GetAddrList(addrCC)
+    xMsg.BCC = GetAddrList(addrBCC)
+End Sub
+
+Public Sub SetMessage( _
+    ByVal msgSubject As String, ByVal msgBody As String, _
+    Optional ByVal chrset As String = cdoISO_2022_JP, _
+    Optional ByVal contTransEnc As String = cdoBase64 _
+    )
+
+    xMsg.Subject = msgSubject
+    xMsg.TextBody = msgBody
+    xMsg.TextBodyPart.Charset = chrset
+    xMsg.TextBodyPart.ContentTransferEncoding = contTransEnc
+End Sub
+
+Public Sub AddAttachments(ByVal atchFiles As Variant)
+    Dim fpath As Variant '(Of String)
+    For Each fpath In atchFiles: xMsg.AddAttachment fpath: Next
+End Sub
+
+Public Sub SendMail()
+    xMsg.Send
+End Sub
+
+Public Sub QuickSendMail( _
+    ByVal addrTo As Variant, ByVal msgSubject As String, ByVal msgBody As String _
+    )
+
+    If Len(xMyMailAddr) < 1 Then Err.Raise 5
+
+    Dim msg As Object: Set msg = CreateObject("CDO.Message")
+    Set msg.Configuration = xConf
+    msg.From = xMyMailAddr
+
+    msg.To = GetAddrList(addrTo)
+    msg.Subject = msgSubject
+    msg.TextBody = msgBody
+
+    msg.Send
+End Sub
+
+Attribute VB_Name = "Core"
+'+----                                                                   --+
+'|                             Ariawase 0.6.0                              |
+'|                Ariawase is free library for VBA cowboys.                |
+'|          The Project Page: https://github.com/vbaidiot/Ariawase         |
+'+--                                                                   ----+
+Option Explicit
+Option Private Module
+
+' @return VARIANT
+' @param [in] IDispatch* Object
+' @param [in] BSTR ProcName
+' @param [in] VbCallType CallType
+' @param [in] SAFEARRAY(VARIANT)* Args
+' @param [in, lcid] long lcid
+#If VBA7 Then
+#If Win64 Then
+Public Declare PtrSafe _
+Function rtcCallByName Lib "VBE7.DLL" ( _
+    ByVal Object As Object, _
+    ByVal ProcName As LongPtr, _
+    ByVal CallType As VbCallType, _
+    ByRef Args() As Any, _
+    Optional ByVal lcid As Long _
+    ) As Variant
+#Else
+Public Declare _
+Function rtcCallByName Lib "VBE7.DLL" ( _
+    ByVal Object As Object, _
+    ByVal ProcName As Long, _
+    ByVal CallType As VbCallType, _
+    ByRef Args() As Any, _
+    Optional ByVal lcid As Long _
+    ) As Variant
+#End If
+#Else
+Public Declare _
+Function rtcCallByName Lib "VBE6.DLL" ( _
+    ByVal Object As Object, _
+    ByVal ProcName As Long, _
+    ByVal CallType As VbCallType, _
+    ByRef Args() As Any, _
+    Optional ByVal lcid As Long _
+    ) As Variant
+#End If
+
+' @seealso WScript.Shell http://msdn.microsoft.com/en-us/library/aew9yb99.aspx (/ja-jp/library/cc364436.aspx)
+' @seealso WbemScripting.SWbemLocator http://msdn.microsoft.com/en-us/library/windows/desktop/aa393719.aspx
+' @seealso VBScript.RegExp http://msdn.microsoft.com/en-us/library/yab2dx62.aspx (/ja-jp/library/cc392403.aspx)
+
+Public Enum HKeyEnum
+    HKEY_CLASSES_ROOT = &H80000000
+    HKEY_CURRENT_USER = &H80000001
+    HKEY_LOCAL_MACHINE = &H80000002
+    HKEY_USERS = &H80000003
+    'HKEY_PERFORMANCE_DATA = &H80000004
+    HKEY_CURRENT_CONFIG = &H80000005
+    'HKEY_DYN_DATA = &H80000006
+End Enum
+
+Private xxWsh As Object 'Is WScript.Shell
+Private xxWmi As Object 'Is WbemScripting.SWbemLocator
+
+Public Property Get Missing() As Variant
+    Missing = GetMissing()
+End Property
+Private Function GetMissing(Optional ByVal mss As Variant) As Variant
+    'If Not IsMissing(mss) Then Err.Raise 5
+    GetMissing = mss
+End Function
+
+' @param n As Long
+' @return As Long
+Public Function IncrPre(ByRef n As Variant, Optional ByVal stepVal As Variant = 1) As Variant
+    n = n + stepVal: IncrPre = n
+End Function
+
+' @param n As Long
+' @return As Long
+Public Function IncrPst(ByRef n As Variant, Optional ByVal stepVal As Variant = 1) As Variant
+    IncrPst = n: n = n + stepVal
+End Function
+
+' @param flgs() As Variant(Of Boolean)
+' @return As Long
+Public Function BitFlag(ParamArray flgs() As Variant) As Long
+    BitFlag = 0
+    Dim ub As Long: ub = UBound(flgs)
+
+    Dim i As Long
+    For i = 0 To ub
+        BitFlag = BitFlag + Abs(flgs(i)) * 2 ^ (ub - i)
+    Next
+End Function
+
+' @param num As Variant(Of Numeric Or Date)
+' @return As Boolean
+Public Function IsInt(ByVal num As Variant) As Boolean
+    If IsDate(num) Then num = CDbl(num)
+    If Not IsNumeric(num) Then Err.Raise 13
+
+    IsInt = num = Fix(num)
+End Function
+
+' @param num As Variant(Of Numeric)
+' @param digits As Integer
+' @param rndup As Integer
+' @return As Variant(Of Decimal)
+Public Function ARound( _
+    ByVal num As Variant, Optional ByVal digits As Integer = 0, Optional rndup As Integer = 5 _
+    ) As Variant
+
+    If Not IsNumeric(num) Then Err.Raise 13
+    If Not (1 <= rndup And rndup <= 10) Then Err.Raise 5
+
+    num = CDec(num)
+    Dim n As Variant: n = CDec(10 ^ Abs(digits))
+    Dim z As Variant: z = CDec(Sgn(num) * 0.1 * (10 - rndup))
+    If digits >= 0 Then
+        ARound = Fix(num * n + z) / n
+    Else
+        ARound = Fix(num / n + z) * n
+    End If
+
+Escape:
+End Function
+
+' @param dt As Date
+' @return As Date
+Public Function BeginOfMonth(ByVal dt As Date) As Date
+    BeginOfMonth = DateAdd("d", -Day(dt) + 1, dt)
+End Function
+
+' @param dt As Date
+' @return As Date
+Public Function EndOfMonth(ByVal dt As Date) As Date
+    EndOfMonth = DateAdd("d", -1, BeginOfMonth(DateAdd("m", 1, dt)))
+End Function
+
+' @param dt As Date
+' @param fstDayOfWeek As VbDayOfWeek
+' @return As Date
+Public Function BeginOfWeek(ByVal dt As Date, Optional fstDayOfWeek As VbDayOfWeek = vbSunday) As Date
+    BeginOfWeek = DateAdd("d", 1 - Weekday(dt, fstDayOfWeek), dt)
+End Function
+
+' @param dt As Date
+' @param fstDayOfWeek As VbDayOfWeek
+' @return As Date
+Public Function EndOfWeek(ByVal dt As Date, Optional fstDayOfWeek As VbDayOfWeek = vbSunday) As Date
+    EndOfWeek = DateAdd("d", 7 - Weekday(dt, fstDayOfWeek), dt)
+End Function
+
+'
+' NOTE: This function for Japanese. Please be customized to your language.
+'
+' @param s As String Is Char
+' @return As Integer
+Private Function CharWidth(ByVal s As String) As Integer
+   Dim x As Integer: x = Asc(s) / &H100 And &HFF
+   CharWidth = 1 + Abs((&H81 <= x And x <= &H9F) Or (&HE0 <= x And x <= &HFC))
+End Function
+
+' @param s As String Is Char
+' @return As Long
+Public Function StringWidth(ByVal s As String) As Long
+    Dim w As Long: w = 0
+
+    Dim i As Long
+    For i = 1 To Len(s)
+        w = w + CharWidth(Mid$(s, i, 1))
+    Next
+    StringWidth = w
+End Function
+
+' @param s As String
+' @param byteLen As Long
+' @return As String
+Public Function LeftA(ByVal s As String, ByVal byteLen As Long) As String
+    Dim ixByte As Long: ixByte = 1
+    Dim ixStr As Long:  ixStr = 1
+    While (ixByte < 1 + byteLen) And (ixStr <= Len(s))
+        ixByte = ixByte + CharWidth(Mid$(s, IncrPst(ixStr), 1))
+    Wend
+    LeftA = Left$(s, ixStr - (ixByte - byteLen))
+End Function
+
+' @param s As String
+' @param byteLen As Long
+' @return As String
+Public Function RightA(ByVal s As String, ByVal byteLen As Long) As String
+    Dim idxs As Object: Set idxs = CreateObject("Scripting.Dictionary")
+    Dim ixByte As Long: ixByte = 1
+    Dim ixStr As Long:  ixStr = 1
+    While ixStr <= Len(s)
+        idxs.Add ixByte, ixStr
+        ixByte = ixByte + CharWidth(Mid$(s, IncrPst(ixStr), 1))
+    Wend
+    idxs.Add ixByte, ixStr
+
+    For byteLen = byteLen To 0 Step -1
+        If idxs.Exists(ixByte - byteLen) Then Exit For
+    Next
+
+    RightA = Right$(s, ixStr - idxs.Item(ixByte - byteLen))
+End Function
+
+' @param s As String
+' @param byteLen As Long
+' @return As Variant(Of Array(Of String))
+Public Function SepA(ByVal s As String, ByVal byteLen As Long) As Variant
+    Dim ixByte As Long: ixByte = 1
+    Dim ixStr  As Long: ixStr = 1
+    Dim strLen As Long: strLen = Len(s)
+
+    While (ixByte < 1 + byteLen) And (ixStr <= strLen)
+        ixByte = ixByte + CharWidth(Mid$(s, IncrPst(ixStr), 1))
+    Wend
+
+    Dim n As Long: n = ixStr - (ixByte - byteLen)
+    SepA = Array(Left$(s, n), Mid$(s, n + 1, strLen))
+End Function
+
+' @param strTemplate As String
+' @param vals() As Variant
+' @return As String
+Public Function Formats(ByVal strTemplate As String, ParamArray vals() As Variant) As String
+    Dim re As Object: Set re = CreateRegExp("(?:[^\{])?(\{(\d+)(:(.*?[^\}]?))?\})", "g")
+    Dim ms As Object: Set ms = re.Execute(strTemplate)
+
+    Dim ret As Variant: ret = Array()
+    If ms.Count < 1 Then GoTo Ending
+
+    ReDim ret(2 * ms.Count)
+    Dim ix0 As Long: ix0 = 1
+    Dim ix1 As Long: ix1 = 1
+
+    Dim i As Long: i = 0
+    Dim m As Object, s As String
+    For Each m In ms
+        ix1 = m.FirstIndex + Abs(Left$(m.Value, 1) <> "{")
+        s = Mid$(strTemplate, ix0, ix1 - ix0 + 1)
+        Dim mbrc As Variant: mbrc = ReMatch(s, "{+$")
+        Dim brcs As String:  If ArrLen(mbrc) > 0 Then brcs = mbrc(0) Else brcs = ""
+
+        ret(i + 0) = Replace(Replace(s, "{{", "{"), "}}", "}") 'FIXME: check non-escape brace
+        If Len(brcs) Mod 2 = 0 Then
+            ret(i + 1) = Format$(vals(m.SubMatches(1)), m.SubMatches(3))
+        Else
+            ret(i + 1) = m.SubMatches(1)
+        End If
+
+        i = i + 2
+        ix0 = ix1 + Len(m.SubMatches(0)) + 1
+    Next
+    s = Mid$(strTemplate, ix0)
+    ret(i) = Replace(Replace(s, "{{", "{"), "}}", "}") 'FIXME: check non-escape brace
+
+Ending:
+    Formats = Join(ret, "")
+End Function
+
+' @param obj As Object Is T
+' @param params As Variant()
+' @return As Object Is T
+Public Function Init(ByVal obj As Object, ParamArray params() As Variant) As Object
+    Dim ub As Long: ub = UBound(params)
+
+    If ub < 0 Then
+        obj.Init
+    Else
+        Dim ps() As Variant: ReDim ps(ub)
+
+        Dim i As Long
+        For i = 0 To ub
+            If IsObject(params(i)) Then
+                Set ps(i) = params(i)
+            Else
+                Let ps(i) = params(i)
+            End If
+        Next
+
+        rtcCallByName obj, StrPtr("Init"), VbMethod, ps
+    End If
+
+    Set Init = obj
+End Function
+
+' @param x As Variant
+' @return As String
+Public Function ToStr(ByVal x As Variant) As String
+    If IsObject(x) Then
+        On Error GoTo Err438
+        ToStr = x.ToStr()
+        On Error GoTo 0
+    Else
+        ToStr = x
+    End If
+
+    GoTo Escape
+
+Err438:
+    Dim e As ErrObject: Set e = Err
+    Select Case e.Number
+        Case 438: ToStr = TypeName(x): Resume Next
+        Case Else: Err.Raise e.Number, e.Source, e.Description, e.HelpFile, e.HelpContext
+    End Select
+
+Escape:
+End Function
+
+' @param x As Variant
+' @return As String
+Public Function Dump(ByVal x As Variant) As String
+    If IsObject(x) Then
+        Dump = ToStr(x)
+        GoTo Escape
+    End If
+
+    Dim ty As String: ty = TypeName(x)
+    Select Case ty
+    Case "Boolean":     Dump = x
+    Case "Integer":     Dump = x & "%"
+    Case "Long":        Dump = x & "&"
+    #If VBA7 And Win64 Then
+    Case "LongLong":    Dump = x & "^"
+    #End If
+    Case "Single":      Dump = x & "!"
+    Case "Double":      Dump = x & "#"
+    Case "Currency":    Dump = x & "@"
+    Case "Byte":        Dump = "CByte(" & x & ")"
+    Case "Decimal":     Dump = "CDec(" & x & ")"
+    Case "Date":
+        Dim d As String, t As String
+        If Abs(x) >= 1 Then d = Month(x) & "/" & Day(x) & "/" & Year(x)
+        If Not IsInt(x) Then t = Format(x, "h:nn:ss AM/PM")
+        Dump = "#" & Trim(d & " " & t) & "#"
+    Case "String"
+        If StrPtr(x) = 0 Then
+            Dump = "(vbNullString)"
+        Else
+            Dump = """" & x & """"
+        End If
+    Case "Empty", "Null", "Nothing"
+        Dump = "(" & ty & ")"
+    Case "Error"
+        If IsMissing(x) Then
+            Dump = "(Missing)"
+        Else
+            Dump = "CVErr(" & ReMatch(CStr(x), "\d+")(0) & ")"
+        End If
+    Case "ErrObject"
+        Dump = "Err " & x.Number
+    Case "Unknown"
+        Dump = ty
+    Case Else
+        If Not IsArray(x) Then
+            Dump = ""
+            GoTo Escape
+        End If
+
+        Dim rnk As Integer: rnk = ArrRank(x)
+        If rnk = 1 Then
+            Dim lb As Long: lb = LBound(x)
+            Dim ub As Long: ub = UBound(x)
+            Dim ar As Variant
+            If ub - lb < 0 Then
+                ar = Array()
+            Else
+                Dim mx As Long: mx = 8 - 1
+                Dim xb As Long: xb = IIf(ub - lb < mx, ub, lb + mx)
+                ReDim ar(lb To xb)
+                Dim i As Long
+                For i = lb To xb: ar(i) = Dump(x(i)): Next
+            End If
+            Dump = "Array(" & Join(ar, ", ") & IIf(xb < ub, ", ...", "") & ")"
+        Else
+            Dump = Replace(ty, "()", "(" & String(rnk - 1, ",") & ")")
+        End If
+    End Select
+
+Escape:
+End Function
+
+' @param x As Variant(Of T)
+' @param y As Variant(Of T)
+' @return As Variant(Of Boolean Or Null Or Empty)
+Public Function Eq(ByVal x As Variant, ByVal y As Variant) As Variant
+    Dim xIsObj As Boolean: xIsObj = IsObject(x)
+    Dim yIsObj As Boolean: yIsObj = IsObject(y)
+    If xIsObj Xor yIsObj Then
+        Eq = Empty
+    ElseIf xIsObj And yIsObj Then
+        Eq = x Is y
+    Else
+        Eq = x = y
+    End If
+End Function
+
+' @param x As Variant(Of T)
+' @param y As Variant(Of T)
+' @return As Variant(Of Boolean Or Null Or Empty)
+Public Function Equals(ByVal x As Variant, ByVal y As Variant) As Variant
+    Dim xIsObj As Boolean: xIsObj = IsObject(x)
+    Dim yIsObj As Boolean: yIsObj = IsObject(y)
+    If xIsObj Xor yIsObj Then
+        Equals = Empty
+    ElseIf xIsObj And yIsObj Then
+        Equals = x.Equals(y)
+    Else
+        If TypeName(x) = TypeName(y) Then
+            Equals = x = y
+        ElseIf IsNull(x) Or IsNull(y) Then
+            Equals = Null
+        Else
+            Equals = Empty
+        End If
+    End If
+End Function
+
+' @param x As Variant(Of T)
+' @param y As Variant(Of T)
+' @return As Variant(Of Integer Or Null)
+Public Function Compare(ByVal x As Variant, ByVal y As Variant) As Variant
+    Dim xIsObj As Boolean: xIsObj = IsObject(x)
+    Dim yIsObj As Boolean: yIsObj = IsObject(y)
+    If xIsObj Xor yIsObj Then
+        Err.Raise 13
+    ElseIf xIsObj And yIsObj Then
+        Compare = x.Compare(y)
+    Else
+        If TypeName(x) = TypeName(y) Then
+            If x = y Then Compare = 0 Else _
+            If x < y Then Compare = -1 Else _
+            If x > y Then Compare = 1 Else _
+            Compare = Null
+        ElseIf IsNull(x) Or IsNull(y) Then
+            Compare = Null
+        Else
+            Err.Raise 13
+        End If
+    End If
+End Function
+
+Private Sub MinOrMax(ByVal arr As Variant, ByVal comp As Integer, ByRef ret As Variant)
+    ret = Empty
+    Dim ub As Variant: ub = UBound(arr)
+    If ub < 0 Then GoTo Escape
+
+    Dim i As Long
+    If IsObject(arr(0)) Then
+        Set ret = arr(0)
+        For i = 1 To ub
+            If Compare(arr(i), ret) = comp Then Set ret = arr(i)
+        Next
+    Else
+        Let ret = arr(0)
+        For i = 1 To ub
+            If Compare(arr(i), ret) = comp Then Let ret = arr(i)
+        Next
+    End If
+
+Escape:
+End Sub
+
+' @param arr() As Variant(Of T)
+' @return As Variant(Of T)
+Public Function Min(ParamArray arr() As Variant) As Variant
+    MinOrMax arr, -1, Min
+End Function
+
+' @param arr() As Variant(Of T)
+' @return As Variant(Of T)
+Public Function Max(ParamArray arr() As Variant) As Variant
+    MinOrMax arr, 1, Max
+End Function
+
+' @param arr As Variant(Of Array(Of T))
+' @return As Integer
+Public Function ArrRank(ByVal arr As Variant) As Integer
+    If Not IsArray(arr) Then Err.Raise 13
+
+    Dim x As Long
+    Dim i As Integer: i = 0
+    On Error Resume Next
+    While Err.Number = 0: x = UBound(arr, IncrPre(i)): Wend
+    ArrRank = i - 1
+End Function
+
+' @param arr As Variant(Of Array(Of T))
+' @return As Long
+Public Function ArrLen(ByVal arr As Variant, Optional ByVal dimen As Integer = 1) As Long
+    If Not IsArray(arr) Then Err.Raise 13
+    ArrLen = UBound(arr, dimen) - LBound(arr, dimen) + 1
+End Function
+
+' @param arr1 As Variant(Of Array(Of T))
+' @param arr2 As Variant(Of Array(Of T))
+' @return As Variant(Of Boolean Or Null)
+Public Function ArrEquals(ByVal arr1 As Variant, ByVal arr2 As Variant) As Variant
+    If Not (IsArray(arr1) And IsArray(arr2)) Then Err.Raise 13
+
+    Dim alen1 As Long: alen1 = ArrLen(arr1)
+    Dim alen2 As Long: alen2 = ArrLen(arr2)
+    Dim cmpLen As Integer: cmpLen = Compare(alen1, alen2)
+
+    Dim ix0 As Long: ix0 = LBound(arr1)
+    Dim pad As Long: pad = LBound(arr2) - ix0
+    Dim alenMin As Long: alenMin = IIf(cmpLen < 0, alen1, alen2)
+
+    Dim i As Long, ret As Variant
+    For i = ix0 To ix0 + alenMin - 1
+        ret = Equals(arr1(i), arr2(pad + i))
+        If ret Then Else GoTo Ending
+    Next
+
+    ret = Null
+    Select Case cmpLen
+    Case Is > 0
+        For i = ix0 + alenMin To ix0 + alen1 - 1
+            If IsNull(arr1(i)) Then GoTo Ending
+        Next
+    Case Is < 0
+        For i = ix0 + alenMin To ix0 + alen2 - 1
+            If IsNull(arr2(pad + i)) Then GoTo Ending
+        Next
+    End Select
+    ret = Not CBool(cmpLen)
+
+Ending:
+    ArrEquals = ret
+End Function
+
+' @param arr1 As Variant(Of Array(Of T))
+' @param arr2 As Variant(Of Array(Of T))
+' @return As Variant(Of Integer Or Null)
+Public Function ArrCompare(ByVal arr1 As Variant, ByVal arr2 As Variant) As Variant
+    If Not (IsArray(arr1) And IsArray(arr2)) Then Err.Raise 13
+
+    Dim alen1 As Long: alen1 = ArrLen(arr1)
+    Dim alen2 As Long: alen2 = ArrLen(arr2)
+    Dim cmpLen As Integer: cmpLen = Compare(alen1, alen2)
+
+    Dim ix0 As Long: ix0 = LBound(arr1)
+    Dim pad As Long: pad = LBound(arr2) - ix0
+    Dim alenMin As Long: alenMin = IIf(cmpLen < 0, alen1, alen2)
+
+    Dim i As Long, ret As Variant
+    For i = ix0 To ix0 + alenMin - 1
+        ret = Compare(arr1(i), arr2(pad + i))
+        If ret = 0 Then Else GoTo Ending
+    Next
+
+    ret = Null
+    Select Case cmpLen
+    Case Is > 0
+        For i = ix0 + alenMin To ix0 + alen1 - 1
+            If IsNull(arr1(i)) Then GoTo Ending
+        Next
+    Case Is < 0
+        For i = ix0 + alenMin To ix0 + alen2 - 1
+            If IsNull(arr2(pad + i)) Then GoTo Ending
+        Next
+    End Select
+    ret = cmpLen
+
+Ending:
+    ArrCompare = ret
+End Function
+
+' @param arr As Variant(Of Array(Of T))
+' @param val As Variant(Of T)
+' @param ixStart As Variant(Of Long)
+' @param cnt As Variant(Of Long)
+' @return As Long
+Public Function ArrIndexOf( _
+    ByVal arr As Variant, ByVal val As Variant, _
+    Optional ByVal ixStart As Variant, Optional ByVal cnt As Variant _
+    ) As Long
+
+    If Not IsArray(arr) Then Err.Raise 13
+
+    Dim ix0 As Long:  ix0 = LBound(arr)
+    Dim alen As Long: alen = ArrLen(arr)
+    If IsMissing(ixStart) Then ixStart = ix0
+    If IsNumeric(ixStart) Then ixStart = CLng(ixStart) Else Err.Raise 13
+    If ixStart < ix0 Then Err.Raise 5
+    If IsMissing(cnt) Then cnt = alen
+    If IsNumeric(cnt) Then cnt = CLng(cnt) Else Err.Raise 13
+    cnt = Min(cnt, alen)
+
+    ArrIndexOf = ixStart - 1
+
+    Dim i As Long
+    For i = ixStart To ixStart + cnt - 1
+        If Equals(arr(i), val) Then
+            ArrIndexOf = i
+            GoTo Escape
+        End If
+    Next
+
+Escape:
+End Function
+
+' @param arr As Variant(Of Array(Of T))
+Public Sub ArrRev(ByRef arr As Variant)
+    Dim ixL As Long: ixL = LBound(arr)
+    Dim ixU As Long: ixU = UBound(arr)
+
+    Dim x As Variant
+    If IsObject(arr(ixL)) Then
+        While ixL < ixU
+            Set x = arr(ixL): Set arr(ixL) = arr(ixU): Set arr(ixU) = x
+            ixL = ixL + 1: ixU = ixU - 1
+        Wend
+    Else
+        While ixL < ixU
+            Let x = arr(ixL): Let arr(ixL) = arr(ixU): Let arr(ixU) = x
+            ixL = ixL + 1: ixU = ixU - 1
+        Wend
+    End If
+
+Escape:
+End Sub
+
+' @param arr As Variant(Of Array(Of T))
+' @param orderAsc As Boolean
+Public Sub ArrSort(ByRef arr As Variant, Optional ByVal orderAsc As Boolean = True)
+    If Not IsArray(arr) Then Err.Raise 13
+    If ArrLen(arr) <= 1 Then GoTo Escape
+
+    Dim ix0 As Long: ix0 = LBound(arr)
+    If IsObject(arr(ix0)) Then
+        ObjArrMSort arr, ix0, orderAsc
+    Else
+        ValArrMSort arr, ix0, orderAsc
+    End If
+
+Escape:
+End Sub
+Private Sub ObjArrMSort(arr As Variant, lb As Long, orderAsc As Boolean)
+    Dim alen As Long: alen = ArrLen(arr)
+    If alen <= 1 Then GoTo Escape
+
+    '' optimization
+    If alen <= 8 Then
+        ObjArrISort arr, lb, orderAsc
+        GoTo Escape
+    End If
+
+    Dim i As Long
+    Dim l1 As Long: l1 = Fix(alen / 2)
+    Dim l2 As Long: l2 = alen - l1
+
+    Dim ub1 As Long:   ub1 = lb + l1 - 1
+    Dim a1 As Variant: ReDim a1(lb To ub1)
+    For i = lb To ub1: Set a1(i) = arr(i): Next
+    ObjArrMSort a1, lb, orderAsc
+
+    Dim ub2 As Long:   ub2 = lb + l2 - 1
+    Dim a2 As Variant: ReDim a2(lb To ub2)
+    For i = lb To ub2: Set a2(i) = arr(l1 + i): Next
+    ObjArrMSort a2, lb, orderAsc
+
+    Dim i1 As Long: i1 = lb
+    Dim i2 As Long: i2 = lb
+    While i1 <= ub1 Or i2 <= ub2
+        If ArrMergeSw(a1, i1, ub1, a2, i2, ub2, orderAsc) Then
+            Set arr(i1 + i2 - lb) = a1(IncrPst(i1))
+        Else
+            Set arr(i1 + i2 - lb) = a2(IncrPst(i2))
+        End If
+    Wend
+
+Escape:
+End Sub
+Private Sub ValArrMSort(arr As Variant, lb As Long, orderAsc As Boolean)
+    Dim alen As Long: alen = ArrLen(arr)
+    If alen <= 1 Then GoTo Escape
+
+    '' optimization
+    If alen <= 8 Then
+        ValArrISort arr, lb, orderAsc
+        GoTo Escape
+    End If
+
+    Dim i As Long
+    Dim l1 As Long: l1 = Fix(alen / 2)
+    Dim l2 As Long: l2 = alen - l1
+
+    Dim ub1 As Long:   ub1 = lb + l1 - 1
+    Dim a1 As Variant: ReDim a1(lb To ub1)
+    For i = lb To ub1: Let a1(i) = arr(i): Next
+    ValArrMSort a1, lb, orderAsc
+
+    Dim ub2 As Long:   ub2 = lb + l2 - 1
+    Dim a2 As Variant: ReDim a2(lb To ub2)
+    For i = lb To ub2: Let a2(i) = arr(l1 + i): Next
+    ValArrMSort a2, lb, orderAsc
+
+    Dim i1 As Long: i1 = lb
+    Dim i2 As Long: i2 = lb
+    While i1 <= ub1 Or i2 <= ub2
+        If ArrMergeSw(a1, i1, ub1, a2, i2, ub2, orderAsc) Then
+            Let arr(i1 + i2 - lb) = a1(IncrPst(i1))
+        Else
+            Let arr(i1 + i2 - lb) = a2(IncrPst(i2))
+        End If
+    Wend
+
+Escape:
+End Sub
+Private Sub ObjArrISort(arr As Variant, lb As Long, orderAsc As Boolean)
+    Dim i As Long, j As Long, x As Variant
+    For i = lb + 1 To UBound(arr)
+        j = i
+        Do While j > lb
+            If Compare(arr(j - 1), arr(j)) * (Abs(orderAsc) * 2 - 1) <= 0 Then Exit Do
+            Set x = arr(j): Set arr(j) = arr(j - 1): Set arr(j - 1) = x
+            j = j - 1
+        Loop
+    Next
+End Sub
+Private Sub ValArrISort(arr As Variant, lb As Long, orderAsc As Boolean)
+    Dim i As Long, j As Long, x As Variant
+    For i = lb + 1 To UBound(arr)
+        j = i
+        Do While j > lb
+            If Compare(arr(j - 1), arr(j)) * (Abs(orderAsc) * 2 - 1) <= 0 Then Exit Do
+            Let x = arr(j): Let arr(j) = arr(j - 1): Let arr(j - 1) = x
+            j = j - 1
+        Loop
+    Next
+End Sub
+Private Function ArrMergeSw( _
+    arr1 As Variant, i1 As Long, ub1 As Long, _
+    arr2 As Variant, i2 As Long, ub2 As Long, _
+    orderAsc As Boolean _
+    ) As Boolean
+
+    If i1 > ub1 Then ArrMergeSw = False Else _
+    If i2 > ub2 Then ArrMergeSw = True Else _
+    ArrMergeSw = Compare(arr1(i1), arr2(i2)) * (Abs(orderAsc) * 2 - 1) < 1
+End Function
+
+' @param arr As Variant(Of Array(Of T))
+' @return As Variant(Of Array(Of T))
+Public Function ArrUniq(ByVal arr As Variant) As Variant
+    If Not IsArray(arr) Then Err.Raise 13
+    Dim ret As Variant: ret = Array()
+    Dim lbA As Long: lbA = LBound(arr)
+    Dim ubA As Long: ubA = UBound(arr)
+    If ubA - lbA < 0 Then GoTo Ending
+
+    ReDim ret(lbA To ubA)
+
+    Dim ixA As Long, ixR As Long: ixR = lbA
+    If IsObject(arr(lbA)) Then
+        For ixA = lbA To ubA
+            If ArrIndexOf(ret, arr(ixA), lbA, ixR - lbA) < lbA Then
+                Set ret(IncrPst(ixR)) = arr(ixA)
+            End If
+        Next
+    Else
+        For ixA = lbA To ubA
+            If ArrIndexOf(ret, arr(ixA), lbA, ixR - lbA) < lbA Then
+                Let ret(IncrPst(ixR)) = arr(ixA)
+            End If
+        Next
+    End If
+
+    ReDim Preserve ret(lbA To ixR - 1)
+
+Ending:
+    ArrUniq = ret
+End Function
+
+' @param arr1 As Variant(Of Array(Of T))
+' @param arr2 As Variant(Of Array(Of T))
+' @return As Variant(Of Array(Of T))
+Public Function ArrConcat(ByVal arr1 As Variant, ByVal arr2 As Variant) As Variant
+    If Not (IsArray(arr1) And IsArray(arr2)) Then Err.Raise 13
+
+    Dim lb2 As Long: lb2 = LBound(arr2)
+    Dim ub2 As Long: ub2 = UBound(arr2)
+    Dim alen2 As Long: alen2 = ub2 - lb2 + 1
+    If alen2 < 1 Then GoTo Ending
+
+    Dim isObj2 As Boolean: isObj2 = IsObject(arr2(lb2))
+
+    Dim lb1 As Long: lb1 = LBound(arr1)
+    Dim ub1 As Long: ub1 = UBound(arr1)
+    Dim alen1 As Long: alen1 = ub1 - lb1 + 1
+    If alen1 > 0 Then If IsObject(arr1(lb1)) <> isObj2 Then Err.Raise 13
+
+    Dim ret As Variant: ReDim ret(alen1 + alen2 - 1)
+
+    Dim i As Integer
+    If isObj2 Then
+        For i = 0 To alen1 - 1: Set ret(i) = arr1(lb1 + i): Next
+        For i = 0 To alen2 - 1: Set ret(alen1 + i) = arr2(lb2 + i): Next
+    Else
+        For i = 0 To alen1 - 1: Let ret(i) = arr1(lb1 + i): Next
+        For i = 0 To alen2 - 1: Let ret(alen1 + i) = arr2(lb2 + i): Next
+    End If
+
+Ending:
+    ArrConcat = ret
+End Function
+
+' @param arr As Variant(Of Array(Of T))
+' @param ixStart As Variant(Of Long)
+' @param ixEnd As Variant(Of Long)
+' @return As Variant(Of Array(Of T))
+Public Function ArrSlice( _
+    ByVal arr As Variant, _
+    Optional ByVal ixStart As Variant, Optional ByVal ixEnd As Variant _
+    ) As Variant
+
+    If Not IsArray(arr) Then Err.Raise 13
+
+    Dim lbA As Long: lbA = LBound(arr)
+    Dim ubA As Long: ubA = UBound(arr)
+    If IsMissing(ixStart) Then ixStart = lbA
+    If IsNumeric(ixStart) Then ixStart = CLng(ixStart) Else Err.Raise 13
+    If IsMissing(ixEnd) Then ixEnd = ubA
+    If IsNumeric(ixEnd) Then ixEnd = CLng(ixEnd) Else Err.Raise 13
+
+    If Not (lbA <= ixStart And ixEnd <= ubA) Then Err.Raise 5
+
+    Dim ret As Variant: ret = Array()
+    Dim ubR As Long: ubR = ixEnd - ixStart
+    If ubR < 1 Then GoTo Ending
+
+    ReDim ret(ubR)
+    Dim isObj As Boolean: isObj = IsObject(arr(ixStart))
+
+    Dim i As Long
+    If isObj Then
+        For i = 0 To ubR: Set ret(i) = arr(ixStart + i): Next
+    Else
+        For i = 0 To ubR: Let ret(i) = arr(ixStart + i): Next
+    End If
+
+Ending:
+    ArrSlice = ret
+End Function
+
+' @param jagArray As Variant(Of Array(Of Array(Of T)))
+' @return As Variant(Of Array(Of T))
+Public Function ArrFlatten(ByVal jagArr As Variant) As Variant
+    If Not IsArray(jagArr) Then Err.Raise 13
+    Dim ret As Variant: ret = Array()
+    If ArrLen(jagArr) < 1 Then GoTo Ending
+
+    Dim arr As Variant
+    For Each arr In jagArr: ret = ArrConcat(ret, arr): Next
+
+Ending:
+    ArrFlatten = ret
+End Function
+
+' @param clct As Collection(Of T)
+' @param val As Variant(Of T)
+Public Sub Push(ByVal clct As Collection, ByVal val As Variant)
+    clct.Add val
+End Sub
+
+' @param clct As Collection(Of T)
+' @return As Variant(Of T)
+Public Function Pop(ByVal clct As Collection) As Variant
+    Dim i As Long: i = clct.Count
+    If IsObject(clct.Item(i)) Then Set Pop = clct.Item(i) Else Let Pop = clct.Item(i)
+    clct.Remove i
+End Function
+
+' @param clct As Collection(Of T)
+' @param val As Variant(Of T)
+Public Sub Shift(ByVal clct As Collection, ByVal val As Variant)
+    If clct.Count < 1 Then
+        clct.Add val
+    Else
+        clct.Add val, , 1
+    End If
+End Sub
+
+' @param clct As Collection(Of T)
+' @return As Variant(Of T)
+Public Function Unshift(ByVal clct As Collection) As Variant
+    Dim i As Long: i = 1
+    If IsObject(clct.Item(i)) Then Set Unshift = clct.Item(i) Else Let Unshift = clct.Item(i)
+    clct.Remove i
+End Function
+
+' @param arr As Variant(Of Array(Of T))
+' @return As Collection(Of T)
+Public Function ArrToClct(ByVal arr As Variant) As Collection
+    If Not IsArray(arr) Then Err.Raise 13
+    Set ArrToClct = New Collection
+    Dim v As Variant
+    For Each v In arr: ArrToClct.Add v: Next
+End Function
+
+' @param clct As Collection(Of T)
+' @return As Variant(Of Array(Of T))
+Public Function ClctToArr(ByVal clct As Collection) As Variant
+    Dim arr As Variant: arr = Array()
+    Dim clen As Long: clen = clct.Count
+    If clen < 1 Then GoTo Ending
+
+    ReDim arr(clen - 1)
+    Dim i As Long: i = 0
+    Dim v As Variant
+    If IsObject(clct.Item(1)) Then
+        For Each v In clct: Set arr(IncrPst(i)) = v: Next
+    Else
+        For Each v In clct: Let arr(IncrPst(i)) = v: Next
+    End If
+
+Ending:
+    ClctToArr = arr
+End Function
+
+' @param jagArr As Variant(Of Array(Of Array(Of T))
+' @return As Variant(Of Array(Of T, T))
+Public Function JagArrToArr2D(ByVal jagArr As Variant) As Variant
+    Dim arr2D As Variant: arr2D = Array()
+
+    Dim ixOut As Long, ixInn As Long
+    Dim lbOut As Long, lbInn As Long, lbInnFst As Long
+    Dim ubOut As Long, ubInn As Long, ubInnFst As Long
+
+    If Not IsArray(jagArr) Then Err.Raise 13
+    lbOut = LBound(jagArr)
+    ubOut = UBound(jagArr)
+    If ubOut - lbOut < 0 Then GoTo Ending
+
+    If Not IsArray(jagArr(lbOut)) Then Err.Raise 13
+
+    lbInnFst = LBound(jagArr(lbOut))
+    ubInnFst = UBound(jagArr(lbOut))
+    If ubInnFst - lbInnFst < 0 Then
+        For ixOut = lbOut + 1 To ubOut
+            If ArrLen(jagArr(ixOut)) > 0 Then Err.Raise 5
+        Next
+        GoTo Ending
+    End If
+
+    ReDim arr2D(lbOut To ubOut, lbInnFst To ubInnFst)
+    If IsObject(jagArr(lbOut)(lbInnFst)) Then
+        For ixOut = lbOut To ubOut
+            lbInn = LBound(jagArr(ixOut))
+            ubInn = UBound(jagArr(ixOut))
+            If lbInn <> lbInnFst Or ubInn <> ubInnFst Then Err.Raise 5
+            For ixInn = lbInn To ubInn: Set arr2D(ixOut, ixInn) = jagArr(ixOut)(ixInn): Next
+        Next
+    Else
+        For ixOut = lbOut To ubOut
+            lbInn = LBound(jagArr(ixOut))
+            ubInn = UBound(jagArr(ixOut))
+            If lbInn <> lbInnFst Or ubInn <> ubInnFst Then Err.Raise 5
+            For ixInn = lbInn To ubInn: Let arr2D(ixOut, ixInn) = jagArr(ixOut)(ixInn): Next
+        Next
+    End If
+
+Ending:
+    JagArrToArr2D = arr2D
+End Function
+
+' @param arr2D As Variant(Of Array(Of T, T))
+' @return As Variant(Of Array(Of Array(Of T))
+Public Function Arr2DToJagArr(ByVal arr2D As Variant) As Variant
+    Dim jagArr As Variant: jagArr = Array()
+
+    Dim lb1 As Long, ub1 As Long: lb1 = LBound(arr2D, 1): ub1 = UBound(arr2D, 1)
+    If ub1 - lb1 < 0 Then GoTo Ending
+    ReDim jagArr(lb1 To ub1)
+
+    Dim lb2 As Long, ub2 As Long: lb2 = LBound(arr2D, 2): ub2 = UBound(arr2D, 2)
+    Dim ix1 As Long, ix2 As Long
+    Dim arr As Variant: ReDim arr(lb2 To ub2)
+
+    If IsObject(arr2D(lb1, lb2)) Then
+        For ix1 = lb1 To ub1
+            jagArr(ix1) = arr
+            For ix2 = lb2 To ub2: Set jagArr(ix1)(ix2) = arr2D(ix1, ix2): Next
+        Next
+    Else
+        For ix1 = lb1 To ub1
+            jagArr(ix1) = arr
+            For ix2 = lb2 To ub2: Let jagArr(ix1)(ix2) = arr2D(ix1, ix2): Next
+        Next
+    End If
+
+Ending:
+    Arr2DToJagArr = jagArr
+End Function
+
+' @param arr() As Variant
+' @return As Object Is Scripting.Dictionary
+Public Function CreateDictionary(ParamArray arr() As Variant) As Object
+    Dim alen As Long: alen = UBound(arr)
+    If Abs(alen Mod 2) = 0 Then Err.Raise 5
+
+    Set CreateDictionary = CreateObject("Scripting.Dictionary")
+    Dim i As Long
+    For i = 0 To alen Step 2: CreateDictionary.Add arr(i), arr(i + 1): Next
+End Function
+
+' @return As Object Is WScript.Shell
+Public Property Get Wsh() As Object
+    If xxWsh Is Nothing Then Set xxWsh = CreateObject("WScript.Shell")
+    Set Wsh = xxWsh
+End Property
+
+' @return As Object Is WbemScripting.SWbemLocator
+Public Property Get Wmi() As Object
+    If xxWmi Is Nothing Then Set xxWmi = CreateObject("WbemScripting.SWbemLocator")
+    Set Wmi = xxWmi
+End Property
+
+' @param ptrnFind As String
+' @param regexpOption As String
+' @return As Object Is VBScript.RegExp
+Public Function CreateRegExp( _
+    ByVal ptrnFind As String, Optional ByVal regexpOption As String = "" _
+    ) As Object
+
+    Dim cnt As Long: cnt = 0
+    Set CreateRegExp = CreateObject("VBScript.RegExp")
+    CreateRegExp.Pattern = ptrnFind
+    CreateRegExp.Global = WithIncrIf(InStr(regexpOption, "g") > 0, True, cnt)
+    CreateRegExp.IgnoreCase = WithIncrIf(InStr(regexpOption, "i") > 0, True, cnt)
+    If cnt <> Len(regexpOption) Then Err.Raise 5
+End Function
+Private Function WithIncrIf( _
+    ByVal expr As Variant, ByVal incif As Variant, ByRef cntr As Long _
+    ) As Variant
+
+    If Equals(expr, incif) Then cntr = cntr + 1
+    WithIncrIf = expr
+End Function
+
+' @param expr As String
+' @param ptrnFind As String
+' @param iCase As Boolean
+' @return As Variant(Of Array(Of String))
+Public Function ReMatch( _
+    ByVal expr As String, ByVal ptrnFind As String, _
+    Optional ByVal iCase As Boolean = False _
+    ) As Variant
+
+    Dim ret As Variant: ret = Array()
+
+    Dim regex As Object:  Set regex = CreateRegExp(ptrnFind, IIf(iCase, "i", ""))
+    Dim ms As Object:     Set ms = regex.Execute(expr)
+    If ms.Count < 1 Then: GoTo Ending
+
+    Dim sms As Object:    Set sms = ms(0).SubMatches
+    ReDim ret(sms.Count)
+
+    ret(0) = ms.Item(0).Value
+    Dim i As Integer
+    For i = 1 To UBound(ret): ret(i) = sms.Item(i - 1): Next
+
+Ending:
+    ReMatch = ret
+End Function
+
+' @param expr As String
+' @param ptrnFind As String
+' @param iCase As Boolean
+' @return As Variant(Of Array(Of Array(Of String)))
+Public Function ReMatcheGlobal( _
+    ByVal expr As String, ByVal ptrnFind As String, _
+    Optional ByVal iCase As Boolean = False _
+    ) As Variant
+
+    Dim ret As Variant: ret = Array()
+
+    Dim regex As Object: Set regex = CreateRegExp(ptrnFind, IIf(iCase, "i", "") & "g")
+    Dim ms As Object:    Set ms = regex.Execute(expr)
+    If ms.Count < 1 Then GoTo Ending
+
+    ReDim ret(ms.Count - 1)
+
+    Dim arr As Variant: ReDim arr(ms(0).SubMatches.Count)
+
+    Dim i As Integer, j As Integer
+    For i = 0 To UBound(ret)
+        ret(i) = arr
+
+        ret(i)(0) = ms.Item(i).Value
+        For j = 1 To UBound(arr): ret(i)(j) = ms(i).SubMatches.Item(j - 1): Next
+    Next
+
+Ending:
+    ReMatcheGlobal = ret
+End Function
+
+' @param expr As String
+' @param ptrnFind As String
+' @param ptrnReplace As String
+' @param regexpOption As String
+' @return As Variant(Of Array(Of String))
+Public Function ReReplace( _
+    ByVal expr As String, ByVal ptrnFind As String, ByVal ptrnReplace As String, _
+    Optional ByVal regexpOption As String = "" _
+    ) As String
+
+    Dim regex As Object: Set regex = CreateRegExp(ptrnFind, regexpOption)
+    ReReplace = regex.Replace(expr, ptrnReplace)
+End Function
+
+' @param expr As String
+' @param ptrnFind As String
+' @param iCase As Boolean
+' @return As String
+Public Function ReTrim( _
+    ByVal expr As String, ByVal ptrnFind As String, _
+    Optional ByVal iCase As Boolean = False _
+    ) As String
+
+    ptrnFind = "^(?:" & ptrnFind & ")+|(?:" & ptrnFind & ")+$"
+
+    Dim regex As Object: Set regex = CreateRegExp(ptrnFind, IIf(iCase, "i", "") & "g")
+    ReTrim = regex.Replace(expr, "")
+End Function
+
+Private Function EvalScript(ByVal expr As String, ByVal lang As String) As String
+    Dim doc As Object: Set doc = CreateObject("HtmlFile")
+    doc.parentWindow.execScript "document.write(" & expr & ")", lang
+    If Not doc.body Is Nothing Then EvalScript = doc.body.innerHTML
+End Function
+
+' @param vbsExpr As String
+' @return As Variant
+Public Function EvalVBS(ByVal vbsExpr As String) As String
+    EvalVBS = EvalScript(vbsExpr, "VBScript")
+End Function
+
+' @param jsExpr As String
+' @return As Variant
+Public Function EvalJS(ByVal jsExpr As String) As String
+    EvalJS = EvalScript(jsExpr, "JScript")
+End Function
+
+' @return As Object Is StdRegProv
+Public Function CreateStdRegProv() As Object
+    Dim wmiSrv As Object: Set wmiSrv = Wmi.ConnectServer(, "root\default")
+    Set CreateStdRegProv = wmiSrv.Get("StdRegProv")
+End Function
+
+Attribute VB_Name = "Ext"
+'+----                                                                   --+
+'|                             Ariawase 0.6.0                              |
+'|                Ariawase is free library for VBA cowboys.                |
+'|          The Project Page: https://github.com/vbaidiot/Ariawase         |
+'+--                                                                   ----+
+Option Explicit
+Option Private Module
+
+Public Function CreateAssocArray(ParamArray arr() As Variant) As Variant
+    Dim alen As Long: alen = UBound(arr)
+    If Abs(alen Mod 2) = 0 Then Err.Raise 5
+
+    Dim aarr As Variant: aarr = Array()
+    If alen < 0 Then GoTo Ending
+
+    ReDim aarr(Fix(UBound(arr) / 2))
+    Dim i As Long
+    For i = 0 To UBound(aarr): Set aarr(i) = Init(New Tuple, arr(2 * i), arr(2 * i + 1)): Next
+
+Ending:
+    CreateAssocArray = aarr
+End Function
+
+Public Function AssocArrToDict(ByVal aarr As Variant) As Object
+    If Not IsArray(aarr) Then Err.Raise 13
+    Set AssocArrToDict = CreateDictionary()
+    Dim v As Variant '(Of Tuple`2)
+    For Each v In aarr: AssocArrToDict.Add v.Item1, v.Item2: Next
+End Function
+
+Public Function DictToAssocArr(ByVal dict As Object) As Variant
+    If TypeName(dict) <> "Dictionary" Then Err.Raise 13
+    Dim arr As Variant: arr = Array()
+
+    Dim ks As Variant: ks = dict.Keys
+    Dim dlen As Long: dlen = UBound(ks)
+    If dlen < 0 Then GoTo Ending
+
+    ReDim arr(UBound(ks))
+    Dim i As Long
+    For i = 0 To dlen: Set arr(i) = Init(New Tuple, ks(i), dict.Item(ks(i))): Next
+
+Ending:
+    DictToAssocArr = arr
+End Function
+
+' @param enumr As Enumerator(Of T)
+' @return As Variant(Of Array(Of T))
+Public Function EnumeratorToArr(ByVal enumr As Object) As Variant
+    Dim arrx As ArrayEx: Set arrx = New ArrayEx
+
+    Dim x As Object
+    For Each x In enumr: Exit For: Next
+    If IsObject(x) Then
+        For Each x In enumr: arrx.AddObj x: Next
+    Else
+        For Each x In enumr: arrx.AddVal x: Next
+    End If
+
+    EnumeratorToArr = arrx.ToArray()
+End Function
+
+' @param fromVal As Variant(Of T)
+' @param toVal As Variant(Of T)
+' @param stepVal As Variant(Of T)
+' @return As Variant(Of Array(Of T))
+Public Function ArrRange( _
+    ByVal fromVal As Variant, ByVal toVal As Variant, Optional ByVal stepVal As Variant = 1 _
+    ) As Variant
+
+    If Not (IsNumeric(fromVal) And IsNumeric(toVal) And IsNumeric(stepVal)) Then Err.Raise 13
+
+    Dim arrx As ArrayEx: Set arrx = New ArrayEx
+
+    Select Case stepVal
+    Case Is > 0
+        While fromVal <= toVal
+            arrx.AddVal IncrPst(fromVal, stepVal)
+        Wend
+    Case Is < 0
+        While fromVal >= toVal
+            arrx.AddVal IncrPst(fromVal, stepVal)
+        Wend
+    Case Else
+        Err.Raise 5
+    End Select
+
+    ArrRange = arrx.ToArray()
+End Function
+
+' @param fun As Func(Of T, U)
+' @param arr As Variant(Of Array(Of T))
+' @return As Variant(Of Array(Of U))
+Public Function ArrMap(ByVal fun As Func, ByVal arr As Variant) As Variant
+    If Not IsArray(arr) Then Err.Raise 13
+    Dim lb As Long: lb = LBound(arr)
+    Dim ub As Long: ub = UBound(arr)
+    Dim ret As Variant
+    If ub - lb < 0 Then
+        ret = Array()
+        GoTo Ending
+    End If
+
+    ReDim ret(lb To ub)
+
+    Dim i As Long
+    For i = lb To ub: fun.FastApply ret(i), arr(i): Next
+
+Ending:
+    ArrMap = ret
+End Function
+
+' @param fun As Func(Of T, U, R)
+' @param arr1 As Variant(Of Array(Of T))
+' @param arr2 As Variant(Of Array(Of U))
+' @return As Variant(Of Array(Of R))
+Public Function ArrZip( _
+    ByVal fun As Func, ByVal arr1 As Variant, ByVal arr2 As Variant _
+    ) As Variant
+
+    If Not (IsArray(arr1) And IsArray(arr2)) Then Err.Raise 13
+    Dim lb1 As Long: lb1 = LBound(arr1)
+    Dim lb2 As Long: lb2 = LBound(arr2)
+    Dim ub0 As Long: ub0 = UBound(arr1) - lb1
+    If ub0 <> UBound(arr2) - lb2 Then Err.Raise 5
+    Dim ret As Variant
+    If ub0 < 0 Then
+        ret = Array()
+        GoTo Ending
+    End If
+
+    ReDim ret(ub0)
+
+    Dim i As Long
+    For i = 0 To ub0: fun.FastApply ret(i), arr1(lb1 + i), arr2(lb2 + i): Next
+
+Ending:
+    ArrZip = ret
+End Function
+
+' @param fun As Func(Of T, Boolean)
+' @param arr As Variant(Of Array(Of T))
+' @return As Variant(Of Array(Of T))
+Public Function ArrFilter(ByVal fun As Func, ByVal arr As Variant) As Variant
+    If Not IsArray(arr) Then Err.Raise 13
+    Dim lb As Long: lb = LBound(arr)
+    Dim ub As Long: ub = UBound(arr)
+    Dim ret As Variant
+    If ub - lb < 0 Then
+        ret = Array()
+        GoTo Ending
+    End If
+
+    ReDim ret(lb To ub)
+
+    Dim flg As Boolean
+    Dim ixArr As Long
+    Dim ixRet As Long: ixRet = lb
+    If IsObject(arr(lb)) Then
+        For ixArr = lb To ub
+            fun.FastApply flg, arr(ixArr)
+            If flg Then Set ret(IncrPst(ixRet)) = arr(ixArr)
+        Next
+    Else
+        For ixArr = lb To ub
+            fun.FastApply flg, arr(ixArr)
+            If flg Then Let ret(IncrPst(ixRet)) = arr(ixArr)
+        Next
+    End If
+
+    If ixRet > 0 Then
+        ReDim Preserve ret(lb To ixRet - 1)
+    Else
+        ret = Array()
+    End If
+
+Ending:
+    ArrFilter = ret
+End Function
+
+' @param fun As Func(Of T, K)
+' @param arr As Variant(Of Array(Of T))
+' @return As Variant(Of Array(Of Tuple`2(Of K, T)))
+Public Function ArrGroupBy(ByVal fun As Func, ByVal arr As Variant) As Variant
+    If Not IsArray(arr) Then Err.Raise 13
+    Dim lb As Long: lb = LBound(arr)
+    Dim ub As Long: ub = UBound(arr)
+    Dim ixRet As Long: ixRet = -1
+    Dim ret As Variant
+    If ub - lb < 0 Then
+        ret = Array()
+        GoTo Ending
+    End If
+
+    ReDim ret(ub - lb)
+
+    Dim k As Variant, i As Long, j As Long
+    If IsObject(arr(lb)) Then
+        For i = lb To ub
+            fun.FastApply k, arr(i)
+            For j = ixRet To 0 Step -1
+                If Equals(k, ret(j)(0)) Then Exit For
+            Next
+            If j < 0 Then
+                j = IncrPre(ixRet)
+                ret(j) = Array(k, New ArrayEx)
+            End If
+            ret(j)(1).AddObj arr(i)
+        Next
+    Else
+        For i = lb To ub
+            fun.FastApply k, arr(i)
+            For j = ixRet To 0 Step -1
+                If Equals(k, ret(j)(0)) Then Exit For
+            Next
+            If j < 0 Then
+                j = IncrPre(ixRet)
+                ret(j) = Array(k, New ArrayEx)
+            End If
+            ret(j)(1).AddVal arr(i)
+        Next
+    End If
+
+    ReDim Preserve ret(ixRet)
+
+    For i = 0 To ixRet
+        Set ret(i) = Init(New Tuple, ret(i)(0), ret(i)(1).ToArray())
+    Next
+
+Ending:
+    ArrGroupBy = ret
+End Function
+
+Private Sub ArrFoldPrep( _
+    arr As Variant, seedv As Variant, i As Long, stat As Variant, _
+    Optional isObj As Boolean _
+    )
+
+    If IsObject(seedv) Then
+        Set stat = seedv
+    Else
+        Let stat = seedv
+    End If
+
+    If IsMissing(stat) Then
+        isObj = IsObject(arr(i))
+        If isObj Then
+            Set stat = arr(i)
+        Else
+            Let stat = arr(i)
+        End If
+        i = i + 1
+    End If
+End Sub
+
+' @param fun As Func(Of U, T, U)
+' @param arr As Variant(Of Array(Of T))
+' @param seedv As Variant(Of U)
+' @return As Variant(Of U)
+Public Function ArrFold( _
+    ByVal fun As Func, ByVal arr As Variant, Optional ByVal seedv As Variant _
+    ) As Variant
+
+    If Not IsArray(arr) Then Err.Raise 13
+
+    Dim stat As Variant
+    Dim i As Long: i = LBound(arr)
+    ArrFoldPrep arr, seedv, i, stat
+
+    For i = i To UBound(arr)
+        fun.FastApply stat, stat, arr(i)
+    Next
+
+    If IsObject(stat) Then
+        Set ArrFold = stat
+    Else
+        Let ArrFold = stat
+    End If
+End Function
+
+' @param fun As Func(Of U, T, U)
+' @param arr As Variant(Of Array(Of T))
+' @param seedv As Variant(Of U)
+' @return As Variant(Of Array(Of U))
+Public Function ArrScan( _
+    ByVal fun As Func, ByVal arr As Variant, Optional ByVal seedv As Variant _
+    ) As Variant
+
+    If Not IsArray(arr) Then Err.Raise 13
+
+    Dim isObj As Boolean
+    Dim stat As Variant
+    Dim i As Long: i = LBound(arr)
+    ArrFoldPrep arr, seedv, i, stat, isObj
+
+    Dim stats As ArrayEx: Set stats = New ArrayEx
+    If isObj Then
+        stats.AddObj stat
+        For i = i To UBound(arr)
+            fun.FastApply stat, stat, arr(i)
+            stats.AddObj stat
+        Next
+    Else
+        stats.AddVal stat
+        For i = i To UBound(arr)
+            fun.FastApply stat, stat, arr(i)
+            stats.AddVal stat
+        Next
+    End If
+
+    ArrScan = stats.ToArray
+End Function
+
+' @param fun As Func
+' @param seedv As Variant(Of T)
+' @return As Variant(Of Array(Of U))
+Public Function ArrUnfold(ByVal fun As Func, ByVal seedv As Variant) As Variant
+    Dim arrx As ArrayEx: Set arrx = New ArrayEx
+
+    Dim stat As Variant '(Of Tuple`2 Or Missing)
+    fun.FastApply stat, seedv
+    If IsMissing(stat) Then GoTo Ending
+
+    If IsObject(stat.Item1) Then
+        arrx.AddObj stat.Item1
+
+        fun.FastApply stat, stat.Item2
+        While Not IsMissing(stat)
+            arrx.AddObj stat.Item1
+            fun.FastApply stat, stat.Item2
+        Wend
+    Else
+        arrx.AddVal stat.Item1
+
+        fun.FastApply stat, stat.Item2
+        While Not IsMissing(stat)
+            arrx.AddVal stat.Item1
+            fun.FastApply stat, stat.Item2
+        Wend
+    End If
+
+Ending:
+    ArrUnfold = arrx.ToArray()
+End Function
+
+VERSION 1.0 CLASS
+BEGIN
+  MultiUse = -1  'True
+END
+Attribute VB_Name = "MonkeyTest"
+Attribute VB_GlobalNameSpace = False
+Attribute VB_Creatable = False
+Attribute VB_PredeclaredId = False
+Attribute VB_Exposed = False
+
+Option Explicit
+
+' Assert.RunTestOf New MonkeyTest
+
+Public Sub CorePrim_Test()
+    Dim i As Integer, n As Long, v As Variant
+
+    i = 42
+    Assert.AreEqual 43, IncrPre(i)
+    Assert.AreEqual 43, i
+    Assert.IsInstanceOfTypeName "Integer", i
+    n = 42
+    Assert.AreEqual 43&, IncrPre(n)
+    Assert.AreEqual 43&, n
+    Assert.IsInstanceOfTypeName "Long", n
+    v = CDec(42)
+    Assert.AreEqual CDec(43), IncrPre(v)
+    Assert.AreEqual CDec(43), v
+    Assert.IsInstanceOfTypeName "Decimal", v
+
+    i = 42
+    Assert.AreEqual 42, IncrPst(i)
+    Assert.AreEqual 43, i
+    Assert.IsInstanceOfTypeName "Integer", i
+    n = 42
+    Assert.AreEqual 42&, IncrPst(n)
+    Assert.AreEqual 43&, n
+    Assert.IsInstanceOfTypeName "Long", n
+    v = CDec(42)
+    Assert.AreEqual CDec(42), IncrPst(v)
+    Assert.AreEqual CDec(43), v
+    Assert.IsInstanceOfTypeName "Decimal", v
+
+    Assert.AreEqual 1&, BitFlag(False, True)
+    Assert.AreEqual 8&, BitFlag(True, False, False, False)
+    Assert.AreEqual 8&, BitFlag(1, 0, 0, 0)
+
+    Assert.AreEqual True, IsInt(7#)
+    Assert.AreEqual False, IsInt(7.01)
+    Assert.AreEqual CDec(4), ARound(4.4)
+    Assert.AreEqual CDec(5), ARound(4.5)
+    Assert.AreEqual CDec(2.34), ARound(2.344, 2)
+    Assert.AreEqual CDec(2.35), ARound(2.345, 2)
+    Assert.AreEqual CDec(2), ARound(2.9, 0, 10)
+    Assert.AreEqual CDec(3), ARound(2.1, 0, 1)
+
+    Assert.AreEqual #5/1/2013#, BeginOfMonth(#5/15/2013#)
+    Assert.AreEqual #5/31/2013#, EndOfMonth(#5/15/2013#)
+    Assert.AreEqual #5/12/2013#, BeginOfWeek(#5/15/2013#)
+    Assert.AreEqual #5/18/2013#, EndOfWeek(#5/15/2013#)
+
+    '' the following test are for Japanese.
+    Assert.AreEqual 13&, StringWidth("Test�e�X�gý�")
+    Assert.AreEqual 27&, StringWidth("�S�p2�޲Ċ��Z�ɂ��镶������")
+    Assert.AreEqual "�S�p2byte", LeftA("�S�p2byte�ō����當�������؂��o��", 10)
+    Assert.AreEqual "2byte�Ő؂��o��", RightA("�E���當�������S�p2byte�Ő؂��o��", 16)
+    Assert.AreEqualArr Array("LeftA��", "���̗]�����"), SepA("LeftA�Ƃ��̗]�����", 8)
+
+    Assert.AreEqual _
+        "001 {2013/05/20} Simple is best.", _
+        Formats("{0:000} {{{1:yyyy/mm/dd}}} {2}", 1, #5/20/2013#, "Simple is best.")
+End Sub
+
+Public Sub CoreAbst_Test()
+    Assert.AreEqual Init(New Tuple, "A", 4), Init(New Tuple, "A", 4)
+    Assert.AreEqual "A", Init(New Tuple, "A", 4).Item1
+    Assert.AreEqual 4, Init(New Tuple, "A", 4).Item2
+
+    Assert.AreEqual "Tuple`2 { Item1 = ""A"", Item2 = 4% }", ToStr(Init(New Tuple, "A", 4))
+    Assert.AreEqual "Tuple`4 { Item1 = 1%, Item2 = 2&, Item3 = 3#, Item4 = 4@ }", ToStr(Init(New Tuple, 1, 2&, 3#, 4@))
+
+    Assert.AreEqual "42%", Dump(42)
+    Assert.AreEqual "42&", Dump(42&)
+    Assert.AreEqual "3.14#", Dump(3.14)
+    Assert.AreEqual "#3/22/2014#", Dump(#3/22/2014#)
+    Assert.AreEqual "#1/1/100#", Dump(#1/1/100#)
+    Assert.AreEqual "#7:00:00 PM#", Dump(#7:00:00 PM#)
+    Assert.AreEqual "#12/3/456 7:00:00 AM#", Dump(#12/3/456 7:00:00 AM#)
+    Assert.AreEqual """Foo""", Dump("Foo")
+    Assert.AreEqual """""", Dump("")
+    Assert.AreEqual "(vbNullString)", Dump(vbNullString)
+    Assert.AreEqual "(Empty)", Dump(Empty)
+    Assert.AreEqual "Array(1%, 2%, 3%, 4%, 5%, 6%, 7%, 8%, ...)", Dump(Array(1, 2, 3, 4, 5, 6, 7, 8, 9))
+    Dim arr2D(0, 0) As Integer
+    Assert.AreEqual "Integer(,)", Dump(arr2D)
+    Dim arr3D(0, 0, 0) As Long
+    Assert.AreEqual "Long(,,)", Dump(arr3D)
+
+    Assert.AreEqual True, Eq(42, 42)
+    Assert.AreEqual True, Eq(42, 42&)
+    Assert.AreEqual False, Eq(42, "42")
+    Assert.AreEqual True, Eq(Empty, 0)
+    Assert.AreEqual True, Eq(Empty, Empty)
+    Assert.IsNullVal Eq(Null, Empty)
+    Assert.IsNullVal Eq(Null, Null)
+    Assert.AreEqual True, Eq("", vbNullString)
+    Assert.AreEqual False, Eq(Init(New Tuple, "A", 4), Init(New Tuple, "A", 4))
+    Assert.AreEqual Empty, Eq(Init(New Tuple, "A", 4), "A4")
+
+    Assert.AreEqual True, Equals(42, 42)
+    Assert.AreEqual Empty, Equals(42, 42&)
+    Assert.AreEqual Empty, Equals(42, "42")
+    Assert.AreEqual Empty, Equals(Empty, 0)
+    Assert.AreEqual True, Equals(Empty, Empty)
+    Assert.AreEqual True, Equals("", vbNullString)
+    Assert.IsNullVal Equals(Null, Empty)
+    Assert.IsNullVal Equals(Null, Null)
+    Assert.AreEqual True, Equals(Init(New Tuple, "A", 4), Init(New Tuple, "A", 4))
+    Assert.AreEqual Empty, Equals(Init(New Tuple, "A", 4), "A4")
+
+    Assert.AreEqual -1, Compare(3, 9)
+    Assert.AreEqual 0, Compare(5, 5)
+    Assert.AreEqual 1, Compare(9, 3)
+    Assert.IsNullVal Compare(Null, Empty)
+    Assert.IsNullVal Compare(Null, Null)
+    Assert.IsErrFunc 13, Init(New Func, vbVariant, AddressOf Compare, vbVariant, vbVariant), Array(0, 0&)
+    Assert.AreEqual -1, Compare(Init(New Tuple, 2, ".txt"), Init(New Tuple, 10, ".txt"))
+    Assert.AreEqual 1, Compare(Init(New Tuple, "2", ".txt"), Init(New Tuple, "10", ".txt"))
+
+    Assert.AreEqual 3, Min(3, 6, 5)
+    Assert.IsInstanceOfTypeName "Integer", Min(3, 6, 5)
+    Assert.AreEqual 6, Max(3, 6, 5)
+    Assert.IsInstanceOfTypeName "Integer", Max(3, 6, 5)
+End Sub
+
+Public Sub CoreEnumr_Test()
+    Dim arr2D(0, 0) As Integer
+    Dim arr3D(0, 0, 0) As Long
+    Assert.AreEqual 1, ArrRank(Array())
+    Assert.AreEqual 2, ArrRank(arr2D)
+    Assert.AreEqual 3, ArrRank(arr3D)
+
+    Assert.AreEqual 3&, ArrLen(Array("V", "B", "A"))
+
+    Assert.AreEqual True, ArrEquals(Array(0, 1, 2), Array(0, 1, 2))
+    Assert.AreEqual False, ArrEquals(Array(0, 1, 2), Array(2, 1, 0))
+    Assert.IsNullVal ArrEquals(Array(Null), Array(1, 2, 3))
+    Assert.IsNullVal ArrEquals(Array(1, 2, 3, Null), Array(1, 2, 3))
+
+    Assert.AreEqual 0, ArrCompare(Array(0, 1, 2), Array(0, 1, 2))
+    Assert.AreEqual -1, ArrCompare(Array(0, 1, 2), Array(0, 1, 3))
+    Assert.AreEqual -1, ArrCompare(Array(0, 1, 2), Array(0, 1, 2, 3))
+    Assert.AreEqual 1, ArrCompare(Array(2, 1), Array(0, 1, 2))
+    Assert.IsNullVal ArrCompare(Array(Null), Array(1, 2, 3))
+    Assert.IsNullVal ArrCompare(Array(1, 2, 3, Null), Array(1, 2, 3))
+
+    Assert.AreEqual 2&, ArrIndexOf(Array("V", "B", "A"), "A")
+    Assert.AreEqual -1&, ArrIndexOf(Array("V", "B", "A"), "Z")
+    Assert.AreEqual 1&, ArrIndexOf(Array("I", "I", "f"), "I", 1)
+    Assert.AreEqual -1&, ArrIndexOf(Array("I", "I", "f"), "f", 0, 2)
+    Assert.AreEqual 2&, ArrIndexOf(Array("I", "I", "f"), "f", 1, 9)
+
+    Dim arr As Variant
+
+    arr = Array(1, 2, 3, 4, 5, 6, 7, 8, 9)
+    ArrRev arr
+    Assert.AreEqualArr Array(9, 8, 7, 6, 5, 4, 3, 2, 1), arr
+
+    arr = Array("S", "O", "R", "T")
+    ArrSort arr
+    Assert.AreEqualArr Array("O", "R", "S", "T"), arr
+    arr = Array(2, 4, 3, 5, 6, 7, 0, 1, 9, 8)
+    ArrSort arr, True
+    Assert.AreEqualArr Array(0, 1, 2, 3, 4, 5, 6, 7, 8, 9), arr
+    arr = Array(2, 4, 3, 5, 6, 7, 0, 1, 9, 8)
+    ArrSort arr, False
+    Assert.AreEqualArr Array(9, 8, 7, 6, 5, 4, 3, 2, 1, 0), arr
+
+    Assert.AreEqualArr Array(6, 5, 3), ArrUniq(Array(6, 5, 5, 3, 6))
+
+    Assert.AreEqualArr Array(1, 2, 3, 4, 5), ArrConcat(Array(1, 2, 3), Array(4, 5))
+
+    Assert.AreEqualArr Array(2, 3, 4), ArrSlice(Array(1, 2, 3, 4, 5), 1, 3)
+
+    Assert.AreEqualArr Array(1, 2, 3, 4, 5), ArrFlatten(Array(Array(1, 2), Array(3), Array(4, 5)))
+
+    Assert.AreEqualArr Array(1, 2, 3), ClctToArr(ArrToClct(Array(1, 2, 3)))
+
+    Dim clct As Collection
+
+    Set clct = ArrToClct(Array(0))
+    Push clct, 3
+    Assert.AreEqualArr Array(0, 3), ClctToArr(clct)
+    Push clct, 4
+    Assert.AreEqualArr Array(0, 3, 4), ClctToArr(clct)
+    Assert.AreEqual 4, Pop(clct)
+    Assert.AreEqualArr Array(0, 3), ClctToArr(clct)
+    Shift clct, 2
+    Assert.AreEqualArr Array(2, 0, 3), ClctToArr(clct)
+    Shift clct, 1
+    Assert.AreEqualArr Array(1, 2, 0, 3), ClctToArr(clct)
+    Assert.AreEqual 1, Unshift(clct)
+    Assert.AreEqualArr Array(2, 0, 3), ClctToArr(clct)
+
+    Dim vArr2D As Variant
+    vArr2D = JagArrToArr2D(Array(Array(1, 2, 3), Array(4, 5, 6)))
+    Assert.AreEqual 2&, ArrLen(vArr2D, 1)
+    Assert.AreEqual 3&, ArrLen(vArr2D, 2)
+    Assert.AreEqual 1, vArr2D(0, 0)
+    Assert.AreEqual 2, vArr2D(0, 1)
+    Assert.AreEqual 3, vArr2D(0, 2)
+    Assert.AreEqual 4, vArr2D(1, 0)
+    Assert.AreEqual 5, vArr2D(1, 1)
+    Assert.AreEqual 6, vArr2D(1, 2)
+
+    Dim jagArr As Variant
+    jagArr = Arr2DToJagArr(vArr2D)
+    Assert.AreEqual 2&, ArrLen(jagArr)
+    Assert.AreEqualArr Array(1, 2, 3), jagArr(0)
+    Assert.AreEqualArr Array(4, 5, 6), jagArr(1)
+
+    Dim dict As Object
+    Set dict = CreateDictionary("One", 1, "Two", 2, "Three", 3)
+    Assert.AreEqual 3&, dict.Count
+    Assert.AreEqual 1, dict!One
+    Assert.AreEqual 2, dict!Two
+    Assert.AreEqual 3, dict!Three
+End Sub
+
+Public Sub CoreXLib_Test()
+    Assert.AreEqual "C:\WINDOWS", UCase(Wsh.ExpandEnvironmentStrings("%windir%"))
+    Assert.AreEqual 0&, Wmi.Security_.Privileges.Count
+
+    Dim regex As Object
+    Set regex = CreateRegExp(".*", "ig")
+    Assert.AreEqual ".*", regex.Pattern
+    Assert.AreEqual True, regex.Global
+    Assert.AreEqual True, regex.IgnoreCase
+
+    Assert.AreEqual "#VBA", ReMatch("beyond the limit of #VBA.", "#\w+")(0)
+    Assert.AreEqualArr Array("2013/5/1", "2013", "5", "1"), ReMatch("2013/5/1", "(\d{4})/(\d{1,2})/(\d{1,2})")
+    Assert.AreEqual 3&, ArrLen(ArrFlatten(ReMatcheGlobal("Practice! Practice! Practice!", "\w+!")))
+    Assert.AreEqual _
+        "<li>Word</li><li>Excel</li><li>Access</li>", _
+        ReReplace("<p>Word</p><P>Excel</P><p>Access</p>", "<(/?)p>", "<$1li>", "ig")
+    Assert.AreEqual _
+        "WScript.Echo(""Hello!"")", _
+        ReTrim(vbTab & "WScript.Echo(""Hello!"");" & vbCrLf, "[\s;]")
+
+    Assert.AreEqual "7", EvalVBS("""3"" + 4")
+    Assert.AreEqual "34", EvalJS("""3"" + 4")
+
+    Dim s As String
+    CreateStdRegProv().GetStringValue HKEY_CLASSES_ROOT, ".txt", "Content Type", s
+    Assert.AreEqual "text/plain", s
+End Sub
+
+Public Sub Util_Test()
+    Dim aarr As Variant, dict As Object
+
+    aarr = CreateAssocArray("One", 1, "Two", 2, "Three", 3)
+    Assert.AreEqual 3&, ArrLen(aarr)
+    Assert.AreEqual Init(New Tuple, "One", 1), aarr(0)
+    Assert.AreEqual Init(New Tuple, "Two", 2), aarr(1)
+    Assert.AreEqual Init(New Tuple, "Three", 3), aarr(2)
+
+    Set dict = AssocArrToDict(aarr)
+    Assert.AreEqual 3&, dict.Count
+    Assert.AreEqual 1, dict!One
+    Assert.AreEqual 2, dict!Two
+    Assert.AreEqual 3, dict!Three
+
+    aarr = DictToAssocArr(dict)
+    Assert.AreEqual 3&, ArrLen(aarr)
+    Assert.AreEqual Init(New Tuple, "One", 1), aarr(0)
+    Assert.AreEqual Init(New Tuple, "Two", 2), aarr(1)
+    Assert.AreEqual Init(New Tuple, "Three", 3), aarr(2)
+
+    Assert.IsInstanceOfTypeName _
+        "Decimal", _
+        CDec(EnumeratorToArr(Wmi.ConnectServer().ExecQuery("SELECT * FROM Win32_ComputerSystem"))(0).TotalPhysicalMemory)
+
+    Assert.AreEqualArr Array(1, 2, 3, 4, 5, 6, 7, 8, 9), ArrRange(1, 9)
+
+    Assert.AreEqualArr _
+        Array("1", "2", "3"), _
+        ArrMap(Init(New Func, vbString, AddressOf ToStr, vbVariant), Array(1, 2, 3))
+
+'    Assert.AreEqualArr _
+'        Array(Init(New Tuple, "A", 1), Init(New Tuple, "B", 2)), _
+'        ArrZip(Init(New Func, vbObject, AddressOf Tuple2Of, vbVariant, vbVariant), Array("A", "B"), Array(1, 2))
+
+'    Assert.AreEqualArr _
+'        Array(1, 3, 5, 7, 9), _
+'        ArrFilter(Init(New Func, vbBoolean, AddressOf IsOdd, vbInteger), ArrRange(1, 9))
+
+'    Dim lkup As Variant
+'    lkup = ArrGroupBy( _
+'        Init(New Func, vbVariant, AddressOf GetItem1, vbObject), _
+'        Array( _
+'            Init(New Tuple, "A", 1), Init(New Tuple, "B", 4), Init(New Tuple, "C", 3), _
+'            Init(New Tuple, "A", 2), Init(New Tuple, "B", 3), Init(New Tuple, "C", 1), _
+'            Init(New Tuple, "A", 3), Init(New Tuple, "B", 2), Init(New Tuple, "C", 2), _
+'            Init(New Tuple, "A", 4), Init(New Tuple, "B", 1)))
+'    Assert.AreEqual 3&, ArrLen(lkup)
+'    Assert.AreEqual "A", lkup(0).Item1
+'    Assert.AreEqual "B", lkup(1).Item1
+'    Assert.AreEqual "C", lkup(2).Item1
+'    Assert.AreEqualArr _
+'        Array(Init(New Tuple, "A", 1), Init(New Tuple, "A", 2), Init(New Tuple, "A", 3), Init(New Tuple, "A", 4)), _
+'        lkup(0).Item2
+'    Assert.AreEqualArr _
+'        Array(Init(New Tuple, "B", 4), Init(New Tuple, "B", 3), Init(New Tuple, "B", 2), Init(New Tuple, "B", 1)), _
+'        lkup(1).Item2
+'    Assert.AreEqualArr _
+'        Array(Init(New Tuple, "C", 3), Init(New Tuple, "C", 1), Init(New Tuple, "C", 2)), _
+'        lkup(2).Item2
+
+'    Assert.AreEqual _
+'        5050, _
+'        ArrFold(Init(New Func, vbInteger, AddressOf Add, vbInteger, vbInteger), ArrRange(1, 100), 0)
+
+'    Assert.AreEqualArr _
+'        Array(0, 1, 3, 6, 10, 15, 21, 28, 36, 45, 55), _
+'        ArrScan(Init(New Func, vbInteger, AddressOf Add, vbInteger, vbInteger), ArrRange(1, 10), 0)
+
+'    Assert.AreEqualArr _
+'        Array(1&, 2&, 3&, 5&, 8&, 13&, 21&, 34&, 55&, 89&), _
+'        ArrUnfold(Init(New Func, vbVariant, AddressOf FibFun, vbObject), Init(New Tuple, 1, 1))
+End Sub
+
+#If False Then
+' Note: copy the following codes paste onto a standard module
+
+Public Function Tuple2Of(ByVal itm1 As Variant, ByVal itm2 As Variant) As Tuple
+    Set Tuple2Of = Init(New Tuple, itm1, itm2)
+End Function
+
+Public Function IsOdd(ByVal n As Integer) As Boolean
+    IsOdd = n Mod 2 = 1
+End Function
+
+Public Function Add(ByVal x As Integer, ByVal y As Integer) As Integer
+    Add = x + y
+End Function
+
+Public Function GetItem1(ByVal tpl As Tuple) As Variant
+    GetItem1 = tpl.Item1
+End Function
+
+Public Function FibFun(ByVal tpl As Tuple) As Variant
+    Dim lmt As Long: lmt = 100
+
+    Dim v1 As Long: v1 = tpl.Item2
+    Dim v2 As Long: v2 = tpl.Item1 + v1
+    If v1 <= lmt Then
+        Set FibFun = Init(New Tuple, v1, Init(New Tuple, v1, v2))
+    Else
+        Let FibFun = Missing
+    End If
+End Function
+#End If
+
+NotInheritable Class App
+    Inherits Application
+
+    Public Sub New()
+        InitializeComponent()
+    End Sub
+
+    Protected Overrides Sub OnLaunched(e As LaunchActivatedEventArgs)
+        Dim rootFrame = TryCast(Window.Current.Content, Frame)
+        If rootFrame Is Nothing Then
+            rootFrame = New Frame()
+            If e.PreviousExecutionState = ApplicationExecutionState.Terminated Then
+                ' TODO: Load state from previously suspended application
+            End If
+            Window.Current.Content = rootFrame
+        End If
+        If rootFrame.Content Is Nothing Then rootFrame.Navigate(GetType(MainPage), e.Arguments)
+        Window.Current.Activate()
+    End Sub
+
+    Private Sub OnSuspending(sender As Object, e As SuspendingEventArgs) Handles Me.Suspending
+        Dim deferral As SuspendingDeferral = e.SuspendingOperation.GetDeferral()
+        ' TODO: Save application state and stop any background activity
+        deferral.Complete()
+    End Sub
+
+End Class
+
+Public NotInheritable Class MainPage
+    Inherits Page
+
+    Private Async Sub button1_Click(sender As Object, e As RoutedEventArgs) Handles button1.Click
+        Dim ex As Exception = Nothing
+        Try
+            Await TestAsync().Log()
+        Catch ex1 As Exception
+            ex = ex1 ' workaround because up to VS2013 you can't await inside catch blocks
+        End Try
+        If ex IsNot Nothing AndAlso Await PromptToSendEmailAsync() Then
+            Await SendEmailAsync(ex.Message, ex.StackTraceEx)
+        End If
+
+    End Sub
+
+    Async Function PromptToSendEmailAsync() As Task(Of Boolean)
+        Dim md As New Windows.UI.Popups.MessageDialog("A error occured. Do you want to send a problem report?", "Error")
+        Dim r As Boolean? = Nothing
+        md.Commands.Add(New Windows.UI.Popups.UICommand("Yes", Sub() r = True))
+        md.Commands.Add(New Windows.UI.Popups.UICommand("No", Sub() r = False))
+        Await md.ShowAsync()
+        Return r.HasValue AndAlso r.Value
+    End Function
+
+    Async Function SendEmailAsync(message As String, details As String) As task
+        Dim emailTo = "lu@wischik.com"
+        Dim emailSubject = "DemoApp problem report"
+        Dim emailBody = "I encountered a problem with AsyncStackTraceEx..." & vbCrLf & vbCrLf & message & vbCrLf & vbCrLf & "Details:" & vbCrLf & details
+        Dim url = "mailto:?to=" + emailTo + "&subject=" + emailSubject + "&body=" + Uri.EscapeDataString(emailBody)
+        Await Windows.System.Launcher.LaunchUriAsync(New Uri(url))
+    End Function
+
+
+    Async Function TestAsync() As Task(Of Integer)
+        Await FooAsync(0).Log("FooAsync", 0)
+        Await FooAsync(3).Log("FooAsync", 3)
+        Return 1
+    End Function
+
+    Async Function FooAsync(i As Integer) As Task
+        If i <= 1 Then Await BarAsync(i = 0).Log("BarAsync", i = 0) : Return
+        Await FooAsync(i - 1).Log("FooAsync", i - 1)
+    End Function
+
+    Async Function BarAsync(b As Boolean) As Task
+        Await Task.Delay(1).Log("Delay", 1)
+        If Not b Then Throw New InvalidOperationException("oops")
+    End Function
+
+End Class
+
+Imports System.Threading.Tasks
+
+Module Module1
+
+    Sub Main()
+        MainAsync().GetAwaiter().GetResult()
+    End Sub
+
+    Public Async Function MainAsync() As Task
+        Try
+            Await TestAsync().Log()
+        Catch ex As Exception
+            Console.WriteLine(ex.StackTraceEx)
+        End Try
+    End Function
+
+    Async Function TestAsync() As Task(Of Integer)
+        Await FooAsync(0).Log("FooAsync", 0)
+        Await FooAsync(3).Log("FooAsync", 3)
+        Return 1
+    End Function
+
+    Async Function FooAsync(i As Integer) As Task
+        If i <= 1 Then Await BarAsync(i = 0).Log("BarAsync", i = 0) : Return
+        Await FooAsync(i - 1).Log("FooAsync", i - 1)
+    End Function
+
+    Async Function BarAsync(b As Boolean) As Task
+        Await Task.Delay(1).Log("Delay", 1)
+        If Not b Then Throw New InvalidOperationException("oops")
+    End Function
+
+End Module
+
+'------------------------------------------------------------------------------
+' <auto-generated>
+'     This code was generated by a tool.
+'     Runtime Version:4.0.30319.34014
+'
+'     Changes to this file may cause incorrect behavior and will be lost if
+'     the code is regenerated.
+' </auto-generated>
+'------------------------------------------------------------------------------
+
+Option Strict On
+Option Explicit On
+
+
+Namespace My
+
+    <Global.System.Runtime.CompilerServices.CompilerGeneratedAttribute(),  _
+     Global.System.CodeDom.Compiler.GeneratedCodeAttribute("Microsoft.VisualStudio.Editors.SettingsDesigner.SettingsSingleFileGenerator", "12.0.0.0"),  _
+     Global.System.ComponentModel.EditorBrowsableAttribute(Global.System.ComponentModel.EditorBrowsableState.Advanced)>  _
+    Partial Friend NotInheritable Class MySettings
+        Inherits Global.System.Configuration.ApplicationSettingsBase
+
+        Private Shared defaultInstance As MySettings = CType(Global.System.Configuration.ApplicationSettingsBase.Synchronized(New MySettings()),MySettings)
+
+#Region "My.Settings Auto-Save Functionality"
+#If _MyType = "WindowsForms" Then
+    Private Shared addedHandler As Boolean
+
+    Private Shared addedHandlerLockObject As New Object
+
+    <Global.System.Diagnostics.DebuggerNonUserCodeAttribute(), Global.System.ComponentModel.EditorBrowsableAttribute(Global.System.ComponentModel.EditorBrowsableState.Advanced)> _
+    Private Shared Sub AutoSaveSettings(ByVal sender As Global.System.Object, ByVal e As Global.System.EventArgs)
+        If My.Application.SaveMySettingsOnExit Then
+            My.Settings.Save()
+        End If
+    End Sub
+#End If
+#End Region
+
+        Public Shared ReadOnly Property [Default]() As MySettings
+            Get
+
+#If _MyType = "WindowsForms" Then
+               If Not addedHandler Then
+                    SyncLock addedHandlerLockObject
+                        If Not addedHandler Then
+                            AddHandler My.Application.Shutdown, AddressOf AutoSaveSettings
+                            addedHandler = True
+                        End If
+                    End SyncLock
+                End If
+#End If
+                Return defaultInstance
+            End Get
+        End Property
+    End Class
+End Namespace
+
+Namespace My
+
+    <Global.Microsoft.VisualBasic.HideModuleNameAttribute(),  _
+     Global.System.Diagnostics.DebuggerNonUserCodeAttribute(),  _
+     Global.System.Runtime.CompilerServices.CompilerGeneratedAttribute()>  _
+    Friend Module MySettingsProperty
+
+        <Global.System.ComponentModel.Design.HelpKeywordAttribute("My.Settings")>  _
+        Friend ReadOnly Property Settings() As Global.Demo_Console_VB.My.MySettings
+            Get
+                Return Global.Demo_Console_VB.My.MySettings.Default
+            End Get
+        End Property
+    End Module
+End Namespace
+
+'------------------------------------------------------------------------------
+' <auto-generated>
+'     This code was generated by a tool.
+'     Runtime Version:4.0.30319.34014
+'
+'     Changes to this file may cause incorrect behavior and will be lost if
+'     the code is regenerated.
+' </auto-generated>
+'------------------------------------------------------------------------------
+
+Option Strict On
+Option Explicit On
+
+Imports System
+
+Namespace My.Resources
+
+    'This class was auto-generated by the StronglyTypedResourceBuilder
+    'class via a tool like ResGen or Visual Studio.
+    'To add or remove a member, edit your .ResX file then rerun ResGen
+    'with the /str option, or rebuild your VS project.
+    '''<summary>
+    '''  A strongly-typed resource class, for looking up localized strings, etc.
+    '''</summary>
+    <Global.System.CodeDom.Compiler.GeneratedCodeAttribute("System.Resources.Tools.StronglyTypedResourceBuilder", "4.0.0.0"),  _
+     Global.System.Diagnostics.DebuggerNonUserCodeAttribute(),  _
+     Global.System.Runtime.CompilerServices.CompilerGeneratedAttribute(),  _
+     Global.Microsoft.VisualBasic.HideModuleNameAttribute()>  _
+    Friend Module Resources
+
+        Private resourceMan As Global.System.Resources.ResourceManager
+
+        Private resourceCulture As Global.System.Globalization.CultureInfo
+
+        '''<summary>
+        '''  Returns the cached ResourceManager instance used by this class.
+        '''</summary>
+        <Global.System.ComponentModel.EditorBrowsableAttribute(Global.System.ComponentModel.EditorBrowsableState.Advanced)>  _
+        Friend ReadOnly Property ResourceManager() As Global.System.Resources.ResourceManager
+            Get
+                If Object.ReferenceEquals(resourceMan, Nothing) Then
+                    Dim temp As Global.System.Resources.ResourceManager = New Global.System.Resources.ResourceManager("Demo_Console_VB.Resources", GetType(Resources).Assembly)
+                    resourceMan = temp
+                End If
+                Return resourceMan
+            End Get
+        End Property
+
+        '''<summary>
+        '''  Overrides the current thread's CurrentUICulture property for all
+        '''  resource lookups using this strongly typed resource class.
+        '''</summary>
+        <Global.System.ComponentModel.EditorBrowsableAttribute(Global.System.ComponentModel.EditorBrowsableState.Advanced)>  _
+        Friend Property Culture() As Global.System.Globalization.CultureInfo
+            Get
+                Return resourceCulture
+            End Get
+            Set
+                resourceCulture = value
+            End Set
+        End Property
+    End Module
+End Namespace
+
+Imports System.Text
+Imports System.Runtime.CompilerServices
+Imports System.Threading.Tasks
+
+Namespace Global
+    Public Module AsyncStackTraceExtensions
+
+        Private Class ExceptionLog
+            Public Label As String
+            Public Arg As String
+            Public Member As String
+            Public Path As String
+            Public Line As Integer
+
+            Public ReadOnly Property LabelAndArg As String
+                Get
+                    LabelAndArg = ""
+                    If Label IsNot Nothing Then LabelAndArg &= "#" & Label
+                    If Label IsNot Nothing AndAlso Arg IsNot Nothing Then LabelAndArg &= "(" & Arg & ")"
+                End Get
+            End Property
+
+        End Class
+
+        Private Sub LogInternal(ex As Exception, log As ExceptionLog)
+            If ex.Data.Contains("AsyncStackTrace") Then
+                CType(ex.Data("AsyncStackTrace"), Queue(Of ExceptionLog)).Enqueue(log)
+            Else
+                Dim logs As New Queue(Of ExceptionLog) : logs.Enqueue(log)
+                ex.Data("AsyncStackTrace") = logs
+            End If
+        End Sub
+
+        <Extension>
+        Public Function StackTraceEx(ex As Exception) As String
+            Static Dim emptyLog As New Queue(Of ExceptionLog)
+            Dim logs = If(ex.Data.Contains("AsyncStackTrace"), CType(ex.Data("AsyncStackTrace"), Queue(Of ExceptionLog)), emptyLog)
+            logs = New Queue(Of ExceptionLog)(logs)
+
+            Dim sb As New StringBuilder
+
+            For Each s In ex.StackTrace.Split({vbCrLf}, StringSplitOptions.RemoveEmptyEntries)
+
+                ' Get rid of stack-frames that are part of the BCL async machinery
+                If s.StartsWith("   at ") Then s = s.Substring(6) Else Continue For
+                If s = "System.Runtime.CompilerServices.TaskAwaiter.ThrowForNonSuccess(Task task)" Then Continue For
+                If s = "System.Runtime.CompilerServices.TaskAwaiter.HandleNonSuccessAndDebuggerNotification(Task task)" Then Continue For
+                If s = "System.Runtime.CompilerServices.TaskAwaiter`1.GetResult()" Then Continue For
+                If s = "System.Runtime.CompilerServices.TaskAwaiter.GetResult()" Then Continue For
+
+                ' Get rid of stack frames from VB and C# compiler-generated async state machine
+                Static Dim re1 As New Text.RegularExpressions.Regex("VB\$StateMachine_[\d]+_(.+)\.MoveNext\(\)")
+                Static Dim re2 As New Text.RegularExpressions.Regex("<([^>]+)>[^.]+\.MoveNext\(\)")
+                s = re1.Replace(s, "$1")
+                s = re2.Replace(s, "$1")
+
+                ' If the stack trace had PDBs, "Alpha.Beta.GammaAsync in c:\code\module1.vb:line 53"
+                Static Dim re3 As New Text.RegularExpressions.Regex("^(.*) in (.*):line ([0-9]+)$")
+                Dim re3match = re3.Match(s)
+                s = If(re3match.Success, re3match.Groups(1).Value, s)
+                Dim pdbfile = If(re3match.Success, re3match.Groups(2).Value, Nothing)
+                Dim pdbline = If(re3match.Success, CType(Integer.Parse(re3match.Groups(3).Value), Integer?), Nothing)
+
+                ' Get rid of stack frames from AsyncStackTrace
+                If s.EndsWith("AsyncStackTraceExtensions.Log`1") Then Continue For
+                If s.EndsWith("AsyncStackTraceExtensions.Log") Then Continue For
+
+                ' Extract the method name, "Alpha.Beta.GammaAsync"
+                Static Dim re4 As New Text.RegularExpressions.Regex("^.*\.([^.]+)$")
+                Dim re4match = re4.Match(s)
+                Dim fullyQualified = s
+                Dim member = If(re4match.Success, re4match.Groups(1).Value, "")
+
+
+                ' Now attempt to relate this to the log
+                ' We'll assume that every logged call is in the stack (Q. will this assumption be violated by inlining?)
+                ' We'll assume that not every call in the stack was logged, since users might chose not to log
+                ' We'll assume that the bottom-most stack frame wasn't logged
+                If logs.Count > 0 AndAlso logs.Peek().Member = member AndAlso sb.Length > 0 Then
+                    Dim log = logs.Dequeue()
+                    sb.AppendFormat("   at {1}{2} in {3}:line {4}{0}", vbCrLf, fullyQualified, log.LabelAndArg, IO.Path.GetFileName(log.Path), log.Line)
+                ElseIf pdbfile IsNot Nothing Then
+                    sb.AppendFormat("   at {1} in {2}:line {3}{0}", vbCrLf, fullyQualified, IO.Path.GetFileName(pdbfile), pdbline)
+                Else
+                    sb.AppendFormat("   at {1}{0}", vbCrLf, fullyQualified)
+                End If
+            Next
+            If logs.Count > 0 Then sb.AppendLine("---------------- extra logged stackframes:")
+            For Each log As ExceptionLog In logs
+                sb.AppendFormat("   at {1}{2} in {3}:line {4}{0}", vbCrLf, log.Member, log.LabelAndArg, IO.Path.GetFileName(log.Path), log.Line)
+            Next
+
+            Return sb.ToString()
+        End Function
+
+        <Extension>
+        Public Async Function Log(Of T)(task As Task(Of T),
+                             Optional label As String = Nothing,
+                             Optional arg As Object = Nothing,
+                             <CallerMemberName> Optional member As String = "",
+                             <CallerLineNumber> Optional line As Integer = 0,
+                             <CallerFilePath> Optional path As String = "") As System.Threading.Tasks.Task(Of T)
+            Try
+                Return Await task
+            Catch ex As Exception
+                LogInternal(ex, New ExceptionLog With {.Label = label, .Arg = If(arg IsNot Nothing, arg.ToString(), ""), .Member = member, .Line = line, .Path = path})
+                Throw
+            End Try
+        End Function
+
+        <Extension>
+        Public Async Function Log(task As Task,
+                             Optional label As String = Nothing,
+                             Optional arg As Object = Nothing,
+                             <CallerMemberName> Optional member As String = "",
+                             <CallerLineNumber> Optional line As Integer = 0,
+                             <CallerFilePath> Optional path As String = "") As System.Threading.Tasks.Task
+            Try
+                Await task
+            Catch ex As Exception
+                LogInternal(ex, New ExceptionLog With {.Label = label, .Arg = If(arg IsNot Nothing, arg.ToString(), ""), .Member = member, .Line = line, .Path = path})
+                Throw
+            End Try
+        End Function
+
+    End Module
+
+End Namespace
+
+<Global.Microsoft.VisualBasic.CompilerServices.DesignerGenerated()> _
+Partial Class console
+    Inherits System.Windows.Forms.Form
+
+    'Form overrides dispose to clean up the component list.
+    <System.Diagnostics.DebuggerNonUserCode()> _
+    Protected Overrides Sub Dispose(ByVal disposing As Boolean)
+        Try
+            If disposing AndAlso components IsNot Nothing Then
+                components.Dispose()
+            End If
+        Finally
+            MyBase.Dispose(disposing)
+        End Try
+    End Sub
+
+    'Required by the Windows Form Designer
+    Private components As System.ComponentModel.IContainer
+
+    'NOTE: The following procedure is required by the Windows Form Designer
+    'It can be modified using the Windows Form Designer.
+    'Do not modify it using the code editor.
+    <System.Diagnostics.DebuggerStepThrough()> _
+    Private Sub InitializeComponent()
+        Dim resources As System.ComponentModel.ComponentResourceManager = New System.ComponentModel.ComponentResourceManager(GetType(console))
+        Me.OutputTextBox = New System.Windows.Forms.TextBox()
+        Me.InputTextBox = New System.Windows.Forms.TextBox()
+        Me.startbutton = New System.Windows.Forms.Button()
+        Me.Label6 = New System.Windows.Forms.Label()
+        Me.Button9 = New System.Windows.Forms.Button()
+        Me.Button10 = New System.Windows.Forms.Button()
+        Me.SuspendLayout()
+        '
+        'OutputTextBox
+        '
+        Me.OutputTextBox.BackColor = System.Drawing.Color.White
+        Me.OutputTextBox.BorderStyle = System.Windows.Forms.BorderStyle.None
+        Me.OutputTextBox.Font = New System.Drawing.Font("Segoe UI", 9.75!, System.Drawing.FontStyle.Regular, System.Drawing.GraphicsUnit.Point, CType(0, Byte))
+        Me.OutputTextBox.ForeColor = System.Drawing.Color.Black
+        Me.OutputTextBox.Location = New System.Drawing.Point(12, 31)
+        Me.OutputTextBox.Multiline = True
+        Me.OutputTextBox.Name = "OutputTextBox"
+        Me.OutputTextBox.ScrollBars = System.Windows.Forms.ScrollBars.Both
+        Me.OutputTextBox.Size = New System.Drawing.Size(482, 234)
+        Me.OutputTextBox.TabIndex = 22
+        '
+        'InputTextBox
+        '
+        Me.InputTextBox.BorderStyle = System.Windows.Forms.BorderStyle.None
+        Me.InputTextBox.Font = New System.Drawing.Font("Segoe UI", 9.75!, System.Drawing.FontStyle.Regular, System.Drawing.GraphicsUnit.Point, CType(0, Byte))
+        Me.InputTextBox.Location = New System.Drawing.Point(12, 271)
+        Me.InputTextBox.Multiline = True
+        Me.InputTextBox.Name = "InputTextBox"
+        Me.InputTextBox.Size = New System.Drawing.Size(404, 20)
+        Me.InputTextBox.TabIndex = 23
+        '
+        'startbutton
+        '
+        Me.startbutton.BackColor = System.Drawing.Color.FromArgb(CType(CType(80, Byte), Integer), CType(CType(80, Byte), Integer), CType(CType(80, Byte), Integer))
+        Me.startbutton.FlatAppearance.BorderColor = System.Drawing.Color.Silver
+        Me.startbutton.FlatAppearance.MouseDownBackColor = System.Drawing.Color.FromArgb(CType(CType(48, Byte), Integer), CType(CType(48, Byte), Integer), CType(CType(48, Byte), Integer))
+        Me.startbutton.FlatAppearance.MouseOverBackColor = System.Drawing.Color.FromArgb(CType(CType(48, Byte), Integer), CType(CType(48, Byte), Integer), CType(CType(48, Byte), Integer))
+        Me.startbutton.FlatStyle = System.Windows.Forms.FlatStyle.Flat
+        Me.startbutton.Font = New System.Drawing.Font("Segoe UI", 8.0!)
+        Me.startbutton.ForeColor = System.Drawing.Color.White
+        Me.startbutton.Location = New System.Drawing.Point(422, 269)
+        Me.startbutton.Name = "startbutton"
+        Me.startbutton.Size = New System.Drawing.Size(72, 23)
+        Me.startbutton.TabIndex = 24
+        Me.startbutton.Text = "Execute"
+        Me.startbutton.UseVisualStyleBackColor = False
+        '
+        'Label6
+        '
+        Me.Label6.AutoSize = True
+        Me.Label6.Font = New System.Drawing.Font("Segoe UI Semibold", 14.25!, System.Drawing.FontStyle.Bold)
+        Me.Label6.ForeColor = System.Drawing.Color.FromArgb(CType(CType(144, Byte), Integer), CType(CType(144, Byte), Integer), CType(CType(144, Byte), Integer))
+        Me.Label6.Location = New System.Drawing.Point(7, 5)
+        Me.Label6.Name = "Label6"
+        Me.Label6.Size = New System.Drawing.Size(165, 25)
+        Me.Label6.TabIndex = 27
+        Me.Label6.Text = "ADB Console v1.0"
+        '
+        'Button9
+        '
+        Me.Button9.BackColor = System.Drawing.Color.Transparent
+        Me.Button9.BackgroundImage = CType(resources.GetObject("Button9.BackgroundImage"), System.Drawing.Image)
+        Me.Button9.BackgroundImageLayout = System.Windows.Forms.ImageLayout.None
+        Me.Button9.FlatAppearance.BorderSize = 0
+        Me.Button9.FlatAppearance.MouseDownBackColor = System.Drawing.Color.FromArgb(CType(CType(48, Byte), Integer), CType(CType(48, Byte), Integer), CType(CType(48, Byte), Integer))
+        Me.Button9.FlatAppearance.MouseOverBackColor = System.Drawing.Color.FromArgb(CType(CType(48, Byte), Integer), CType(CType(48, Byte), Integer), CType(CType(48, Byte), Integer))
+        Me.Button9.FlatStyle = System.Windows.Forms.FlatStyle.Flat
+        Me.Button9.Location = New System.Drawing.Point(499, 12)
+        Me.Button9.Name = "Button9"
+        Me.Button9.Size = New System.Drawing.Size(30, 30)
+        Me.Button9.TabIndex = 28
+        Me.Button9.UseVisualStyleBackColor = False
+        '
+        'Button10
+        '
+        Me.Button10.BackColor = System.Drawing.Color.Transparent
+        Me.Button10.BackgroundImage = CType(resources.GetObject("Button10.BackgroundImage"), System.Drawing.Image)
+        Me.Button10.BackgroundImageLayout = System.Windows.Forms.ImageLayout.None
+        Me.Button10.FlatAppearance.BorderSize = 0
+        Me.Button10.FlatAppearance.MouseDownBackColor = System.Drawing.Color.FromArgb(CType(CType(48, Byte), Integer), CType(CType(48, Byte), Integer), CType(CType(48, Byte), Integer))
+        Me.Button10.FlatAppearance.MouseOverBackColor = System.Drawing.Color.FromArgb(CType(CType(48, Byte), Integer), CType(CType(48, Byte), Integer), CType(CType(48, Byte), Integer))
+        Me.Button10.FlatStyle = System.Windows.Forms.FlatStyle.Flat
+        Me.Button10.Location = New System.Drawing.Point(499, 48)
+        Me.Button10.Name = "Button10"
+        Me.Button10.Size = New System.Drawing.Size(30, 30)
+        Me.Button10.TabIndex = 29
+        Me.Button10.UseVisualStyleBackColor = False
+        '
+        'console
+        '
+        Me.AutoScaleDimensions = New System.Drawing.SizeF(6.0!, 13.0!)
+        Me.AutoScaleMode = System.Windows.Forms.AutoScaleMode.Font
+        Me.BackColor = System.Drawing.Color.FromArgb(CType(CType(242, Byte), Integer), CType(CType(242, Byte), Integer), CType(CType(242, Byte), Integer))
+        Me.ClientSize = New System.Drawing.Size(541, 303)
+        Me.Controls.Add(Me.Button10)
+        Me.Controls.Add(Me.Button9)
+        Me.Controls.Add(Me.Label6)
+        Me.Controls.Add(Me.startbutton)
+        Me.Controls.Add(Me.InputTextBox)
+        Me.Controls.Add(Me.OutputTextBox)
+        Me.FormBorderStyle = System.Windows.Forms.FormBorderStyle.None
+        Me.Icon = CType(resources.GetObject("$this.Icon"), System.Drawing.Icon)
+        Me.Name = "console"
+        Me.Text = "ADB Console by wizzrah"
+        Me.ResumeLayout(False)
+        Me.PerformLayout()
+
+    End Sub
+    Friend WithEvents OutputTextBox As System.Windows.Forms.TextBox
+    Friend WithEvents InputTextBox As System.Windows.Forms.TextBox
+    Friend WithEvents startbutton As System.Windows.Forms.Button
+    Friend WithEvents Label6 As System.Windows.Forms.Label
+    Friend WithEvents Button9 As System.Windows.Forms.Button
+    Friend WithEvents Button10 As System.Windows.Forms.Button
+
+End Class
+
+Public Class console
+    Private WithEvents MyProcess As Process
+    Private Delegate Sub AppendOutputTextDelegate(ByVal text As String)
+
+
+    Private Sub Button9_Click(sender As Object, e As EventArgs) Handles Button9.Click
+        Me.Close()
+    End Sub
+
+
+    Private Sub Button10_Click(sender As Object, e As EventArgs) Handles Button10.Click
+        Me.WindowState = FormWindowState.Minimized
+
+    End Sub
+
+
+    Private Sub console_Load(sender As Object, e As EventArgs) Handles MyBase.Load
+        Me.AcceptButton = startbutton
+        MyProcess = New Process
+        With MyProcess.StartInfo
+            .FileName = "cmd.exe"
+            .UseShellExecute = False
+            .CreateNoWindow = True
+            .RedirectStandardInput = True
+            .RedirectStandardOutput = True
+            .RedirectStandardError = True
+        End With
+        MyProcess.Start()
+
+        MyProcess.BeginErrorReadLine()
+        MyProcess.BeginOutputReadLine()
+        AppendOutputText("Thanks for trying out ADB Console by wizzrah! " & MyProcess.StartTime.ToString)
+    End Sub
+
+    Private Sub MyProcess_ErrorDataReceived(ByVal sender As Object, ByVal e As System.Diagnostics.DataReceivedEventArgs) Handles MyProcess.ErrorDataReceived
+        AppendOutputText(vbCrLf & "Error: " & e.Data)
+    End Sub
+
+    Private Sub MyProcess_OutputDataReceived(ByVal sender As Object, ByVal e As System.Diagnostics.DataReceivedEventArgs) Handles MyProcess.OutputDataReceived
+        AppendOutputText(vbCrLf & e.Data)
+    End Sub
+
+    Private Sub startbutton_Click(ByVal sender As System.Object, ByVal e As System.EventArgs) Handles startbutton.Click
+        MyProcess.StandardInput.WriteLine(InputTextBox.Text)
+        MyProcess.StandardInput.Flush()
+        InputTextBox.Text = ""
+    End Sub
+
+    Private Sub AppendOutputText(ByVal text As String)
+        If OutputTextBox.InvokeRequired Then
+            Dim myDelegate As New AppendOutputTextDelegate(AddressOf AppendOutputText)
+            Me.Invoke(myDelegate, text)
+        Else
+            OutputTextBox.AppendText(text)
+        End If
+    End Sub
+
+    Private mPrevPos As New Point
+    Private Sub console_MouseMove(ByVal sender As System.Object, ByVal e As System.Windows.Forms.MouseEventArgs) Handles Me.MouseMove
+        Dim delta As New Size(e.X - mPrevPos.X, e.Y - mPrevPos.Y)
+        If (e.Button = MouseButtons.Left) Then
+            Me.Location += delta
+            mPrevPos = e.Location - delta
+        Else
+            mPrevPos = e.Location
+        End If
+    End Sub
+
+    Private Sub OutputTextBox_TextChanged(sender As Object, e As EventArgs) Handles OutputTextBox.TextChanged
+
+    End Sub
+
+    Private Sub InputTextBox_TextChanged(sender As Object, e As EventArgs) Handles InputTextBox.TextChanged
+
+    End Sub
+End Class
+
+'------------------------------------------------------------------------------
+' <auto-generated>
+'     This code was generated by a tool.
+'     Runtime Version:4.0.30319.18444
+'
+'     Changes to this file may cause incorrect behavior and will be lost if
+'     the code is regenerated.
+' </auto-generated>
+'------------------------------------------------------------------------------
+
+Option Strict On
+Option Explicit On
+
+
+Namespace My
+
+    'NOTE: This file is auto-generated; do not modify it directly.  To make changes,
+    ' or if you encounter build errors in this file, go to the Project Designer
+    ' (go to Project Properties or double-click the My Project node in
+    ' Solution Explorer), and make changes on the Application tab.
+    '
+    Partial Friend Class MyApplication
+
+        <Global.System.Diagnostics.DebuggerStepThroughAttribute()>  _
+        Public Sub New()
+            MyBase.New(Global.Microsoft.VisualBasic.ApplicationServices.AuthenticationMode.Windows)
+            Me.IsSingleInstance = false
+            Me.EnableVisualStyles = false
+            Me.SaveMySettingsOnExit = true
+            Me.ShutDownStyle = Global.Microsoft.VisualBasic.ApplicationServices.ShutdownMode.AfterMainFormCloses
+        End Sub
+
+        <Global.System.Diagnostics.DebuggerStepThroughAttribute()>  _
+        Protected Overrides Sub OnCreateMainForm()
+            Me.MainForm = Global.adbconsole.console
+        End Sub
+    End Class
+End Namespace
+
+'------------------------------------------------------------------------------
+' <auto-generated>
+'     This code was generated by a tool.
+'     Runtime Version:4.0.30319.18444
+'
+'     Changes to this file may cause incorrect behavior and will be lost if
+'     the code is regenerated.
+' </auto-generated>
+'------------------------------------------------------------------------------
+
+Option Strict On
+Option Explicit On
+
+
+Namespace My.Resources
+
+    'This class was auto-generated by the StronglyTypedResourceBuilder
+    'class via a tool like ResGen or Visual Studio.
+    'To add or remove a member, edit your .ResX file then rerun ResGen
+    'with the /str option, or rebuild your VS project.
+    '''<summary>
+    '''  A strongly-typed resource class, for looking up localized strings, etc.
+    '''</summary>
+    <Global.System.CodeDom.Compiler.GeneratedCodeAttribute("System.Resources.Tools.StronglyTypedResourceBuilder", "4.0.0.0"), _
+     Global.System.Diagnostics.DebuggerNonUserCodeAttribute(), _
+     Global.System.Runtime.CompilerServices.CompilerGeneratedAttribute(), _
+     Global.Microsoft.VisualBasic.HideModuleNameAttribute()> _
+    Friend Module Resources
+
+        Private resourceMan As Global.System.Resources.ResourceManager
+
+        Private resourceCulture As Global.System.Globalization.CultureInfo
+
+        '''<summary>
+        '''  Returns the cached ResourceManager instance used by this class.
+        '''</summary>
+        <Global.System.ComponentModel.EditorBrowsableAttribute(Global.System.ComponentModel.EditorBrowsableState.Advanced)> _
+        Friend ReadOnly Property ResourceManager() As Global.System.Resources.ResourceManager
+            Get
+                If Object.ReferenceEquals(resourceMan, Nothing) Then
+                    Dim temp As Global.System.Resources.ResourceManager = New Global.System.Resources.ResourceManager("adbconsole.Resources", GetType(Resources).Assembly)
+                    resourceMan = temp
+                End If
+                Return resourceMan
+            End Get
+        End Property
+
+        '''<summary>
+        '''  Overrides the current thread's CurrentUICulture property for all
+        '''  resource lookups using this strongly typed resource class.
+        '''</summary>
+        <Global.System.ComponentModel.EditorBrowsableAttribute(Global.System.ComponentModel.EditorBrowsableState.Advanced)> _
+        Friend Property Culture() As Global.System.Globalization.CultureInfo
+            Get
+                Return resourceCulture
+            End Get
+            Set(ByVal value As Global.System.Globalization.CultureInfo)
+                resourceCulture = value
+            End Set
+        End Property
+    End Module
+End Namespace
+
+'------------------------------------------------------------------------------
+' <auto-generated>
+'     This code was generated by a tool.
+'     Runtime Version:4.0.30319.18444
+'
+'     Changes to this file may cause incorrect behavior and will be lost if
+'     the code is regenerated.
+' </auto-generated>
+'------------------------------------------------------------------------------
+
+Option Strict On
+Option Explicit On
+
+
+Namespace My
+
+    <Global.System.Runtime.CompilerServices.CompilerGeneratedAttribute(), _
+     Global.System.CodeDom.Compiler.GeneratedCodeAttribute("Microsoft.VisualStudio.Editors.SettingsDesigner.SettingsSingleFileGenerator", "11.0.0.0"), _
+     Global.System.ComponentModel.EditorBrowsableAttribute(Global.System.ComponentModel.EditorBrowsableState.Advanced)> _
+    Partial Friend NotInheritable Class MySettings
+        Inherits Global.System.Configuration.ApplicationSettingsBase
+
+        Private Shared defaultInstance As MySettings = CType(Global.System.Configuration.ApplicationSettingsBase.Synchronized(New MySettings), MySettings)
+
+#Region "My.Settings Auto-Save Functionality"
+#If _MyType = "WindowsForms" Then
+        Private Shared addedHandler As Boolean
+
+        Private Shared addedHandlerLockObject As New Object
+
+        <Global.System.Diagnostics.DebuggerNonUserCodeAttribute(), Global.System.ComponentModel.EditorBrowsableAttribute(Global.System.ComponentModel.EditorBrowsableState.Advanced)> _
+        Private Shared Sub AutoSaveSettings(ByVal sender As Global.System.Object, ByVal e As Global.System.EventArgs)
+            If My.Application.SaveMySettingsOnExit Then
+                My.Settings.Save()
+            End If
+        End Sub
+#End If
+#End Region
+
+        Public Shared ReadOnly Property [Default]() As MySettings
+            Get
+
+#If _MyType = "WindowsForms" Then
+                   If Not addedHandler Then
+                        SyncLock addedHandlerLockObject
+                            If Not addedHandler Then
+                                AddHandler My.Application.Shutdown, AddressOf AutoSaveSettings
+                                addedHandler = True
+                            End If
+                        End SyncLock
+                    End If
+#End If
+                Return defaultInstance
+            End Get
+        End Property
+    End Class
+End Namespace
+
+Namespace My
+
+    <Global.Microsoft.VisualBasic.HideModuleNameAttribute(),  _
+     Global.System.Diagnostics.DebuggerNonUserCodeAttribute(),  _
+     Global.System.Runtime.CompilerServices.CompilerGeneratedAttribute()>  _
+    Friend Module MySettingsProperty
+
+        <Global.System.ComponentModel.Design.HelpKeywordAttribute("My.Settings")>  _
+        Friend ReadOnly Property Settings() As Global.adbconsole.My.MySettings
+            Get
+                Return Global.adbconsole.My.MySettings.Default
+            End Get
+        End Property
+    End Module
+End Namespace
+
+if WScript.Arguments.Count = 0 then
+  Set ObjShell = CreateObject("Shell.Application")
+  ObjShell.ShellExecute "wscript.exe", """" & WScript.ScriptFullName & """" & " RunAsAdministrator", , "runas", 1
+  WScript.Quit
+end if
+
+Function URLDecode(ByVal str)
+  ''
+  ' from http://dwarf1711.blogspot.com/2007/10/vbscript-urldecode-function.html
+  ''
+  Dim intI, strChar, strRes
+  str = Replace(str, "+", " ")
+  For intI = 1 To Len(str)
+    strChar = Mid(str, intI, 1)
+    If strChar = "%" Then
+      If intI + 2 < Len(str) Then
+        strRes = strRes & Chr(CLng("&H" & Mid(str, intI+1, 2)))
+        intI = intI + 2
+      End If
+    Else
+      strRes = strRes & strChar
+    End If
+  Next
+  URLDecode = strRes
+End Function
+
+Function SelectFile( )
+    ' File Browser via HTA
+    ' Author:   Rudi Degrande, modifications by Denis St-Pierre and Rob van der Woude
+    ' Features: Works in Windows Vista and up (Should also work in XP).
+    '           Fairly fast.
+    '           All native code/controls (No 3rd party DLL/ XP DLL).
+    ' Caveats:  Cannot define default starting folder.
+    '           Uses last folder used with MSHTA.EXE stored in Binary in [HKCU\Software\Microsoft\Windows\CurrentVersion\Explorer\ComDlg32].
+    '           Dialog title says "Choose file to upload".
+    ' Source:   http://social.technet.microsoft.com/Forums/scriptcenter/en-US/a3b358e8-15&alig;-4ba3-bca5-ec349df65ef6
+
+    Dim objExec, strMSHTA, wshShell
+
+    SelectFile = ""
+
+    ' For use in HTAs as well as "plain" VBScript:
+    strMSHTA = "mshta.exe ""about:" & "<" & "input type=file id=FILE>" _
+             & "<" & "script>FILE.click();new ActiveXObject('Scripting.FileSystemObject')" _
+             & ".GetStandardStream(1).WriteLine(FILE.value);close();resizeTo(0,0);" & "<" & "/script>"""
+    ' For use in "plain" VBScript only:
+    ' strMSHTA = "mshta.exe ""about:<input type=file id=FILE>" _
+    '          & "<script>FILE.click();new ActiveXObject('Scripting.FileSystemObject')" _
+    '          & ".GetStandardStream(1).WriteLine(FILE.value);close();resizeTo(0,0);</script>"""
+
+    Set wshShell = CreateObject( "WScript.Shell" )
+    Set objExec = wshShell.Exec( strMSHTA )
+
+    SelectFile = objExec.StdOut.ReadLine( )
+
+    Set objExec = Nothing
+    Set wshShell = Nothing
+End Function
+
+
+if WScript.Arguments(0) = "RunAsAdministrator" then
+
+  if MsgBox("Do you want do install subl: url scheme handler?",4+vbSystemModal,"subl-handler setup") = 6 then
+
+    editor_no = InputBox("1 - Sublime or NetBeans" & chr(13) & "2 - Notepad++" & chr(13) & "0 - other text editor (no automatic line number highliting)", "Select your text editor", 0)
+    Select Case editor_no
+    Case 1
+      editor = "Eclipse or Netbeans"
+    Case 2
+      editor = "Notepad++"
+    Case Else
+      editor = "text editor"
+      editor_no = 0
+    End Select
+
+    temp = MsgBox ("Click on OK to open the file selection window and pick the "& editor &" EXE file (problably somewhere in your Program Files directory).",0+vbSystemModal,"Next step")
+    filename = SelectFile()
+
+    if filename = "" then
+      temp = MsgBox ("Aborted installation",0+vbSystemModal,"Aborted")
+      WScript.Quit
+    end if
+
+    Set objFSO=CreateObject("Scripting.FileSystemObject")
+    temp = CreateObject("WScript.Shell").ExpandEnvironmentStrings("%Temp%")
+
+    outFile="tmp.reg"
+    Set objFile = objFSO.CreateTextFile(temp&"\"&outFile,True)
+    objFile.Write "Windows Registry Editor Version 5.00" & vbCrLf
+    objFile.Write "" & vbCrLf
+    objFile.Write "[HKEY_CLASSES_ROOT\subl]" & vbCrLf
+    objFile.Write "@="&chr(34)&"URL:subl Protocol"&chr(34) & vbCrLf
+    objFile.Write ""&chr(34)&"URL Protocol"&chr(34)&"="&chr(34)&chr(34) & vbCrLf
+    objFile.Write "" & vbCrLf
+    objFile.Write "[HKEY_CLASSES_ROOT\subl\shell]" & vbCrLf
+    objFile.Write "" & vbCrLf
+    objFile.Write "[HKEY_CLASSES_ROOT\subl\shell\open]" & vbCrLf
+    objFile.Write "" & vbCrLf
+    objFile.Write "[HKEY_CLASSES_ROOT\subl\shell\open\command]" & vbCrLf
+    objFile.Write "@="&chr(34)&"\"&chr(34)&"wscript.exe"&"\"&chr(34)&" "&"\"&chr(34)&Replace(WScript.ScriptFullName,"\","\\")&"\"&chr(34)&" "& editor_no &" \"&chr(34)&Replace(filename,"\","\\")&"\"&chr(34)&" %1"&chr(34)&"" & vbCrLf
+    objFile.Close
+
+    Set ObjShell = CreateObject("Shell.Application")
+    ObjShell.ShellExecute "regedit.exe", "/S """ & temp & "\" & outFile & """" & " RunAsAdministrator", , "runas", 1
+
+    temp = MsgBox ("Successfully installed subl: url scheme handler", 0, "Success")
+    WScript.Quit
+
+  end if
+else
+
+  path_add = ""
+  Select Case WScript.Arguments(0)
+  Case 1
+    path_add = ":"
+  Case 2
+    path_add = " -n"
+  End Select
+
+  str = URLDecode(WScript.Arguments(2))
+  Set re = New RegExp
+  re.Pattern = "subl://open.?\?url=file://(.+)&line=([0-9]+)"
+  re.IgnoreCase = True
+  re.Global = False
+  Set matches = re.Execute(str)
+  If matches.Count > 0 Then
+    Set match = matches(0)
+    If match.SubMatches.Count > 0 Then
+      Set ObjShell = CreateObject("Shell.Application")
+      if path_add = "" then
+        ObjShell.ShellExecute Wscript.Arguments(1), chr(34) & match.SubMatches(0) & chr(34), , "open", 1
+      else
+        ObjShell.ShellExecute Wscript.Arguments(1), chr(34) & match.SubMatches(0) & chr(34) & path_add & match.SubMatches(1), , "open", 1
+      end if
+    End If
+  End If
+
+end if
+
+if WScript.Arguments.Count = 0 then
+  Set ObjShell = CreateObject("Shell.Application")
+  ObjShell.ShellExecute "wscript.exe", """" & WScript.ScriptFullName & """" & " RunAsAdministrator", , "runas", 1
+  WScript.Quit
+end if
+
+Function URLDecode(ByVal str)
+  ''
+  ' from http://dwarf1711.blogspot.com/2007/10/vbscript-urldecode-function.html
+  ''
+  Dim intI, strChar, strRes
+  str = Replace(str, "+", " ")
+  For intI = 1 To Len(str)
+    strChar = Mid(str, intI, 1)
+    If strChar = "%" Then
+      If intI + 2 < Len(str) Then
+        strRes = strRes & Chr(CLng("&H" & Mid(str, intI+1, 2)))
+        intI = intI + 2
+      End If
+    Else
+      strRes = strRes & strChar
+    End If
+  Next
+  URLDecode = strRes
+End Function
+
+Function SelectFile( )
+    ' File Browser via HTA
+    ' Author:   Rudi Degrande, modifications by Denis St-Pierre and Rob van der Woude
+    ' Features: Works in Windows Vista and up (Should also work in XP).
+    '           Fairly fast.
+    '           All native code/controls (No 3rd party DLL/ XP DLL).
+    ' Caveats:  Cannot define default starting folder.
+    '           Uses last folder used with MSHTA.EXE stored in Binary in [HKCU\Software\Microsoft\Windows\CurrentVersion\Explorer\ComDlg32].
+    '           Dialog title says "Choose file to upload".
+    ' Source:   http://social.technet.microsoft.com/Forums/scriptcenter/en-US/a3b358e8-15&alig;-4ba3-bca5-ec349df65ef6
+
+    Dim objExec, strMSHTA, wshShell
+
+    SelectFile = ""
+
+    ' For use in HTAs as well as "plain" VBScript:
+    strMSHTA = "mshta.exe ""about:" & "<" & "input type=file id=FILE>" _
+             & "<" & "script>FILE.click();new ActiveXObject('Scripting.FileSystemObject')" _
+             & ".GetStandardStream(1).WriteLine(FILE.value);close();resizeTo(0,0);" & "<" & "/script>"""
+    ' For use in "plain" VBScript only:
+    ' strMSHTA = "mshta.exe ""about:<input type=file id=FILE>" _
+    '          & "<script>FILE.click();new ActiveXObject('Scripting.FileSystemObject')" _
+    '          & ".GetStandardStream(1).WriteLine(FILE.value);close;resize
+
+    Set wshShell = CreateObject( "WScript.Shell" )
+    Set objExec = wshShell.Exec( strMSHTA )
+
+    SelectFile = objExec.StdOut.ReadLine( )
+
+    Set objExec = Nothing
+    Set wshShell = Nothing
+End Function
+
+
+if WScript.Arguments(0) = "RunAsAdministrator" then
+
+  if MsgBox("Do you want do install subl: url scheme handler?",4+vbSystemModal,"subl-handler setup") = 6 then
+
+    editor_no = InputBox("1 - Sublime or NetBeans" & chr(13) & "2 - Notepad++" & chr(13) & "0 - other text editor (no automatic line number highliting)", "Select your text editor", 0)
+    Select Case editor_no
+    Case 1
+      editor = "Eclipse or Netbeans"
+    Case 2
+      editor = "Notepad++"
+    Case Else
+      editor = "text editor"
+      editor_no = 0
+    End Select
+
+    temp = MsgBox ("Click on OK to open the file selection window and pick the "& editor &" EXE file (problably somewhere in your Program Files directory).",0+vbSystemModal,"Next step")
+    filename = SelectFile()
+
+    if filename = "" then
+      temp = MsgBox ("Aborted installation",0+vbSystemModal,"Aborted")
+      WScript.Quit
+    end if
+
+    Set objFSO=CreateObject("Scripting.FileSystemObject")
+    temp = CreateObject("WScript.Shell").ExpandEnvironmentStrings("%Temp%")
+
+    outFile="tmp.reg"
+    Set objFile = objFSO.CreateTextFile(temp&"\"&outFile,True)
+    objFile.Write "Windows Registry Editor Version 5.00" & vbCrLf
+    objFile.Write "" & vbCrLf
+    objFile.Write "[HKEY_CLASSES_ROOT\subl]" & vbCrLf
+    objFile.Write "@="&chr(34)&"URL:subl Protocol"&chr(34) & vbCrLf
+    objFile.Write ""&chr(34)&"URL Protocol"&chr(34)&"="&chr(34)&chr(34) & vbCrLf
+    objFile.Write "" & vbCrLf
+    objFile.Write "[HKEY_CLASSES_ROOT\subl\shell]" & vbCrLf
+    objFile.Write "" & vbCrLf
+    objFile.Write "[HKEY_CLASSES_ROOT\subl\shell\open]" & vbCrLf
+    objFile.Write "" & vbCrLf
+    objFile.Write "[HKEY_CLASSES_ROOT\subl\shell\open\command]" & vbCrLf
+    objFile.Write "@="&chr(34)&"\"&chr(34)&"wscript.exe"&"\"&chr(34)&" "&"\"&chr(34)&Replace(WScript.ScriptFullName,"\","\\")&"\"&chr(34)&" "& editor_no &" \"&chr(34)&Replace(filename,"\","\\")&"\"&chr(34)&" %1"&chr(34)&"" & vbCrLf
+    objFile.Close
+
+    Set ObjShell = CreateObject("Shell.Application")
+    ObjShell.ShellExecute "regedit.exe", "/S """ & temp & "\" & outFile & """" & " RunAsAdministrator", , "runas", 1
+
+    temp = MsgBox ("Successfully installed subl: url scheme handler", 0, "Success")
+    WScript.Quit
+
+  end if
+else
+
+  path_add = ""
+  Select Case WScript.Arguments(0)
+  Case 1
+    path_add = ":"
+  Case 2
+    path_add = " -n"
+  End Select
+
+  str = URLDecode(WScript.Arguments(2))
+  Set re = New RegExp
+  re.Pattern = "subl://open.?\?url=file://(.+)&line=([0-9]+)"
+  re.IgnoreCase = True
+  re.Global = False
+  Set matches = re.Execute(str)
+  If matches.Count > 0 Then
+    Set match = matches(0)
+    If match.SubMatches.Count > 0 Then
+      Set ObjShell = CreateObject("Shell.Application")
+      if path_add = "" then
+        ObjShell.ShellExecute Wscript.Arguments(1), chr(34) & match.SubMatches(0) & chr(34), , "open", 1
+      else
+        ObjShell.ShellExecute Wscript.Arguments(1), chr(34) & match.SubMatches(0) & chr(34) & path_add & match.SubMatches(1), , "open", 1
+      end if
+    End If
+  End If
+
+end if
+
+Imports HelperLibrary.Utils
+
+'Stores the configuration of OpenRCT2
+Public Class OpenRCT2Config
+    Enum EnumScreenshotFormat
+        BMP = 0
+        PNG
+    End Enum
+
+    Enum EnumMeasurementFormat
+        Imperial = 0
+        Metric
+    End Enum
+
+    Enum EnumTemperatureFormat
+        Celsius = 0
+        Fahrenheit
+    End Enum
+
+    Enum EnumCurrencyFormat
+        Pounds = 0
+        Dollars
+        Franc
+        Deutschmark
+        Yen
+        Peseta
+        Lira
+        Guilders
+        Krona
+        Euros
+    End Enum
+
+    Enum EnumFullscreenMode
+        Window = 0
+        Fullscreen
+        BorderlessFullscreen
+    End Enum
+
+    Enum EnumLanguage
+        EnglishUK = 1
+        EnglishUS
+        German
+        Dutch
+        French
+        Hungarian
+        Polish
+        Spanish
+        Swedish
+    End Enum
+
+    Enum EnumTitleMusic
+        None = 0
+        RCT1
+        RCT2
+    End Enum
+
+    Enum EnumSoundQuality
+        Low = 0
+        Medium
+        High
+    End Enum
+
+    Public Shared HasChanged As Boolean
+
+    Public Shared ReadOnly DefPlayIntro = False
+    Public Shared ReadOnly DefConfirmationPrompt = False
+    Public Shared ReadOnly DefScreenshotFormat = EnumScreenshotFormat.PNG
+    Public Shared ReadOnly DefGamePath = ""
+    Public Shared ReadOnly DefMeasurementFormat = EnumMeasurementFormat.Imperial
+    Public Shared ReadOnly DefTemperatureFormat = EnumTemperatureFormat.Celsius
+    Public Shared ReadOnly DefCurrencyFormat = EnumCurrencyFormat.Pounds
+    Public Shared ReadOnly DefEdgeScrolling = True
+    Public Shared ReadOnly DefAlwaysShowGridlines = False
+    Public Shared ReadOnly DefLandscapeSmoothing = True
+    Public Shared ReadOnly DefShowHeightAsUnits = False
+    Public Shared ReadOnly DefSavePluginData = True
+    Public Shared ReadOnly DefFullscreenMode = EnumFullscreenMode.Window
+    Public Shared ReadOnly DefFullscreenWidth = -1
+    Public Shared ReadOnly DefFullscreenHeight = -1
+    Public Shared ReadOnly DefLanguage = EnumLanguage.EnglishUK
+    Public Shared ReadOnly DefTitleMusic = EnumTitleMusic.RCT2
+    Public Shared ReadOnly DefSoundQuality = EnumSoundQuality.Low
+    Public Shared ReadOnly DefForcedSoftwareBuffering = False
+
+    Public Shared PlayIntro As Boolean
+    Public Shared ConfirmationPrompt As Boolean
+    Public Shared ScreenshotFormat As EnumScreenshotFormat
+    Public Shared GamePath As String
+    Public Shared MeasurementFormat As EnumMeasurementFormat
+    Public Shared TemperatureFormat As EnumTemperatureFormat
+    Public Shared CurrencyFormat As EnumCurrencyFormat
+    Public Shared EdgeScrolling As Boolean
+    Public Shared AlwaysShowGridlines As Boolean
+    Public Shared LandscapeSmoothing As Boolean
+    Public Shared ShowHeightAsUnits As Boolean
+    Public Shared SavePluginData As Boolean
+    Public Shared FullscreenMode As EnumFullscreenMode
+    Public Shared FullscreenWidth As Integer
+    Public Shared FullscreenHeight As Integer
+    Public Shared Language As EnumLanguage
+    Public Shared TitleMusic As EnumTitleMusic
+    Public Shared SoundQuality As EnumSoundQuality
+    Public Shared ForcedSoftwareBuffering As Boolean
+
+    Shared INIConfig As New IniConfiguration
+
+    Public Shared Sub Load(File As String)
+        Dim Number As Integer
+
+        HasChanged = False
+
+        Try
+            INIConfig = New IniConfiguration(File)
+        Catch ex As Exception
+            PlayIntro = DefPlayIntro
+            ConfirmationPrompt = DefConfirmationPrompt
+            ScreenshotFormat = DefScreenshotFormat
+            GamePath = DefGamePath
+            MeasurementFormat = DefMeasurementFormat
+            TemperatureFormat = DefTemperatureFormat
+            CurrencyFormat = DefCurrencyFormat
+            EdgeScrolling = DefEdgeScrolling
+            AlwaysShowGridlines = DefAlwaysShowGridlines
+            LandscapeSmoothing = DefLandscapeSmoothing
+            ShowHeightAsUnits = DefShowHeightAsUnits
+            SavePluginData = DefSavePluginData
+            FullscreenMode = DefFullscreenMode
+            FullscreenWidth = DefFullscreenWidth
+            FullscreenHeight = DefFullscreenHeight
+            Language = DefLanguage
+            TitleMusic = DefTitleMusic
+            SoundQuality = DefSoundQuality
+            ForcedSoftwareBuffering = DefForcedSoftwareBuffering
+            Return
+        End Try
+
+        PlayIntro = INIConfig.GetPropertyBoolean("general", "play_intro", DefPlayIntro)
+
+        ConfirmationPrompt = INIConfig.GetPropertyInt32("general", "confirmation_prompt", DefConfirmationPrompt)
+
+        Select Case INIConfig.GetProperty("general", "screenshot_format", DefScreenshotFormat)
+            Case "BMP"
+                ScreenshotFormat = EnumScreenshotFormat.BMP
+            Case "PNG"
+                ScreenshotFormat = EnumScreenshotFormat.PNG
+        End Select
+
+        GamePath = INIConfig.GetProperty("general", "game_path", DefGamePath)
+
+        Select Case INIConfig.GetProperty("general", "measurement_format", DefMeasurementFormat)
+            Case "IMPERIAL"
+                MeasurementFormat = EnumMeasurementFormat.Imperial
+            Case "METRIC"
+                MeasurementFormat = EnumMeasurementFormat.Metric
+        End Select
+
+        Select Case INIConfig.GetProperty("general", "temperature_format", DefTemperatureFormat)
+            Case "CELSIUS"
+                TemperatureFormat = EnumTemperatureFormat.Celsius
+            Case "FAHRENHEIT"
+                TemperatureFormat = EnumTemperatureFormat.Fahrenheit
+        End Select
+
+        Select Case INIConfig.GetProperty("general", "currency_format", DefCurrencyFormat)
+            Case "GBP"
+                CurrencyFormat = EnumCurrencyFormat.Pounds
+            Case "USD"
+                CurrencyFormat = EnumCurrencyFormat.Dollars
+            Case "FRF"
+                CurrencyFormat = EnumCurrencyFormat.Franc
+            Case "DEM"
+                CurrencyFormat = EnumCurrencyFormat.Deutschmark
+            Case "YEN"
+                CurrencyFormat = EnumCurrencyFormat.Yen
+            Case "ESP"
+                CurrencyFormat = EnumCurrencyFormat.Peseta
+            Case "ITL"
+                CurrencyFormat = EnumCurrencyFormat.Lira
+            Case "NLG"
+                CurrencyFormat = EnumCurrencyFormat.Guilders
+            Case "NOK"
+                CurrencyFormat = EnumCurrencyFormat.Krona
+            Case "SEK"
+                CurrencyFormat = EnumCurrencyFormat.Krona
+            Case "DEK"
+                CurrencyFormat = EnumCurrencyFormat.Krona
+            Case Chr(163)
+                CurrencyFormat = EnumCurrencyFormat.Pounds
+            Case Chr(36)
+                CurrencyFormat = EnumCurrencyFormat.Dollars
+            Case Chr(165)
+                CurrencyFormat = EnumCurrencyFormat.Yen
+            Case Chr(181)
+                CurrencyFormat = EnumCurrencyFormat.Euros
+        End Select
+
+        EdgeScrolling = INIConfig.GetPropertyBoolean("general", "edge_scrolling", DefEdgeScrolling)
+
+        AlwaysShowGridlines = INIConfig.GetPropertyBoolean("general", "always_show_gridlines", DefAlwaysShowGridlines)
+
+        LandscapeSmoothing = INIConfig.GetPropertyBoolean("general", "landscape_smoothing", DefLandscapeSmoothing)
+
+        ShowHeightAsUnits = INIConfig.GetPropertyBoolean("general", "show_height_as_units", DefShowHeightAsUnits)
+
+        SavePluginData = INIConfig.GetPropertyBoolean("general", "save_plugin_data", DefSavePluginData)
+
+        Number = INIConfig.GetPropertyInt32("general", "fullscreen_mode", DefFullscreenMode)
+
+        If Number >= 0 And Number <= 2 Then
+            FullscreenMode = Number
+        End If
+
+        FullscreenWidth = INIConfig.GetPropertyInt32("general", "fullscreen_width", DefFullscreenWidth)
+
+        FullscreenHeight = INIConfig.GetPropertyInt32("general", "fullscreen_height", DefFullscreenHeight)
+
+        Select Case INIConfig.GetProperty("general", "language", DefLanguage)
+            Case "en-GB"
+                Language = EnumLanguage.EnglishUK
+            Case "en-US"
+                Language = EnumLanguage.EnglishUS
+            Case "de-DE"
+                Language = EnumLanguage.German
+            Case "nl-NL"
+                Language = EnumLanguage.Dutch
+            Case "fr-FR"
+                Language = EnumLanguage.French
+            Case "hu-HU"
+                Language = EnumLanguage.Hungarian
+            Case "pl-PL"
+                Language = EnumLanguage.Polish
+            Case "es-ES"
+                Language = EnumLanguage.Spanish
+            Case "sv-SE"
+                Language = EnumLanguage.Swedish
+        End Select
+
+        Number = INIConfig.GetPropertyInt32("sound", "title_music", DefTitleMusic)
+
+        If Number >= 0 And Number <= 2 Then
+            TitleMusic = Number
+        End If
+
+        Number = INIConfig.GetPropertyInt32("sound", "sound_quality", DefSoundQuality)
+
+        If Number >= 0 And Number <= 2 Then
+            SoundQuality = Number
+        End If
+
+        ForcedSoftwareBuffering = INIConfig.GetPropertyBoolean("sound", "forced_software_buffering", DefForcedSoftwareBuffering)
+    End Sub
+
+    Public Shared Async Function Save(File As String) As Task
+        If PlayIntro Then
+            INIConfig.SetProperty("general", "play_intro", "true")
+        Else
+            INIConfig.SetProperty("general", "play_intro", "false")
+        End If
+
+        INIConfig.SetProperty("general", "confirmation_prompt", Convert.ToInt32(ConfirmationPrompt))
+
+        Select Case ScreenshotFormat
+            Case EnumScreenshotFormat.BMP
+                INIConfig.SetProperty("general", "screenshot_format", "BMP")
+            Case EnumScreenshotFormat.PNG
+                INIConfig.SetProperty("general", "screenshot_format", "PNG")
+        End Select
+
+        INIConfig.SetProperty("general", "game_path", GamePath)
+
+        Select Case MeasurementFormat
+            Case EnumMeasurementFormat.Imperial
+                INIConfig.SetProperty("general", "measurement_format", "IMPERIAL")
+            Case EnumMeasurementFormat.Metric
+                INIConfig.SetProperty("general", "measurement_format", "METRIC")
+        End Select
+
+        Select Case TemperatureFormat
+            Case EnumTemperatureFormat.Celsius
+                INIConfig.SetProperty("general", "temperature_format", "CELSIUS")
+            Case EnumTemperatureFormat.Fahrenheit
+                INIConfig.SetProperty("general", "temperature_format", "FAHRENHEIT")
+        End Select
+
+        Select Case CurrencyFormat
+            Case EnumCurrencyFormat.Pounds
+                INIConfig.SetProperty("general", "currency_format", "GBP")
+            Case EnumCurrencyFormat.Dollars
+                INIConfig.SetProperty("general", "currency_format", "USD")
+            Case EnumCurrencyFormat.Franc
+                INIConfig.SetProperty("general", "currency_format", "FRF")
+            Case EnumCurrencyFormat.Deutschmark
+                INIConfig.SetProperty("general", "currency_format", "DEM")
+            Case EnumCurrencyFormat.Yen
+                INIConfig.SetProperty("general", "currency_format", "YEN")
+            Case EnumCurrencyFormat.Peseta
+                INIConfig.SetProperty("general", "currency_format", "ESP")
+            Case EnumCurrencyFormat.Lira
+                INIConfig.SetProperty("general", "currency_format", "ITL")
+            Case EnumCurrencyFormat.Guilders
+                INIConfig.SetProperty("general", "currency_format", "NLG")
+            Case EnumCurrencyFormat.Krona
+                INIConfig.SetProperty("general", "currency_format", "NOK")
+            Case EnumCurrencyFormat.Euros
+                INIConfig.SetProperty("general", "currency_format", "EUR")
+        End Select
+
+        If EdgeScrolling Then
+            INIConfig.SetProperty("general", "edge_scrolling", "true")
+        Else
+            INIConfig.SetProperty("general", "edge_scrolling", "false")
+        End If
+
+        If AlwaysShowGridlines Then
+            INIConfig.SetProperty("general", "always_show_gridlines", "true")
+        Else
+            INIConfig.SetProperty("general", "always_show_gridlines", "false")
+        End If
+
+        If LandscapeSmoothing Then
+            INIConfig.SetProperty("general", "landscape_smoothing", "true")
+        Else
+            INIConfig.SetProperty("general", "landscape_smoothing", "false")
+        End If
+
+        If ShowHeightAsUnits Then
+            INIConfig.SetProperty("general", "show_height_as_units", "true")
+        Else
+            INIConfig.SetProperty("general", "show_height_as_units", "false")
+        End If
+
+        If SavePluginData Then
+            INIConfig.SetProperty("general", "save_plugin_data", "true")
+        Else
+            INIConfig.SetProperty("general", "save_plugin_data", "false")
+        End If
+
+        INIConfig.SetProperty("general", "fullscreen_mode", FullscreenMode)
+
+        INIConfig.SetProperty("general", "fullscreen_width", FullscreenWidth.ToString())
+
+        INIConfig.SetProperty("general", "fullscreen_height", FullscreenHeight.ToString())
+
+        Select Case Language
+            Case EnumLanguage.EnglishUK
+                INIConfig.SetProperty("general", "language", "en-GB")
+            Case EnumLanguage.EnglishUS
+                INIConfig.SetProperty("general", "language", "en-US")
+            Case EnumLanguage.German
+                INIConfig.SetProperty("general", "language", "de-DE")
+            Case EnumLanguage.Dutch
+                INIConfig.SetProperty("general", "language", "nl-NL")
+            Case EnumLanguage.French
+                INIConfig.SetProperty("general", "language", "fr-FR")
+            Case EnumLanguage.Hungarian
+                INIConfig.SetProperty("general", "language", "hu-HU")
+            Case EnumLanguage.Polish
+                INIConfig.SetProperty("general", "language", "pl-PL")
+            Case EnumLanguage.Spanish
+                INIConfig.SetProperty("general", "language", "es-ES")
+            Case EnumLanguage.Swedish
+                INIConfig.SetProperty("general", "language", "sv-SE")
+        End Select
+
+        INIConfig.SetProperty("sound", "title_music", TitleMusic)
+
+        INIConfig.SetProperty("sound", "sound_quality", SoundQuality)
+
+        If ForcedSoftwareBuffering Then
+            INIConfig.SetProperty("sound", "forced_software_buffering", "true")
+        Else
+            INIConfig.SetProperty("sound", "forced_software_buffering", "false")
+        End If
+
+        Try
+            Await INIConfig.Save(File)
+        Catch ex As Exception
+            MessageBox.Show("Error in OpenRCT2Config.Save:" + vbCrLf + ex.Message)
+        End Try
+    End Function
+End Class
+
+Imports HelperLibrary.Classes
+Imports Launcher.Forms
+Imports Launcher.My
+Imports Launcher.My.Resources
+Imports Launcher.OpenRCTdotNet
+Imports Microsoft.Win32
+Imports System.IO
+Imports System.IO.Compression
+Imports System.Net
+
+Public Class frmLauncher
+    Const LauncherVer As Integer = 4 'Increment this and then we can release updates on Openrct.net
+
+    Private Sub frmLauncher_Load(sender As Object, e As EventArgs) Handles MyBase.Load
+        'Check for updates
+        CheckForIllegalCrossThreadCalls = False
+
+        OpenRCT2Config.Load(Constants.OpenRCT2ConfigFile)
+
+        Settings.HasChanged = False
+
+        Task.Run(DirectCast(Async Sub() Await LauncherUpdate(), Action))
+        Task.Run(DirectCast(Async Sub() Await GameUpdate(False), Action))
+
+        cmdLaunchGame.Enabled = Directory.Exists(OpenRCT2Config.GamePath)
+
+        PictureBox1.SizeMode = PictureBoxSizeMode.Zoom
+        PictureBox1.Image = Logo
+        Icon = OpenRCTIcon
+
+        'If the OpenRCT2 folder doesn't exist, create it
+        If Directory.Exists(Constants.OpenRCT2Folder) = False Then
+            Directory.CreateDirectory(Constants.OpenRCT2Folder)
+        End If
+
+        'If the programm couldn't find the path look for it in the registry
+        If String.IsNullOrEmpty(OpenRCT2Config.GamePath) Then
+            Try
+                OpenRCT2Config.GamePath = Registry.LocalMachine.OpenSubKey("Software\Infogrames\rollercoaster tycoon 2 setup").GetValue("Path")
+                OpenRCT2Config.HasChanged = True
+            Catch ex As Exception
+                MsgBox(frmLauncher_Load_neverRun)
+            End Try
+        End If
+
+        If My.Computer.Keyboard.AltKeyDown Then
+            Me.Text = Settings.LocalVersion
+        End If
+
+
+        If Settings.OpenRCTdotNetUserID <> Nothing Then
+            'Add code here for Stats etc.
+        End If
+    End Sub
+
+    Private Async Sub cmdLaunchGame_Click(sender As Object, e As EventArgs) Handles cmdLaunchGame.Click
+        If File.Exists(Constants.OpenRCT2Exe) And File.Exists(Constants.OpenRCT2Dll) Then
+            Dim launchProcess As New ProcessStartInfo
+
+            'Redirect output if needed
+            If Settings.SaveOutput Then
+                If Directory.Exists(Path.GetDirectoryName(Settings.OutputPath)) Then
+                    launchProcess.RedirectStandardOutput = True
+                    launchProcess.RedirectStandardError = True
+                    launchProcess.UseShellExecute = False
+                End If
+            End If
+
+            launchProcess.WorkingDirectory = Constants.OpenRCT2Bin     'OpenRCT2's Executibles will be stored here, so we make this the working dir.
+            launchProcess.FileName = Constants.OpenRCT2Exe                  'The EXE of course.
+
+            If Settings.Verbose Then
+                launchProcess.Arguments += "--verbose"
+            End If
+
+            If Settings.Arguments <> "" Then
+                If launchProcess.Arguments <> "" Then 'Add space to arguments
+                    launchProcess.Arguments += " "
+                End If
+
+                launchProcess.Arguments += Settings.Arguments
+            End If
+
+            'Save before starting the *.exe to prevent it from failing to load
+            If Settings.HasChanged Then
+                Settings.HasChanged = False
+                Settings.Save()
+            End If
+
+            If OpenRCT2Config.HasChanged Then
+                Await OpenRCT2Config.Save(Constants.OpenRCT2ConfigFile)
+                OpenRCT2Config.HasChanged = False
+            End If
+
+            Dim process As Process = process.Start(launchProcess)
+
+            'Start new thread for saving the output of the *.exe
+            If Settings.SaveOutput Then
+                If Directory.Exists(Path.GetDirectoryName(Settings.OutputPath)) Then
+                    Await WriteOutput(process)
+                End If
+            End If
+
+
+            'THIS NEEDS TO REMAIN LAST BECAUSE IT HANDLES WHETHER WE NEED TO CLOSE!
+            If Settings.OpenRCTdotNetUploadTime = True Then
+                Visible = False
+                tmrUsedForUploadingTime.Enabled = True
+            Else
+                Close()
+            End If
+
+
+        Else
+            MsgBox(frmLauncher_launchGame_RCT2NotFound)
+
+            'Redownload
+            Await GameUpdate(True)
+        End If
+    End Sub
+
+    Private Sub cmdOptions_Click(sender As Object, e As EventArgs) Handles cmdOptions.Click
+        FrmOptions.ShowDialog()
+
+        cmdLaunchGame.Enabled = Directory.Exists(OpenRCT2Config.GamePath)
+    End Sub
+
+    Private Sub cmdExtras_Click(sender As Object, e As EventArgs) Handles cmdExtras.Click
+        Extras.ShowDialog()
+    End Sub
+
+    Private Sub frmLauncher_FormClosing(sender As Object, e As FormClosingEventArgs) Handles Me.FormClosing
+        'Save changes
+        If Settings.HasChanged Then
+            Settings.HasChanged = False
+            Settings.Save()
+        End If
+    End Sub
+
+    Private Async Function WriteOutput(process As Process) As Task
+        Dim out As String = Await process.StandardOutput.ReadToEndAsync() 'I need to use Async here because it crashes the game if I won't use it
+        Dim e As String = Await process.StandardError.ReadToEndAsync()
+    End Function
+End Class

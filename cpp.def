@@ -1,0 +1,5176 @@
+#include "childprocess.h"
+
+//
+// ChildProcessContext
+//
+
+ChildProcessContext::ChildProcessContext(QObject *parent)
+    : QObject(parent)
+    , m_proc(this)
+{
+    connect(&m_proc, SIGNAL(readyReadStandardOutput()), this, SLOT(_readyReadStandardOutput()));
+    connect(&m_proc, SIGNAL(readyReadStandardError()), this, SLOT(_readyReadStandardError()));
+    connect(&m_proc, SIGNAL(finished(int, QProcess::ExitStatus)), this, SLOT(_finished(int, QProcess::ExitStatus)));
+    connect(&m_proc, SIGNAL(error(QProcess::ProcessError)), this, SLOT(_error(QProcess::ProcessError)));
+}
+
+ChildProcessContext::~ChildProcessContext()
+{
+}
+
+// public:
+
+qint64 ChildProcessContext::pid() const
+{
+    Q_PID pid = m_proc.pid();
+
+#if !defined(Q_OS_WIN32) && !defined(Q_OS_WINCE)
+    return pid;
+#else
+    return pid->dwProcessId;
+#endif
+}
+
+void ChildProcessContext::kill(const QString &signal)
+{
+    // TODO: it would be nice to be able to handle more signals
+    if ("SIGKILL" == signal) {
+        m_proc.kill();
+    } else {
+        // Default to "SIGTERM"
+        m_proc.terminate();
+    }
+}
+
+void ChildProcessContext::_setEncoding(const QString &encoding)
+{
+    m_encoding.setEncoding(encoding);
+}
+
+// This is affected by [QTBUG-5990](https://bugreports.qt-project.org/browse/QTBUG-5990).
+// `QProcess` doesn't properly handle the situations of `cmd` not existing or
+// failing to start...
+bool ChildProcessContext::_start(const QString &cmd, const QStringList &args)
+{
+    m_proc.start(cmd, args);
+    // TODO: Is there a better way to do this???
+    return m_proc.waitForStarted(1000);
+}
+
+// private slots:
+
+void ChildProcessContext::_readyReadStandardOutput()
+{
+    QByteArray bytes = m_proc.readAllStandardOutput();
+    emit stdoutData(m_encoding.decode(bytes));
+}
+
+void ChildProcessContext::_readyReadStandardError()
+{
+    QByteArray bytes = m_proc.readAllStandardError();
+    emit stderrData(m_encoding.decode(bytes));
+}
+
+void ChildProcessContext::_finished(const int exitCode, const QProcess::ExitStatus exitStatus)
+{
+    Q_UNUSED(exitStatus)
+
+    emit exit(exitCode);
+}
+
+void ChildProcessContext::_error(const QProcess::ProcessError error)
+{
+    Q_UNUSED(error)
+
+    emit exit(m_proc.exitCode());
+}
+
+
+//
+// ChildProcess
+//
+
+ChildProcess::ChildProcess(QObject *parent)
+    : QObject(parent)
+{
+}
+
+ChildProcess::~ChildProcess()
+{
+}
+
+// public:
+
+QObject *ChildProcess::_createChildProcessContext()
+{
+    return new ChildProcessContext(this);
+}
+
+#ifndef CHILDPROCESS_H
+#define CHILDPROCESS_H
+
+#include <QObject>
+#include <QProcess>
+
+#ifdef Q_OS_WIN32
+#include <QtCore/qt_windows.h>
+#endif
+
+#include "encoding.h"
+
+/**
+ * This class wraps a QProcess and facilitates emulation of node.js's ChildProcess
+ */
+class ChildProcessContext : public QObject
+{
+    Q_OBJECT
+    Q_PROPERTY(qint64 pid READ pid)
+
+public:
+    explicit ChildProcessContext(QObject *parent = 0);
+    virtual ~ChildProcessContext();
+
+    qint64 pid() const;
+    Q_INVOKABLE void kill(const QString &signal = "SIGTERM");
+
+    Q_INVOKABLE void _setEncoding(const QString &encoding);
+    Q_INVOKABLE bool _start(const QString &cmd, const QStringList &args);
+
+signals:
+    void exit(const int code) const;
+
+    /**
+     * For emulating `child.stdout.on("data", function (data) {})`
+     */
+    void stdoutData(const QString &data) const;
+    /**
+     * For emulating `child.stderr.on("data", function (data) {})`
+     */
+    void stderrData(const QString &data) const;
+
+private slots:
+    void _readyReadStandardOutput();
+    void _readyReadStandardError();
+    void _error(const QProcess::ProcessError error);
+    void _finished(const int exitCode, const QProcess::ExitStatus exitStatus);
+
+private:
+    QProcess m_proc;
+    Encoding m_encoding;
+};
+
+/**
+ * Helper class for child_process module
+ */
+class ChildProcess : public QObject
+{
+    Q_OBJECT
+
+public:
+    explicit ChildProcess(QObject *parent = 0);
+    virtual ~ChildProcess();
+
+    Q_INVOKABLE QObject *_createChildProcessContext();
+};
+
+#endif // CHILDPROCESS_H
+
+#ifdef _WIN32
+#define NOMINMAX
+#endif
+
+#include "consts.h"
+#include "utils.h"
+#include "env.h"
+#include "phantom.h"
+#include "crashdump.h"
+
+#include <QApplication>
+#include <QSslSocket>
+#include <QIcon>
+
+int main(int argc, char** argv)
+{
+    CrashHandler crash_guard;
+    QApplication app(argc, argv);
+
+    app.setWindowIcon(QIcon(":/phantomjs-icon.png"));
+    app.setApplicationName("PhantomJS");
+    app.setOrganizationName("Ofi Labs");
+    app.setOrganizationDomain("www.ofilabs.com");
+    app.setApplicationVersion(PHANTOMJS_VERSION_STRING);
+
+    // Registering an alternative Message Handler
+    qInstallMessageHandler(Utils::messageHandler);
+
+#if defined(Q_OS_LINUX)
+    if (QSslSocket::supportsSsl()) {
+        // Don't perform on-demand loading of root certificates on Linux
+        QSslSocket::addDefaultCaCertificates(QSslSocket::systemCaCertificates());
+    }
+#endif
+
+    // Get the Phantom singleton
+    Phantom *phantom = Phantom::instance();
+
+    // Start script execution
+    if (phantom->execute()) {
+        app.exec();
+    }
+
+    // End script execution: delete the phantom singleton and set execution return value
+    int retVal = phantom->returnValue();
+    delete phantom;
+    return retVal;
+}
+
+#ifndef FILESYSTEM_H
+#define FILESYSTEM_H
+
+#include <QStringList>
+#include <QFile>
+#include <QTextCodec>
+#include <QTextStream>
+#include <QVariant>
+
+class File : public QObject
+{
+    Q_OBJECT
+
+public:
+    // handle a textfile with given codec
+    // if @p codec is null, the file is considered to be binary
+    File(QFile *openfile, QTextCodec *codec, QObject *parent = 0);
+    virtual ~File();
+
+public slots:
+    /**
+     * @param n Number of bytes to read (a negative value means read up to EOF)
+     * NOTE: The use of QVariant here is necessary to catch JavaScript `null`.
+     * @see <a href="http://wiki.commonjs.org/wiki/IO/A#Instance_Methods">IO/A spec</a>
+     */
+    QString read(const QVariant &n = -1);
+    bool write(const QString &data);
+
+    bool seek(const qint64 pos);
+
+    QString readLine();
+    bool writeLine(const QString &data);
+
+    bool atEnd() const;
+    void flush();
+    void close();
+
+    QString getEncoding() const;
+    bool setEncoding(const QString &encoding);
+
+private:
+    bool _isUnbuffered() const;
+
+    QFile *m_file;
+    QTextStream *m_fileStream;
+};
+
+
+class FileSystem : public QObject
+{
+    Q_OBJECT
+    Q_PROPERTY(QString workingDirectory READ workingDirectory)
+    Q_PROPERTY(QString separator READ separator)
+
+public:
+    FileSystem(QObject *parent = 0);
+
+public slots:
+    // Attributes
+    // 'size(path)' implemented in "filesystem-shim.js" using '_size(path)'
+    int _size(const QString &path) const;
+    QVariant lastModified(const QString &path) const;
+
+    // Directory
+    // 'copyTree(source, destination)' implemented in "filesystem-shim.js" using '_copyTree(source, destination)'
+    bool _copyTree(const QString &source, const QString &destination) const;
+    bool makeDirectory(const QString &path) const;
+    bool makeTree(const QString &path) const;
+    // 'removeDirectory(path)' implemented in "filesystem-shim.js" using '_removeDirectory(path)'
+    bool _removeDirectory(const QString &path) const;
+    // 'removeTree(path)' implemented in "filesystem-shim.js" using '_removeTree(path)'
+    bool _removeTree(const QString &path) const;
+
+    // Files
+    // 'open(path, mode|options)' implemented in "filesystem-shim.js" using '_open(path, opts)'
+    QObject *_open(const QString &path, const QVariantMap &opts) const;
+    // 'read(path, options)' implemented in "filesystem-shim.js"
+    // 'readRaw(path, options)' implemented in "filesystem-shim.js"
+    // 'write(path, mode|options)' implemented in the "filesystem-shim.js"
+    // 'writeRaw(path, mode|options)' implemented in the "filesystem-shim.js"
+    // 'remove(path)' implemented in "filesystem-shim.js" using '_remove(path)'
+    bool _remove(const QString &path) const;
+    // 'copy(source, destination)' implemented in "filesystem-shim.js" using '_copy(source, destination)'
+    bool _copy(const QString &source, const QString &destination) const;
+    // 'move(source, destination)' implemented in "filesystem-shim.js"
+    // 'touch(path)' implemented in "filesystem-shim.js"
+
+    // Listing
+    QStringList list(const QString &path) const;
+
+    // Paths
+    QString separator() const;
+    QString workingDirectory() const;
+    bool changeWorkingDirectory(const QString &path) const;
+    QString absolute(const QString &relativePath) const;
+    // 'join(...)' implemented in "fs.js"
+    // 'split(path)' implemented in "fs.js"
+    QString fromNativeSeparators(const QString &path) const;
+    QString toNativeSeparators(const QString &path) const;
+
+    // Links
+    QString readLink(const QString &path) const;
+
+    // Tests
+    bool exists(const QString &path) const;
+    bool isDirectory(const QString &path) const;
+    bool isFile(const QString &path) const;
+    bool isAbsolute(const QString &path) const;
+    bool isExecutable(const QString &path) const;
+    bool isReadable(const QString &path) const;
+    bool isWritable(const QString &path) const;
+    bool isLink(const QString &path) const;
+};
+
+#endif // FILESYSTEM_H
+
+#include "filesystem.h"
+
+#include <QFile>
+#include <QFileInfo>
+#include <QDir>
+#include <QDebug>
+#include <QDateTime>
+
+// File
+// public:
+File::File(QFile *openfile, QTextCodec *codec, QObject *parent) :
+    QObject(parent),
+    m_file(openfile),
+    m_fileStream(0)
+{
+    if ( codec ) {
+        m_fileStream = new QTextStream(m_file);
+        m_fileStream->setCodec(codec);
+    }
+}
+
+File::~File()
+{
+    this->close();
+}
+
+//NOTE: for binary files we want to use QString instead of QByteArray as the
+//      latter is not really useable in javascript and e.g. window.btoa expects a string
+//      and we need special code required since fromAsci() would stop as soon as it
+//      encounters \0 or similar
+
+// public slots:
+QString File::read(const QVariant &n)
+{
+    // Default to 1024 (used when n is "null")
+    qint64 bytesToRead = 1024;
+
+    // If parameter can be converted to a qint64, do so and use that value instead
+    if (n.canConvert(QVariant::LongLong)) {
+        bytesToRead = n.toLongLong();
+    }
+
+    const bool isReadAll = 0 > bytesToRead;
+
+    if ( !m_file->isReadable() ) {
+        qDebug() << "File::read - " << "Couldn't read:" << m_file->fileName();
+        return QString();
+    }
+    if ( m_file->isWritable() ) {
+        // make sure we write everything to disk before reading
+        flush();
+    }
+    if ( m_fileStream ) {
+        // text file
+        QString ret;
+        if (isReadAll) {
+            // This code, for some reason, reads the whole file from 0 to EOF,
+            // and then resets to the position the file was at prior to reading
+            const qint64 pos = m_fileStream->pos();
+            m_fileStream->seek(0);
+            ret = m_fileStream->readAll();
+            m_fileStream->seek(pos);
+        } else {
+            ret = m_fileStream->read(bytesToRead);
+        }
+        return ret;
+    } else {
+        // binary file
+        QByteArray data;
+        if (isReadAll) {
+            // This code, for some reason, reads the whole file from 0 to EOF,
+            // and then resets to the position the file was at prior to reading
+            const qint64 pos = m_file->pos();
+            m_file->seek(0);
+            data = m_file->readAll();
+            m_file->seek(pos);
+        } else {
+            data = m_file->read(bytesToRead);
+        }
+        QString ret(data.size());
+        for(int i = 0; i < data.size(); ++i) {
+            ret[i] = data.at(i);
+        }
+        return ret;
+    }
+}
+
+bool File::write(const QString &data)
+{
+    if ( !m_file->isWritable() ) {
+        qDebug() << "File::write - " << "Couldn't write:" << m_file->fileName();
+        return true;
+    }
+    if ( m_fileStream ) {
+        // text file
+        (*m_fileStream) << data;
+        if (_isUnbuffered()) {
+            m_fileStream->flush();
+        }
+        return true;
+    } else {
+        // binary file
+        QByteArray bytes(data.size(), Qt::Uninitialized);
+        for(int i = 0; i < data.size(); ++i) {
+            bytes[i] = data.at(i).toLatin1();
+        }
+        return m_file->write(bytes);
+    }
+}
+
+bool File::seek(const qint64 pos)
+{
+    if (m_fileStream) {
+        return m_fileStream->seek(pos);
+    } else {
+        return m_file->seek(pos);
+    }
+}
+
+QString File::readLine()
+{
+    if ( !m_file->isReadable() ) {
+        qDebug() << "File::readLine - " << "Couldn't read:" << m_file->fileName();
+        return QString();
+    }
+    if ( m_file->isWritable() ) {
+        // make sure we write everything to disk before reading
+        flush();
+    }
+    if ( m_fileStream ) {
+        // text file
+        return m_fileStream->readLine();
+    } else {
+        // binary file - doesn't make much sense but well...
+        return QString::fromLatin1(m_file->readLine());
+    }
+}
+
+bool File::writeLine(const QString &data)
+{
+    if ( write(data) && write("\n") ) {
+        return true;
+    }
+    qDebug() << "File::writeLine - " << "Couldn't write:" << m_file->fileName();
+    return false;
+}
+
+bool File::atEnd() const
+{
+    if ( m_file->isReadable() ) {
+        if (m_fileStream) {
+            // text file
+            return m_fileStream->atEnd();
+        } else {
+            // binary file
+            return m_file->atEnd();
+        }
+    }
+    qDebug() << "File::atEnd - " << "Couldn't read:" << m_file->fileName();
+    return false;
+}
+
+void File::flush()
+{
+    if ( m_file ) {
+        if ( m_fileStream ) {
+            // text file
+            m_fileStream->flush();
+        }
+        // binary or text file
+        m_file->flush();
+    }
+}
+
+void File::close()
+{
+    flush();
+    if ( m_fileStream ) {
+        delete m_fileStream;
+        m_fileStream = 0;
+    }
+    if ( m_file ) {
+        m_file->close();
+        delete m_file;
+        m_file = NULL;
+    }
+    deleteLater();
+}
+
+bool File::setEncoding(const QString &encoding) {
+    if (encoding.isEmpty() || encoding.isNull()) {
+        return false;
+    }
+
+    // "Binary" mode doesn't use/need text codecs
+    if ((QTextStream *)NULL == m_fileStream) {
+        // TODO: Should we switch to "text" mode?
+        return false;
+    }
+
+    // Since there can be multiple names for the same codec (i.e., "utf8" and
+    // "utf-8"), we need to get the codec in the system first and use its
+    // canonical name
+    QTextCodec *codec = QTextCodec::codecForName(encoding.toLatin1());
+    if ((QTextCodec *)NULL == codec) {
+      return false;
+    }
+
+    // Check whether encoding actually needs to be changed
+    const QString encodingBeforeUpdate(m_fileStream->codec()->name());
+    if (0 == encodingBeforeUpdate.compare(QString(codec->name()), Qt::CaseInsensitive)) {
+        return false;
+    }
+
+    m_fileStream->setCodec(codec);
+
+    // Return whether update was successful
+    const QString encodingAfterUpdate(m_fileStream->codec()->name());
+    return 0 != encodingBeforeUpdate.compare(encodingAfterUpdate, Qt::CaseInsensitive);
+}
+
+QString File::getEncoding() const
+{
+    QString encoding;
+
+    if ((QTextStream *)NULL != m_fileStream) {
+        encoding = QString(m_fileStream->codec()->name());
+    }
+
+    return encoding;
+}
+
+// private:
+
+bool File::_isUnbuffered() const
+{
+    return m_file->openMode() & QIODevice::Unbuffered;
+}
+
+
+// FileSystem
+// public:
+FileSystem::FileSystem(QObject *parent)
+    : QObject(parent)
+{ }
+
+// public slots:
+
+// Attributes
+int FileSystem::_size(const QString &path) const
+{
+    QFileInfo fi(path);
+    if (fi.exists()) {
+        return fi.size();
+    }
+    return -1;
+}
+
+QVariant FileSystem::lastModified(const QString &path) const
+{
+    QFileInfo fi(path);
+    if (fi.exists()) {
+        return QVariant(fi.lastModified());
+    }
+    return QVariant(QDateTime());
+}
+
+// Links
+QString FileSystem::readLink(const QString &path) const
+{
+    return QFileInfo(path).symLinkTarget();
+}
+
+// Tests
+bool FileSystem::exists(const QString &path) const
+{
+    return QFile::exists(path);
+}
+
+bool FileSystem::isDirectory(const QString &path) const
+{
+    return QFileInfo(path).isDir();
+}
+
+bool FileSystem::isFile(const QString &path) const
+{
+    return QFileInfo(path).isFile();
+}
+
+bool FileSystem::isAbsolute(const QString &path) const {
+   return QFileInfo(path).isAbsolute();
+}
+
+bool FileSystem::isExecutable(const QString &path) const {
+   return QFileInfo(path).isExecutable();
+}
+
+bool FileSystem::isLink(const QString &path) const {
+   return QFileInfo(path).isSymLink();
+}
+
+bool FileSystem::isReadable(const QString &path) const {
+   return QFileInfo(path).isReadable();
+}
+
+bool FileSystem::isWritable(const QString &path) const {
+   return QFileInfo(path).isWritable();
+}
+
+// Directory
+bool FileSystem::_copyTree(const QString &source, const QString &destination) const {
+    QDir sourceDir(source);
+    QDir::Filters sourceDirFilter = QDir::NoDotAndDotDot | QDir::AllDirs | QDir::Files | QDir::NoSymLinks | QDir::Drives;
+
+    if (sourceDir.exists()) {
+        // Make the destination directory if it doesn't exist already
+        if (!FileSystem::exists(destination) && !FileSystem::makeDirectory(destination)) {
+            return false;
+        }
+
+        foreach(QFileInfo entry, sourceDir.entryInfoList(sourceDirFilter, QDir::DirsFirst)) {
+            if (entry.isDir()) {
+                if (!FileSystem::_copyTree(entry.absoluteFilePath(),
+                            destination + "/" + entry.fileName())) { //< directory: recursive call
+                    return false;
+                }
+            } else {
+                if (!FileSystem::_copy(entry.absoluteFilePath(),
+                                destination + "/" + entry.fileName())) { //< file: copy
+                    return false;
+                }
+            }
+        }
+    }
+
+    return true;
+}
+
+bool FileSystem::makeDirectory(const QString &path) const
+{
+    return QDir().mkdir(path);
+}
+
+bool FileSystem::makeTree(const QString &path) const
+{
+    return QDir().mkpath(path);
+}
+
+bool FileSystem::_removeDirectory(const QString &path) const
+{
+    return QDir().rmdir(path);
+}
+
+bool FileSystem::_removeTree(const QString &path) const
+{
+    QDir dir(path);
+    QDir::Filters dirFilter = QDir::NoDotAndDotDot | QDir::System | QDir::Hidden | QDir::AllDirs | QDir::Files;
+
+    if (dir.exists()) {
+        foreach(QFileInfo info, dir.entryInfoList(dirFilter, QDir::DirsFirst)) {
+            if (info.isDir()) {
+                if (!FileSystem::_removeTree(info.absoluteFilePath())) { //< directory: recursive call
+                    return false;
+                }
+            } else {
+                if (!FileSystem::_remove(info.absoluteFilePath())) { //< file: remove
+                    return false;
+                }
+            }
+        }
+        if (!FileSystem::_removeDirectory(path)) { //< delete the top tree directory
+            return false;
+        }
+    }
+
+    return true;
+}
+
+QStringList FileSystem::list(const QString &path) const
+{
+    return QDir(path).entryList();
+}
+
+// Paths
+QString FileSystem::separator() const
+{
+    return QDir::separator();
+}
+
+QString FileSystem::workingDirectory() const
+{
+    return QDir::currentPath();
+}
+
+bool FileSystem::changeWorkingDirectory(const QString &path) const
+{
+    return QDir::setCurrent(path);
+}
+
+QString FileSystem::absolute(const QString &relativePath) const
+{
+    return QFileInfo(relativePath).absoluteFilePath();
+}
+
+QString FileSystem::fromNativeSeparators(const QString &path) const
+{
+    return QDir::fromNativeSeparators(path);
+}
+
+QString FileSystem::toNativeSeparators(const QString &path) const
+{
+    return QDir::toNativeSeparators(path);
+}
+
+// Files
+QObject *FileSystem::_open(const QString &path, const QVariantMap &opts) const
+{
+    qDebug() << "FileSystem - _open:" << path << opts;
+
+    const QVariant modeVar = opts["mode"];
+    // Ensure only strings
+    if (modeVar.type() != QVariant::String) {
+        qDebug() << "FileSystem::open - " << "Mode must be a string!" << modeVar;
+        return 0;
+    }
+
+    bool isBinary = false;
+    QFile::OpenMode modeCode = QFile::NotOpen;
+
+    // Determine the OpenMode
+    foreach(const QChar &c, modeVar.toString()) {
+        switch(c.toLatin1()) {
+        case 'r': case 'R': {
+            modeCode |= QFile::ReadOnly;
+            break;
+        }
+        case 'a': case 'A': case '+': {
+            modeCode |= QFile::Append;
+            modeCode |= QFile::WriteOnly;
+            break;
+        }
+        case 'w': case 'W': {
+            modeCode |= QFile::WriteOnly;
+            break;
+        }
+        case 'b': case 'B': {
+            isBinary = true;
+            break;
+        }
+        default: {
+            qDebug() << "FileSystem::open - " << "Wrong Mode:" << c;
+            return 0;
+        }
+        }
+    }
+
+    // Make sure the file exists OR it can be created at the required path
+    if ( !QFile::exists(path) && modeCode & QFile::WriteOnly ) {
+        if ( !makeTree(QFileInfo(path).dir().absolutePath()) ) {
+            qDebug() << "FileSystem::open - " << "Full path coulnd't be created:" << path;
+            return 0;
+        }
+    }
+
+    // Make sure there is something to read
+    if ( !QFile::exists(path) && modeCode & QFile::ReadOnly ) {
+        qDebug() << "FileSystem::open - " << "Trying to read a file that doesn't exist:" << path;
+        return 0;
+    }
+
+    QTextCodec *codec = 0;
+    if (!isBinary) {
+        // default to UTF-8 encoded files
+        const QString charset = opts.value("charset", "UTF-8").toString();
+        codec = QTextCodec::codecForName(charset.toLatin1());
+        if (!codec) {
+            qDebug() << "FileSystem::open - " << "Unknown charset:" << charset;
+            return 0;
+        }
+    }
+
+    // Try to Open
+    QFile* file = new QFile(path);
+    if ( !file->open(modeCode) ) {
+        // Return "NULL" if the file couldn't be opened as requested
+        delete file;
+        qDebug() << "FileSystem::open - " << "Couldn't be opened:" << path;
+        return 0;
+    }
+
+    return new File(file, codec);
+}
+
+bool FileSystem::_remove(const QString &path) const
+{
+    return QFile::remove(path);
+}
+
+bool FileSystem::_copy(const QString &source, const QString &destination) const {
+    return QFile(source).copy(destination);
+}
+
+#include "webpage.h"
+
+#include <math.h>
+
+#include <QApplication>
+#include <QDesktopServices>
+#include <QDateTime>
+#include <QDir>
+#include <QFileInfo>
+#include <QKeyEvent>
+#include <QMouseEvent>
+#include <QNetworkAccessManager>
+#include <QNetworkCookie>
+#include <QNetworkRequest>
+#include <QPainter>
+#include <QPrinter>
+#include <QWebHistory>
+#include <QWebHistoryItem>
+#include <QWebElement>
+#include <QWebFrame>
+#include <QWebPage>
+#include <QWebInspector>
+#include <QMapIterator>
+#include <QBuffer>
+#include <QDebug>
+#include <QImageWriter>
+#include <QUuid>
+
+#include "phantom.h"
+#include "networkaccessmanager.h"
+#include "utils.h"
+#include "config.h"
+#include "consts.h"
+#include "callback.h"
+#include "cookiejar.h"
+#include "system.h"
+
+#ifdef Q_OS_WIN32
+#include <io.h>
+#include <fcntl.h>
+#endif
+
+// Ensure we have at least head and body.
+#define BLANK_HTML                      "<html><head></head><body></body></html>"
+#define CALLBACKS_OBJECT_NAME           "_phantom"
+#define INPAGE_CALL_NAME                "window.callPhantom"
+#define CALLBACKS_OBJECT_INJECTION      INPAGE_CALL_NAME" = function() { return window."CALLBACKS_OBJECT_NAME".call.call(_phantom, Array.prototype.slice.call(arguments, 0)); };"
+#define CALLBACKS_OBJECT_PRESENT        "typeof(window."CALLBACKS_OBJECT_NAME") !== \"undefined\";"
+
+#define STDOUT_FILENAME "/dev/stdout"
+#define STDERR_FILENAME "/dev/stderr"
+
+
+/**
+  * @class CustomPage
+  */
+class CustomPage: public QWebPage
+{
+    Q_OBJECT
+
+public:
+    CustomPage(WebPage *parent = 0)
+        : QWebPage(parent)
+        , m_webPage(parent)
+    {
+        m_userAgent = QWebPage::userAgentForUrl(QUrl());
+        setForwardUnsupportedContent(true);
+    }
+
+    bool extension(Extension extension, const ExtensionOption* option, ExtensionReturn* output) {
+        Q_UNUSED(option);
+
+        if (extension == ChooseMultipleFilesExtension) {
+            static_cast<ChooseMultipleFilesExtensionReturn*>(output)->fileNames = m_uploadFiles;
+            return true;
+        } else {
+            return false;
+        }
+    }
+
+    void setCookieJar(CookieJar *cookieJar) {
+        m_cookieJar = cookieJar;
+    }
+
+public slots:
+    bool shouldInterruptJavaScript() {
+        m_webPage->javascriptInterrupt();
+
+        if (m_webPage->m_shouldInterruptJs) {
+
+            // reset our flag
+            m_webPage->m_shouldInterruptJs = false;
+            return true;
+        }
+        return false;
+    }
+
+protected:
+    bool supportsExtension(Extension extension) const {
+        return extension == ChooseMultipleFilesExtension;
+    }
+
+    QString chooseFile(QWebFrame *originatingFrame, const QString &oldFile) {
+        Q_UNUSED(originatingFrame);
+
+        // Check if User set a file via File Picker
+        QString chosenFile = m_webPage->filePicker(oldFile);
+        if (chosenFile == QString::null && m_uploadFiles.count() > 0) {
+            // Check if instead User set a file via uploadFile API
+            chosenFile = m_uploadFiles.first();
+        }
+
+        // Return the value coming from the "filePicker" callback, IFF not null.
+        qDebug() << "CustomPage - file chosen for upload:" << chosenFile;
+        return chosenFile;
+    }
+
+    void javaScriptAlert(QWebFrame *originatingFrame, const QString &msg) {
+        Q_UNUSED(originatingFrame);
+        emit m_webPage->javaScriptAlertSent(msg);
+    }
+
+    bool javaScriptConfirm(QWebFrame *originatingFrame, const QString &msg) {
+        Q_UNUSED(originatingFrame);
+        return m_webPage->javaScriptConfirm(msg);
+    }
+
+    bool javaScriptPrompt(QWebFrame *originatingFrame, const QString &msg, const QString &defaultValue, QString *result) {
+        Q_UNUSED(originatingFrame);
+        return m_webPage->javaScriptPrompt(msg, defaultValue, result);
+    }
+
+    void javaScriptConsoleMessage(const QString &message, int lineNumber, const QString &sourceID) {
+        Q_UNUSED(lineNumber);
+        Q_UNUSED(sourceID);
+        emit m_webPage->javaScriptConsoleMessageSent(message);
+    }
+
+    void javaScriptError(const QString &message, int lineNumber, const QString &sourceID, const QString &stack) {
+        emit m_webPage->javaScriptErrorSent(message, lineNumber, sourceID, stack);
+    }
+
+    QString userAgentForUrl(const QUrl &url) const {
+        Q_UNUSED(url);
+        return m_userAgent;
+    }
+
+    bool acceptNavigationRequest(QWebFrame *frame, const QNetworkRequest &request, QWebPage::NavigationType type) {
+        bool isMainFrame = (frame == m_webPage->m_mainFrame);
+
+        QString navigationType = "Undefined";
+        switch (type) {
+        case NavigationTypeLinkClicked:
+            navigationType = "LinkClicked";
+            break;
+        case NavigationTypeFormSubmitted:
+            navigationType = "FormSubmitted";
+            break;
+        case NavigationTypeBackOrForward:
+            navigationType = "BackOrForward";
+            break;
+        case NavigationTypeReload:
+            navigationType = "Reload";
+            break;
+        case NavigationTypeFormResubmitted:
+            navigationType = "FormResubmitted";
+            break;
+        case NavigationTypeOther:
+            navigationType = "Other";
+            break;
+        }
+        bool isNavigationLocked = m_webPage->navigationLocked();
+
+        emit m_webPage->navigationRequested(
+                    request.url(),                   //< Requested URL
+                    navigationType,                  //< Navigation Type
+                    !isNavigationLocked,             //< Will navigate (not locked)?
+                    isMainFrame);                    //< Is main frame?
+
+        return !isNavigationLocked;
+    }
+
+    QWebPage *createWindow (WebWindowType type) {
+        Q_UNUSED(type);
+        WebPage *newPage;
+
+        // Create a new "raw" WebPage object
+        if (m_webPage->ownsPages()) {
+            newPage = new WebPage(m_webPage);
+        } else {
+            newPage = new WebPage(Phantom::instance());
+            Phantom::instance()->m_pages.append(newPage);
+        }
+        newPage->setCookieJar(m_cookieJar);
+
+        // Apply default settings
+        newPage->applySettings(Phantom::instance()->defaultPageSettings());
+
+        // Signal JS shim to catch, decorate and store this new child page
+        emit m_webPage->rawPageCreated(newPage);
+
+        // Return the new QWebPage to the QWebKit backend
+        return newPage->m_customWebPage;
+    }
+
+private:
+    WebPage *m_webPage;
+    QString m_userAgent;
+    QStringList m_uploadFiles;
+    friend class WebPage;
+    CookieJar *m_cookieJar;
+};
+
+
+/**
+  * Contains the Callback Objects used to regulate callback-traffic from the webpage internal context.
+  * It's directly exposed within the webpage JS context,
+  * and indirectly in the phantom JS context.
+  *
+  * @class WebPageCallbacks
+  */
+class WebpageCallbacks : public QObject
+{
+    Q_OBJECT
+
+public:
+    WebpageCallbacks(QObject *parent = 0)
+        : QObject(parent)
+        , m_genericCallback(NULL)
+        , m_filePickerCallback(NULL)
+        , m_jsConfirmCallback(NULL)
+        , m_jsPromptCallback(NULL)
+        , m_jsInterruptCallback(NULL)
+    {
+    }
+
+    QObject *getGenericCallback() {
+        qDebug() << "WebpageCallbacks - getGenericCallback";
+
+        if (!m_genericCallback) {
+            m_genericCallback = new Callback(this);
+        }
+        return m_genericCallback;
+    }
+
+    QObject *getFilePickerCallback() {
+        qDebug() << "WebpageCallbacks - getFilePickerCallback";
+
+        if (!m_filePickerCallback) {
+            m_filePickerCallback = new Callback(this);
+        }
+        return m_filePickerCallback;
+    }
+
+    QObject *getJsConfirmCallback() {
+        qDebug() << "WebpageCallbacks - getJsConfirmCallback";
+
+        if (!m_jsConfirmCallback) {
+            m_jsConfirmCallback = new Callback(this);
+        }
+        return m_jsConfirmCallback;
+    }
+
+    QObject *getJsPromptCallback() {
+        qDebug() << "WebpageCallbacks - getJsConfirmCallback";
+
+        if (!m_jsPromptCallback) {
+            m_jsPromptCallback = new Callback(this);
+        }
+        return m_jsPromptCallback;
+    }
+
+    QObject *getJsInterruptCallback() {
+        qDebug() << "WebpageCallbacks - getJsInterruptCallback";
+
+        if (!m_jsInterruptCallback) {
+            m_jsInterruptCallback = new Callback(this);
+        }
+        return m_jsInterruptCallback;
+    }
+
+public slots:
+    QVariant call(const QVariantList &arguments) {
+        if (m_genericCallback) {
+            return m_genericCallback->call(arguments);
+        }
+        return QVariant();
+    }
+
+private:
+    Callback *m_genericCallback;
+    Callback *m_filePickerCallback;
+    Callback *m_jsConfirmCallback;
+    Callback *m_jsPromptCallback;
+    Callback *m_jsInterruptCallback;
+
+    friend class WebPage;
+};
+
+
+WebPage::WebPage(QObject *parent, const QUrl &baseUrl)
+    : QObject(parent)
+    , m_navigationLocked(false)
+    , m_mousePos(QPoint(0, 0))
+    , m_ownsPages(true)
+    , m_loadingProgress(0)
+    , m_shouldInterruptJs(false)
+{
+    setObjectName("WebPage");
+    m_callbacks = new WebpageCallbacks(this);
+    m_customWebPage = new CustomPage(this);
+    m_mainFrame = m_customWebPage->mainFrame();
+    m_currentFrame = m_mainFrame;
+    m_mainFrame->setHtml(BLANK_HTML, baseUrl);
+
+    Config *phantomCfg = Phantom::instance()->config();
+
+    // NOTE: below you can see that between all the event handlers
+    // we listen for, "SLOT(setupFrame())" is connected to 2 signals:
+    //   1. page.loadFinished
+    //   2. mainFrame.javaScriptWindowObjectCleared
+    // We have found out that, despite our understanding, the event #1 above
+    // fires BEFORE the event #2 when loading a url.
+    // But, if no page load is requested, #2 is the only one to fire.
+    //
+    // So, we call the slot twice to setup the main frame
+    // (no parameter == main frame) but we make sure to do the setup only once.
+    //
+    // @see WebPage::setupFrame(QWebFrame *) for details.
+    connect(m_mainFrame, SIGNAL(loadStarted()), this, SLOT(switchToMainFrame()), Qt::QueuedConnection);
+    connect(m_mainFrame, SIGNAL(loadFinished(bool)), this, SLOT(setupFrame()), Qt::QueuedConnection);
+    connect(m_customWebPage, SIGNAL(frameCreated(QWebFrame*)), this, SLOT(setupFrame(QWebFrame*)), Qt::DirectConnection);
+    connect(m_mainFrame, SIGNAL(javaScriptWindowObjectCleared()), this, SLOT(setupFrame()));
+    connect(m_mainFrame, SIGNAL(javaScriptWindowObjectCleared()), SIGNAL(initialized()));
+    connect(m_mainFrame, SIGNAL(urlChanged(QUrl)), SIGNAL(urlChanged(QUrl)));
+    connect(m_customWebPage, SIGNAL(loadStarted()), SIGNAL(loadStarted()), Qt::QueuedConnection);
+    connect(m_customWebPage, SIGNAL(loadFinished(bool)), SLOT(finish(bool)), Qt::QueuedConnection);
+    connect(m_customWebPage, SIGNAL(windowCloseRequested()), this, SLOT(close()), Qt::QueuedConnection);
+    connect(m_customWebPage, SIGNAL(loadProgress(int)), this, SLOT(updateLoadingProgress(int)));
+    connect(m_customWebPage, SIGNAL(repaintRequested(QRect)), this, SLOT(handleRepaintRequested(QRect)), Qt::QueuedConnection);
+
+
+    // Start with transparent background.
+    QPalette palette = m_customWebPage->palette();
+    palette.setBrush(QPalette::Base, Qt::transparent);
+    m_customWebPage->setPalette(palette);
+
+    // Set the page Library path
+    setLibraryPath(QFileInfo(phantomCfg->scriptFile()).dir().absolutePath());
+
+    // Page size does not need to take scrollbars into account.
+    m_mainFrame->setScrollBarPolicy(Qt::Horizontal, Qt::ScrollBarAlwaysOff);
+    m_mainFrame->setScrollBarPolicy(Qt::Vertical, Qt::ScrollBarAlwaysOff);
+
+    m_customWebPage->settings()->setAttribute(QWebSettings::OfflineStorageDatabaseEnabled, true);
+    m_customWebPage->settings()->setAttribute(QWebSettings::OfflineWebApplicationCacheEnabled, true);
+    m_customWebPage->settings()->setAttribute(QWebSettings::FrameFlatteningEnabled, true);
+
+    m_customWebPage->settings()->setAttribute(QWebSettings::LocalStorageEnabled, true);
+    m_customWebPage->settings()->setLocalStoragePath(QStandardPaths::writableLocation(QStandardPaths::DataLocation));
+
+    // Custom network access manager to allow traffic monitoring.
+    m_networkAccessManager = new NetworkAccessManager(this, phantomCfg);
+    m_customWebPage->setNetworkAccessManager(m_networkAccessManager);
+    connect(m_networkAccessManager, SIGNAL(resourceRequested(QVariant, QObject *)),
+            SIGNAL(resourceRequested(QVariant, QObject *)));
+    connect(m_networkAccessManager, SIGNAL(resourceReceived(QVariant)),
+            SIGNAL(resourceReceived(QVariant)));
+    connect(m_networkAccessManager, SIGNAL(resourceError(QVariant)),
+            SIGNAL(resourceError(QVariant)));
+    connect(m_networkAccessManager, SIGNAL(resourceTimeout(QVariant)),
+            SIGNAL(resourceTimeout(QVariant)));
+
+    m_customWebPage->setViewportSize(QSize(400, 300));
+}
+
+WebPage::~WebPage()
+{
+    emit closing(this);
+}
+
+QWebFrame *WebPage::mainFrame()
+{
+    return m_mainFrame;
+}
+
+QString WebPage::content() const
+{
+    return m_mainFrame->toHtml();
+}
+
+QString WebPage::frameContent() const
+{
+    return m_currentFrame->toHtml();
+}
+
+void WebPage::setContent(const QString &content)
+{
+    m_mainFrame->setHtml(content);
+}
+
+void WebPage::setContent(const QString &content, const QString &baseUrl)
+{
+    if (baseUrl == "about:blank") {
+        m_mainFrame->setHtml(BLANK_HTML);
+    } else {
+        m_mainFrame->setHtml(content, QUrl(baseUrl));
+    }
+}
+
+
+void WebPage::setFrameContent(const QString &content)
+{
+    m_currentFrame->setHtml(content);
+}
+
+QString WebPage::title() const
+{
+    return m_mainFrame->title();
+}
+
+QString WebPage::frameTitle() const
+{
+    return m_currentFrame->title();
+}
+
+QString WebPage::url() const
+{
+    return m_mainFrame->url().toString();
+}
+
+QString WebPage::frameUrl() const
+{
+    return m_currentFrame->url().toString();
+}
+
+bool WebPage::loading() const
+{
+    // Return "true" if Load Progress is "]0, 100["
+    return (0 < m_loadingProgress && m_loadingProgress < 100);
+}
+
+int WebPage::loadingProgress() const
+{
+    return m_loadingProgress;
+}
+
+bool WebPage::canGoBack()
+{
+    return m_customWebPage->history()->canGoBack();
+}
+
+bool WebPage::goBack()
+{
+    if (canGoBack()) {
+        m_customWebPage->history()->back();
+        return true;
+    }
+    return false;
+}
+
+bool WebPage::canGoForward()
+{
+    return m_customWebPage->history()->canGoForward();
+}
+
+bool WebPage::goForward()
+{
+    if (canGoForward()) {
+        m_customWebPage->history()->forward();
+        return true;
+    }
+    return false;
+}
+
+bool WebPage::go(int historyItemRelativeIndex)
+{
+    // Convert the relative index to absolute
+    int historyItemIndex = m_customWebPage->history()->currentItemIndex() + historyItemRelativeIndex;
+
+    // Fetch the right item from the history
+    QWebHistoryItem historyItem = m_customWebPage->history()->itemAt(historyItemIndex);
+
+    // Go to the history item, if it's valid
+    if (historyItem.isValid()) {
+        m_customWebPage->history()->goToItem(historyItem);
+        return true;
+    }
+
+    return false;
+}
+
+void WebPage::reload()
+{
+    m_customWebPage->triggerAction(QWebPage::Reload);
+}
+
+void WebPage::stop()
+{
+    m_customWebPage->triggerAction(QWebPage::Stop);
+}
+
+
+QString WebPage::plainText() const
+{
+    return m_mainFrame->toPlainText();
+}
+
+QString WebPage::framePlainText() const
+{
+    return m_currentFrame->toPlainText();
+}
+
+QString WebPage::libraryPath() const
+{
+   return m_libraryPath;
+}
+
+void WebPage::setLibraryPath(const QString &libraryPath)
+{
+   m_libraryPath = libraryPath;
+}
+
+QString WebPage::offlineStoragePath() const
+{
+    return m_customWebPage->settings()->offlineStoragePath();
+}
+
+int WebPage::offlineStorageQuota() const
+{
+    return m_customWebPage->settings()->offlineStorageDefaultQuota();
+}
+
+void WebPage::showInspector(const int port)
+{
+    m_customWebPage->settings()->setAttribute(QWebSettings::DeveloperExtrasEnabled, true);
+    m_inspector = new QWebInspector;
+    m_inspector->setPage(m_customWebPage);
+
+    if (port == -1) {
+        m_inspector->setVisible(true);
+    } else {
+        m_customWebPage->setProperty("_q_webInspectorServerPort", port);
+    }
+}
+
+void WebPage::applySettings(const QVariantMap &def)
+{
+    QWebSettings *opt = m_customWebPage->settings();
+
+    opt->setAttribute(QWebSettings::AutoLoadImages, def[PAGE_SETTINGS_LOAD_IMAGES].toBool());
+    opt->setAttribute(QWebSettings::JavascriptEnabled, def[PAGE_SETTINGS_JS_ENABLED].toBool());
+    opt->setAttribute(QWebSettings::XSSAuditingEnabled, def[PAGE_SETTINGS_XSS_AUDITING].toBool());
+    opt->setAttribute(QWebSettings::LocalContentCanAccessRemoteUrls, def[PAGE_SETTINGS_LOCAL_ACCESS_REMOTE].toBool());
+    opt->setAttribute(QWebSettings::WebSecurityEnabled, def[PAGE_SETTINGS_WEB_SECURITY_ENABLED].toBool());
+    opt->setAttribute(QWebSettings::JavascriptCanOpenWindows, def[PAGE_SETTINGS_JS_CAN_OPEN_WINDOWS].toBool());
+    opt->setAttribute(QWebSettings::JavascriptCanCloseWindows, def[PAGE_SETTINGS_JS_CAN_CLOSE_WINDOWS].toBool());
+
+    if (def.contains(PAGE_SETTINGS_USER_AGENT))
+        m_customWebPage->m_userAgent = def[PAGE_SETTINGS_USER_AGENT].toString();
+
+    if (def.contains(PAGE_SETTINGS_USERNAME))
+        m_networkAccessManager->setUserName(def[PAGE_SETTINGS_USERNAME].toString());
+
+    if (def.contains(PAGE_SETTINGS_PASSWORD))
+        m_networkAccessManager->setPassword(def[PAGE_SETTINGS_PASSWORD].toString());
+
+    if (def.contains(PAGE_SETTINGS_MAX_AUTH_ATTEMPTS))
+        m_networkAccessManager->setMaxAuthAttempts(def[PAGE_SETTINGS_MAX_AUTH_ATTEMPTS].toInt());
+
+    if (def.contains(PAGE_SETTINGS_RESOURCE_TIMEOUT))
+        m_networkAccessManager->setResourceTimeout(def[PAGE_SETTINGS_RESOURCE_TIMEOUT].toInt());
+
+}
+
+QString WebPage::userAgent() const
+{
+    return m_customWebPage->m_userAgent;
+}
+
+void WebPage::setNavigationLocked(bool lock)
+{
+    m_navigationLocked = lock;
+}
+
+bool WebPage::navigationLocked()
+{
+    return m_navigationLocked;
+}
+
+void WebPage::setViewportSize(const QVariantMap &size)
+{
+    int w = size.value("width").toInt();
+    int h = size.value("height").toInt();
+    if (w > 0 && h > 0)
+        m_customWebPage->setViewportSize(QSize(w, h));
+}
+
+QVariantMap WebPage::viewportSize() const
+{
+    QVariantMap result;
+    QSize size = m_customWebPage->viewportSize();
+    result["width"] = size.width();
+    result["height"] = size.height();
+    return result;
+}
+
+void WebPage::setClipRect(const QVariantMap &size)
+{
+    int w = size.value("width").toInt();
+    int h = size.value("height").toInt();
+    int top = size.value("top").toInt();
+    int left = size.value("left").toInt();
+
+    if (w >= 0 && h >= 0)
+        m_clipRect = QRect(left, top, w, h);
+}
+
+QVariantMap WebPage::clipRect() const
+{
+    QVariantMap result;
+    result["width"] = m_clipRect.width();
+    result["height"] = m_clipRect.height();
+    result["top"] = m_clipRect.top();
+    result["left"] = m_clipRect.left();
+    return result;
+}
+
+
+void WebPage::setScrollPosition(const QVariantMap &size)
+{
+    int top = size.value("top").toInt();
+    int left = size.value("left").toInt();
+    m_scrollPosition = QPoint(left,top);
+    m_mainFrame->setScrollPosition(m_scrollPosition);
+}
+
+QVariantMap WebPage::scrollPosition() const
+{
+    QVariantMap result;
+    result["top"] = m_scrollPosition.y();
+    result["left"] = m_scrollPosition.x();
+    return result;
+}
+
+void WebPage::setPaperSize(const QVariantMap &size)
+{
+    m_paperSize = size;
+}
+
+QVariantMap WebPage::paperSize() const
+{
+    return m_paperSize;
+}
+
+QVariant WebPage::evaluateJavaScript(const QString &code)
+{
+    QVariant evalResult;
+    QString function = "(" + code + ")()";
+
+    qDebug() << "WebPage - evaluateJavaScript" << function;
+
+    evalResult = m_currentFrame->evaluateJavaScript(
+                function,                                   //< function evaluated
+                QString("phantomjs://webpage.evaluate()")); //< reference source file
+
+    qDebug() << "WebPage - evaluateJavaScript result" << evalResult;
+
+    return evalResult;
+}
+
+QString WebPage::filePicker(const QString &oldFile)
+{
+    qDebug() << "WebPage - filePicker" << "- old file:" << oldFile;
+
+    if (m_callbacks->m_filePickerCallback) {
+        QVariant res = m_callbacks->m_filePickerCallback->call(QVariantList() << oldFile);
+
+        if (res.canConvert<QString>()) {
+            QString filePath = res.toString();
+            qDebug() << "WebPage - filePicker" << "- new file:" << filePath;
+            // Return this value only if the file actually exists
+            if (QFile::exists(filePath)) {
+                return filePath;
+            }
+        }
+    }
+    return QString::null;
+}
+
+bool WebPage::javaScriptConfirm(const QString &msg)
+{
+    if (m_callbacks->m_jsConfirmCallback) {
+        QVariant res = m_callbacks->m_jsConfirmCallback->call(QVariantList() << msg);
+        if (res.canConvert<bool>()) {
+            return res.toBool();
+        }
+    }
+    return false;
+}
+
+bool WebPage::javaScriptPrompt(const QString &msg, const QString &defaultValue, QString *result)
+{
+    if (m_callbacks->m_jsPromptCallback) {
+        QVariant res = m_callbacks->m_jsPromptCallback->call(QVariantList() << msg << defaultValue);
+        if (!res.isNull() && res.canConvert<QString>()) {
+            result->append(res.toString());
+            return true;
+        }
+    }
+    return false;
+}
+
+void WebPage::javascriptInterrupt()
+{
+    if (m_callbacks->m_jsInterruptCallback) {
+        QVariant res = m_callbacks->m_jsInterruptCallback->call(QVariantList());
+
+        if (res.canConvert<bool>()) {
+            m_shouldInterruptJs = res.toBool();
+        }
+    }
+}
+
+void WebPage::finish(bool ok)
+{
+    QString status = ok ? "success" : "fail";
+    emit loadFinished(status);
+}
+
+void WebPage::setCustomHeaders(const QVariantMap &headers)
+{
+    m_networkAccessManager->setCustomHeaders(headers);
+}
+
+QVariantMap WebPage::customHeaders() const
+{
+    return m_networkAccessManager->customHeaders();
+}
+
+void WebPage::setCookieJar(CookieJar *cookieJar) {
+    m_cookieJar = cookieJar;
+    m_customWebPage->setCookieJar(m_cookieJar);
+    m_networkAccessManager->setCookieJar(m_cookieJar);
+}
+
+void WebPage::setCookieJarFromQObject(QObject *cookieJar) {
+    setCookieJar(qobject_cast<CookieJar *>(cookieJar));
+}
+
+CookieJar *WebPage::cookieJar()
+{
+    return m_cookieJar;
+}
+
+bool WebPage::setCookies(const QVariantList &cookies)
+{
+    // Delete all the cookies for this URL
+    m_cookieJar->deleteCookies(this->url());
+    // Add a new set of cookies foor this URL
+    return m_cookieJar->addCookiesFromMap(cookies, this->url());
+}
+
+QVariantList WebPage::cookies() const
+{
+    // Return all the Cookies visible to this Page, as a list of Maps (aka JSON in JS space)
+    return m_cookieJar->cookiesToMap(this->url());
+}
+
+bool WebPage::addCookie(const QVariantMap &cookie)
+{
+    return m_cookieJar->addCookieFromMap(cookie, this->url());
+}
+
+bool WebPage::deleteCookie(const QString &cookieName)
+{
+    if (!cookieName.isEmpty()) {
+        return m_cookieJar->deleteCookie(cookieName, this->url());
+    }
+    return false;
+}
+
+bool WebPage::clearCookies()
+{
+    return m_cookieJar->deleteCookies(this->url());
+}
+
+void WebPage::openUrl(const QString &address, const QVariant &op, const QVariantMap &settings)
+{
+    QString operation;
+    QByteArray body;
+    QNetworkRequest request;
+
+    applySettings(settings);
+    m_customWebPage->triggerAction(QWebPage::Stop);
+
+    if (op.type() == QVariant::String)
+        operation = op.toString();
+
+    if (op.type() == QVariant::Map) {
+        QVariantMap settingsMap = op.toMap();
+        operation = settingsMap.value("operation").toString();
+        QString bodyString = settingsMap.value("data").toString();
+        QString encoding = settingsMap.value("encoding").toString().toLower();
+        body = encoding == "utf-8" || encoding == "utf8" ? bodyString.toUtf8() : bodyString.toLatin1();
+        if (settingsMap.contains("headers")) {
+            QMapIterator<QString, QVariant> i(settingsMap.value("headers").toMap());
+            while (i.hasNext()) {
+                i.next();
+                request.setRawHeader(i.key().toUtf8(), i.value().toString().toUtf8());
+            }
+        }
+    }
+
+    if (operation.isEmpty())
+        operation = "get";
+
+    QNetworkAccessManager::Operation networkOp = QNetworkAccessManager::UnknownOperation;
+    operation = operation.toLower();
+    if (operation == "get")
+        networkOp = QNetworkAccessManager::GetOperation;
+    else if (operation == "head")
+        networkOp = QNetworkAccessManager::HeadOperation;
+    else if (operation == "put")
+        networkOp = QNetworkAccessManager::PutOperation;
+    else if (operation == "post")
+        networkOp = QNetworkAccessManager::PostOperation;
+    else if (operation == "delete")
+        networkOp = QNetworkAccessManager::DeleteOperation;
+
+    if (networkOp == QNetworkAccessManager::UnknownOperation) {
+        m_mainFrame->evaluateJavaScript("console.error('Unknown network operation: " + operation + "');", QString());
+        return;
+    }
+
+    if (address == "about:blank") {
+        m_mainFrame->setHtml(BLANK_HTML);
+    } else {
+        QUrl url = QUrl::fromEncoded(QByteArray(address.toLatin1()));
+
+        // Assume local file if scheme is empty
+        if (url.scheme().isEmpty()) {
+            url.setPath(QFileInfo(url.toString()).absoluteFilePath().prepend("/"));
+            url.setScheme("file");
+        }
+
+        request.setUrl(url);
+        m_mainFrame->load(request, networkOp, body);
+    }
+}
+
+void WebPage::release()
+{
+    close();
+}
+
+void WebPage::close() {
+    deleteLater();
+}
+
+bool WebPage::render(const QString &fileName, const QVariantMap &option)
+{
+    if (m_mainFrame->contentsSize().isEmpty())
+        return false;
+
+    QString outFileName = fileName;
+    QString tempFileName = "";
+
+    QString format = "";
+    int quality = -1; // QImage#save default
+
+    if( fileName == STDOUT_FILENAME || fileName == STDERR_FILENAME ){
+        if( !QFile::exists(fileName) ){
+            // create temporary file for OS that have no /dev/stdout or /dev/stderr. (ex. windows)
+            tempFileName = QDir::tempPath() + "/phantomjstemp" + QUuid::createUuid().toString();
+            outFileName = tempFileName;
+        }
+
+        format = "png"; // default format for stdout and stderr
+    }
+    else{
+        QFileInfo fileInfo(outFileName);
+        QDir dir;
+        dir.mkpath(fileInfo.absolutePath());
+    }
+
+    if( option.contains("format") ){
+        format = option.value("format").toString();
+    }
+    else if (fileName.endsWith(".pdf", Qt::CaseInsensitive) ){
+        format = "pdf";
+    }
+
+    if( option.contains("quality") ){
+        quality = option.value("quality").toInt();
+    }
+
+    bool retval = true;
+    if ( format == "pdf" ){
+        retval = renderPdf(outFileName);
+    }
+    else{
+        QImage rawPageRendering = renderImage();
+
+        const char *f = 0; // 0 is QImage#save default
+        if( format != "" ){
+            f = format.toLocal8Bit().constData();
+        }
+
+        retval = rawPageRendering.save(outFileName, f, quality);
+    }
+
+    if( tempFileName != "" ){
+        // cleanup temporary file and render to stdout or stderr
+        QFile i(tempFileName);
+        i.open(QIODevice::ReadOnly);
+
+        QByteArray ba = i.readAll();
+
+        System *system = (System*)Phantom::instance()->createSystem();
+        if( fileName == STDOUT_FILENAME ){
+#ifdef Q_OS_WIN32
+            _setmode(_fileno(stdout), O_BINARY);
+#endif
+
+            ((File *)system->_stdout())->write(QString::fromLatin1(ba.constData(), ba.size()));
+
+#ifdef Q_OS_WIN32
+            _setmode(_fileno(stdout), O_TEXT);
+#endif
+        }
+        else if( fileName == STDERR_FILENAME ){
+#ifdef Q_OS_WIN32
+            _setmode(_fileno(stderr), O_BINARY);
+#endif
+
+            ((File *)system->_stderr())->write(QString::fromLatin1(ba.constData(), ba.size()));
+
+#ifdef Q_OS_WIN32
+            _setmode(_fileno(stderr), O_TEXT);
+#endif
+        }
+
+        i.close();
+
+        QFile::remove(tempFileName);
+    }
+
+    return retval;
+}
+
+QString WebPage::renderBase64(const QByteArray &format)
+{
+    QByteArray nformat = format.toLower();
+
+    // Check if the given format is supported
+    if (QImageWriter::supportedImageFormats().contains(nformat)) {
+        QImage rawPageRendering = renderImage();
+
+        // Prepare buffer for writing
+        QByteArray bytes;
+        QBuffer buffer(&bytes);
+        buffer.open(QIODevice::WriteOnly);
+
+        // Writing image to the buffer, using PNG encoding
+        rawPageRendering.save(&buffer, nformat);
+
+        return bytes.toBase64();
+    }
+
+    // Return an empty string in case an unsupported format was provided
+    return "";
+}
+
+QImage WebPage::renderImage()
+{
+    QSize contentsSize = m_mainFrame->contentsSize();
+    contentsSize -= QSize(m_scrollPosition.x(), m_scrollPosition.y());
+    QRect frameRect = QRect(QPoint(0, 0), contentsSize);
+    if (!m_clipRect.isNull())
+        frameRect = m_clipRect;
+
+    QSize viewportSize = m_customWebPage->viewportSize();
+    m_customWebPage->setViewportSize(contentsSize);
+
+#ifdef Q_OS_WIN32
+    QImage::Format format = QImage::Format_ARGB32_Premultiplied;
+#else
+    QImage::Format format = QImage::Format_ARGB32;
+#endif
+
+    QImage buffer(frameRect.size(), format);
+    buffer.fill(Qt::transparent);
+
+    QPainter painter;
+
+    // We use tiling approach to work-around Qt software rasterizer bug
+    // when dealing with very large paint device.
+    // See http://code.google.com/p/phantomjs/issues/detail?id=54.
+    const int tileSize = 4096;
+    int htiles = (buffer.width() + tileSize - 1) / tileSize;
+    int vtiles = (buffer.height() + tileSize - 1) / tileSize;
+    for (int x = 0; x < htiles; ++x) {
+        for (int y = 0; y < vtiles; ++y) {
+
+            QImage tileBuffer(tileSize, tileSize, format);
+            tileBuffer.fill(Qt::transparent);
+
+            // Render the web page onto the small tile first
+            painter.begin(&tileBuffer);
+            painter.setRenderHint(QPainter::Antialiasing, true);
+            painter.setRenderHint(QPainter::TextAntialiasing, true);
+            painter.setRenderHint(QPainter::SmoothPixmapTransform, true);
+            painter.translate(-frameRect.left(), -frameRect.top());
+            painter.translate(-x * tileSize, -y * tileSize);
+            m_mainFrame->render(&painter, QRegion(frameRect));
+            painter.end();
+
+            // Copy the tile to the main buffer
+            painter.begin(&buffer);
+            painter.setCompositionMode(QPainter::CompositionMode_Source);
+            painter.drawImage(x * tileSize, y * tileSize, tileBuffer);
+            painter.end();
+        }
+    }
+
+    m_customWebPage->setViewportSize(viewportSize);
+    return buffer;
+}
+
+#define PHANTOMJS_PDF_DPI 72            // Different defaults. OSX: 72, X11: 75(?), Windows: 96
+
+qreal stringToPointSize(const QString &string)
+{
+    static const struct {
+        QString unit;
+        qreal factor;
+    } units[] = {
+        { "mm", 72 / 25.4 },
+        { "cm", 72 / 2.54 },
+        { "in", 72 },
+        { "px", 72.0 / PHANTOMJS_PDF_DPI },
+        { "", 72.0 / PHANTOMJS_PDF_DPI }
+    };
+    for (uint i = 0; i < sizeof(units) / sizeof(units[0]); ++i) {
+        if (string.endsWith(units[i].unit)) {
+            QString value = string;
+            value.chop(units[i].unit.length());
+            return value.toDouble() * units[i].factor;
+        }
+    }
+    return 0;
+}
+
+qreal printMargin(const QVariantMap &map, const QString &key)
+{
+    const QVariant margin = map.value(key);
+    if (margin.isValid() && margin.canConvert(QVariant::String)) {
+        return stringToPointSize(margin.toString());
+    } else {
+        return 0;
+    }
+}
+
+bool WebPage::renderPdf(const QString &fileName)
+{
+    QPrinter printer;
+    printer.setOutputFormat(QPrinter::PdfFormat);
+    printer.setOutputFileName(fileName);
+    printer.setResolution(PHANTOMJS_PDF_DPI);
+    QVariantMap paperSize = m_paperSize;
+
+    if (paperSize.isEmpty()) {
+        const QSize pageSize = m_mainFrame->contentsSize();
+        paperSize.insert("width", QString::number(pageSize.width()) + "px");
+        paperSize.insert("height", QString::number(pageSize.height()) + "px");
+        paperSize.insert("margin", "0px");
+    }
+
+    if (paperSize.contains("width") && paperSize.contains("height")) {
+        const QSizeF sizePt(ceil(stringToPointSize(paperSize.value("width").toString())),
+                            ceil(stringToPointSize(paperSize.value("height").toString())));
+        printer.setPaperSize(sizePt, QPrinter::Point);
+    } else if (paperSize.contains("format")) {
+        const QPrinter::Orientation orientation = paperSize.contains("orientation")
+                && paperSize.value("orientation").toString().compare("landscape", Qt::CaseInsensitive) == 0 ?
+                    QPrinter::Landscape : QPrinter::Portrait;
+        printer.setOrientation(orientation);
+        static const struct {
+            QString format;
+            QPrinter::PaperSize paperSize;
+        } formats[] = {
+            { "A0", QPrinter::A0 },
+            { "A1", QPrinter::A1 },
+            { "A2", QPrinter::A2 },
+            { "A3", QPrinter::A3 },
+            { "A4", QPrinter::A4 },
+            { "A5", QPrinter::A5 },
+            { "A6", QPrinter::A6 },
+            { "A7", QPrinter::A7 },
+            { "A8", QPrinter::A8 },
+            { "A9", QPrinter::A9 },
+            { "B0", QPrinter::B0 },
+            { "B1", QPrinter::B1 },
+            { "B2", QPrinter::B2 },
+            { "B3", QPrinter::B3 },
+            { "B4", QPrinter::B4 },
+            { "B5", QPrinter::B5 },
+            { "B6", QPrinter::B6 },
+            { "B7", QPrinter::B7 },
+            { "B8", QPrinter::B8 },
+            { "B9", QPrinter::B9 },
+            { "B10", QPrinter::B10 },
+            { "C5E", QPrinter::C5E },
+            { "Comm10E", QPrinter::Comm10E },
+            { "DLE", QPrinter::DLE },
+            { "Executive", QPrinter::Executive },
+            { "Folio", QPrinter::Folio },
+            { "Ledger", QPrinter::Ledger },
+            { "Legal", QPrinter::Legal },
+            { "Letter", QPrinter::Letter },
+            { "Tabloid", QPrinter::Tabloid }
+        };
+        printer.setPaperSize(QPrinter::A4); // Fallback
+        for (uint i = 0; i < sizeof(formats) / sizeof(formats[0]); ++i) {
+            if (paperSize.value("format").toString().compare(formats[i].format, Qt::CaseInsensitive) == 0) {
+                printer.setPaperSize(formats[i].paperSize);
+                break;
+            }
+        }
+    } else {
+        return false;
+    }
+
+    if (paperSize.contains("border") && !paperSize.contains("margin")) {
+        // backwards compatibility
+        paperSize["margin"] = paperSize["border"];
+    }
+
+    qreal marginLeft = 0;
+    qreal marginTop = 0;
+    qreal marginRight = 0;
+    qreal marginBottom = 0;
+
+    if (paperSize.contains("margin")) {
+        const QVariant margins = paperSize["margin"];
+        if (margins.canConvert(QVariant::Map)) {
+            const QVariantMap map = margins.toMap();
+            marginLeft = printMargin(map, "left");
+            marginTop = printMargin(map, "top");
+            marginRight = printMargin(map, "right");
+            marginBottom = printMargin(map, "bottom");
+        } else if (margins.canConvert(QVariant::String)) {
+            const qreal margin = stringToPointSize(margins.toString());
+            marginLeft = margin;
+            marginTop = margin;
+            marginRight = margin;
+            marginBottom = margin;
+        }
+    }
+
+    printer.setPageMargins(marginLeft, marginTop, marginRight, marginBottom, QPrinter::Point);
+
+    m_mainFrame->print(&printer, this);
+    return true;
+}
+
+void WebPage::setZoomFactor(qreal zoom)
+{
+    m_mainFrame->setZoomFactor(zoom);
+}
+
+qreal WebPage::zoomFactor() const
+{
+    return m_mainFrame->zoomFactor();
+}
+
+QString WebPage::windowName() const
+{
+    return m_mainFrame->evaluateJavaScript("window.name;").toString();
+}
+
+qreal getHeight(const QVariantMap &map, const QString &key)
+{
+    QVariant footer = map.value(key);
+    if (!footer.canConvert(QVariant::Map)) {
+        return 0;
+    }
+    QVariant height = footer.toMap().value("height");
+    if (!height.canConvert(QVariant::String)) {
+        return 0;
+    }
+    return stringToPointSize(height.toString());
+}
+
+qreal WebPage::footerHeight() const
+{
+    return getHeight(m_paperSize, "footer");
+}
+
+qreal WebPage::headerHeight() const
+{
+    return getHeight(m_paperSize, "header");
+}
+
+QString getHeaderFooter(const QVariantMap &map, const QString &key, QWebFrame *frame, int page, int numPages)
+{
+    QVariant header = map.value(key);
+    if (!header.canConvert(QVariant::Map)) {
+        return QString();
+    }
+    QVariant callback = header.toMap().value("contents");
+    if (callback.canConvert<QObject*>()) {
+        Callback* caller = qobject_cast<Callback*>(callback.value<QObject*>());
+        if (caller) {
+            QVariant ret = caller->call(QVariantList() << page << numPages);
+            if (ret.canConvert(QVariant::String)) {
+                return ret.toString();
+            }
+        }
+    }
+    frame->evaluateJavaScript("console.error('Bad header callback given, use phantom.callback);", QString());
+    return QString();
+}
+
+QString WebPage::header(int page, int numPages)
+{
+    return getHeaderFooter(m_paperSize, "header", m_mainFrame, page, numPages);
+}
+
+QString WebPage::footer(int page, int numPages)
+{
+    return getHeaderFooter(m_paperSize, "footer", m_mainFrame, page, numPages);
+}
+
+void WebPage::_uploadFile(const QString &selector, const QStringList &fileNames)
+{
+    QWebElement el = m_currentFrame->findFirstElement(selector);
+    if (el.isNull())
+        return;
+
+    // Filter out "fileNames" that don't actually exist
+    m_customWebPage->m_uploadFiles.clear();
+    for (int i = 0, ilen = fileNames.length(); i < ilen; ++i) {
+        if (QFile::exists(fileNames[i])) {
+            m_customWebPage->m_uploadFiles.append(fileNames[i]);
+        }
+    }
+
+    el.evaluateJavaScript(JS_ELEMENT_CLICK);
+}
+
+bool WebPage::injectJs(const QString &jsFilePath) {
+    return Utils::injectJsInFrame(jsFilePath, m_libraryPath, m_currentFrame);
+}
+
+void WebPage::_appendScriptElement(const QString &scriptUrl) {
+    m_currentFrame->evaluateJavaScript(QString(JS_APPEND_SCRIPT_ELEMENT).arg(scriptUrl), scriptUrl);
+}
+
+QObject *WebPage::_getGenericCallback() {
+    if (!m_callbacks) {
+        m_callbacks = new WebpageCallbacks(this);
+    }
+
+    return m_callbacks->getGenericCallback();
+}
+
+QObject *WebPage::_getFilePickerCallback()
+{
+    if (!m_callbacks) {
+        m_callbacks = new WebpageCallbacks(this);
+    }
+
+    return m_callbacks->getFilePickerCallback();
+}
+
+QObject *WebPage::_getJsConfirmCallback()
+{
+    if (!m_callbacks) {
+        m_callbacks = new WebpageCallbacks(this);
+    }
+
+    return m_callbacks->getJsConfirmCallback();
+}
+
+QObject *WebPage::_getJsPromptCallback()
+{
+    if (!m_callbacks) {
+        m_callbacks = new WebpageCallbacks(this);
+    }
+
+    return m_callbacks->getJsPromptCallback();
+}
+
+QObject *WebPage::_getJsInterruptCallback()
+{
+    if (!m_callbacks) {
+        m_callbacks = new WebpageCallbacks(this);
+    }
+
+    return m_callbacks->getJsInterruptCallback();
+}
+
+void WebPage::sendEvent(const QString &type, const QVariant &arg1, const QVariant &arg2, const QString &mouseButton, const QVariant &modifierArg)
+{
+    Qt::KeyboardModifiers keyboardModifiers(modifierArg.toInt());
+    // Normalize the event "type" to lowercase
+    const QString eventType = type.toLower();
+
+    // single keyboard events
+    if (eventType == "keydown" || eventType == "keyup") {
+        QKeyEvent::Type keyEventType = QEvent::None;
+        if (eventType == "keydown")
+            keyEventType = QKeyEvent::KeyPress;
+        if (eventType == "keyup")
+            keyEventType = QKeyEvent::KeyRelease;
+        Q_ASSERT(keyEventType != QEvent::None);
+
+        int key = 0;
+        QString text;
+        if (arg1.type() == QVariant::Char) {
+            // a single char was given
+            text = arg1.toChar();
+            key = text.at(0).toUpper().unicode();
+        } else if (arg1.type() == QVariant::String) {
+            // javascript invokation of a single char
+            text = arg1.toString();
+            if (!text.isEmpty()) {
+                key = text.at(0).toUpper().unicode();
+            }
+        } else {
+            // assume a raw integer char code was given
+            key = arg1.toInt();
+        }
+        QKeyEvent *keyEvent = new QKeyEvent(keyEventType, key, keyboardModifiers, text);
+        QApplication::postEvent(m_customWebPage, keyEvent);
+        QApplication::processEvents();
+        return;
+    }
+
+    // sequence of key events: will generate all the single keydown/keyup events
+    if (eventType == "keypress") {
+        if (arg1.type() == QVariant::String) {
+            // this is the case for e.g. sendEvent("...", 'A')
+            // but also works with sendEvent("...", "ABCD")
+            foreach(const QChar typeChar, arg1.toString()) {
+                sendEvent("keydown", typeChar, QVariant(), QString(), modifierArg);
+                sendEvent("keyup", typeChar, QVariant(), QString(), modifierArg);
+            }
+        } else {
+            // otherwise we assume a raw integer char-code was given
+            sendEvent("keydown", arg1.toInt(), QVariant(), QString(), modifierArg);
+            sendEvent("keyup", arg1.toInt(), QVariant(), QString(), modifierArg);
+        }
+        return;
+    }
+
+    // mouse events
+    if (eventType == "mousedown" ||
+            eventType == "mouseup" ||
+            eventType == "mousemove" ||
+            eventType == "mousedoubleclick") {
+        QMouseEvent::Type mouseEventType = QEvent::None;
+
+        // Which mouse button (if it's a click)
+        Qt::MouseButton button = Qt::LeftButton;
+        Qt::MouseButton buttons = Qt::LeftButton;
+        if (mouseButton.toLower() == "middle") {
+            button = Qt::MiddleButton;
+            buttons = Qt::MiddleButton;
+        } else if (mouseButton.toLower() == "right") {
+            button = Qt::RightButton;
+            buttons = Qt::RightButton;
+        }
+
+        // Which mouse event
+        if (eventType == "mousedown") {
+            mouseEventType = QEvent::MouseButtonPress;
+        } else if (eventType == "mouseup") {
+            mouseEventType = QEvent::MouseButtonRelease;
+        } else if (eventType == "mousedoubleclick") {
+            mouseEventType = QEvent::MouseButtonDblClick;
+        } else if (eventType == "mousemove") {
+            mouseEventType = QEvent::MouseMove;
+            button = Qt::NoButton;
+            buttons = Qt::NoButton;
+        }
+        Q_ASSERT(mouseEventType != QEvent::None);
+
+        // Gather coordinates
+        if (arg1.isValid() && arg2.isValid()) {
+            m_mousePos.setX(arg1.toInt());
+            m_mousePos.setY(arg2.toInt());
+        }
+
+        // Prepare the Mouse event
+        qDebug() << "Mouse Event:" << eventType << "(" << mouseEventType << ")" << m_mousePos << ")" << button << buttons;
+        QMouseEvent *event = new QMouseEvent(mouseEventType, m_mousePos, button, buttons, keyboardModifiers);
+
+        // Post and process events
+        QApplication::postEvent(m_customWebPage, event);
+        QApplication::processEvents();
+        return;
+    }
+
+    // mouse click events: Qt doesn't provide this as a separate events,
+    // so we compose it with a mousedown/mouseup sequence
+    // mouse doubleclick events: It is not enough to simply send a
+    // MouseButtonDblClick event by itself; it must be accompanied
+    // by a preceding press-release, and a following release.
+    if (type == "click" || type == "doubleclick") {
+        sendEvent("mousedown", arg1, arg2, mouseButton, modifierArg);
+        sendEvent("mouseup", arg1, arg2, mouseButton, modifierArg);
+        if (type == "doubleclick") {
+            sendEvent("mousedoubleclick", arg1, arg2, mouseButton, modifierArg);
+            sendEvent("mouseup", arg1, arg2, mouseButton, modifierArg);
+        }
+        return;
+    }
+}
+
+QObjectList WebPage::pages() const
+{
+    QObjectList pages;
+
+    QList<WebPage *> childPages = this->findChildren<WebPage *>();
+    for (int i = childPages.length() -1; i >= 0; --i) {
+        pages << childPages.at(i);
+    }
+
+    return pages;
+}
+
+QStringList WebPage::pagesWindowName() const
+{
+    QStringList pagesWindowName;
+
+    foreach (const WebPage *p, this->findChildren<WebPage *>()) {
+        pagesWindowName << p->windowName();
+    }
+
+    return pagesWindowName;
+}
+
+QObject *WebPage::getPage(const QString &windowName) const
+{
+    QList<WebPage *> childPages = this->findChildren<WebPage *>();
+    for (int i = childPages.length() -1; i >= 0; --i) {
+        if (childPages.at(i)->windowName() == windowName) {
+            return childPages.at(i);
+        }
+    }
+    return NULL;
+}
+
+bool WebPage::ownsPages() const
+{
+    return m_ownsPages;
+}
+
+void WebPage::setOwnsPages(const bool owns)
+{
+    m_ownsPages = owns;
+}
+
+int WebPage::framesCount() const
+{
+    return m_currentFrame->childFrames().count();
+}
+
+int WebPage::childFramesCount() const //< deprecated
+{
+    return this->framesCount();
+}
+
+QStringList WebPage::framesName() const
+{
+    QStringList framesName;
+
+    foreach(const QWebFrame *f, m_currentFrame->childFrames()) {
+        framesName << f->frameName();
+    }
+    return framesName;
+}
+
+QStringList WebPage::childFramesName() const //< deprecated
+{
+    return this->framesName();
+}
+
+void WebPage::changeCurrentFrame(QWebFrame * const frame)
+{
+    if (frame != m_currentFrame) {
+        qDebug() << "WebPage - changeCurrentFrame" << "from" << (m_currentFrame == NULL ? "Undefined" : m_currentFrame->frameName()) << "to" << frame->frameName();
+        m_currentFrame = frame;
+    }
+}
+
+bool WebPage::switchToFrame(const QString &frameName)
+{
+    QList<QWebFrame *> childFrames = m_currentFrame->childFrames();
+    for (int i = childFrames.length() -1; i >= 0; --i) {
+        if (childFrames.at(i)->frameName() == frameName) {
+            this->changeCurrentFrame(childFrames.at(i));
+            return true;
+        }
+    }
+    return false;
+}
+
+bool WebPage::switchToChildFrame(const QString &frameName) //< deprecated
+{
+    return this->switchToFrame(frameName);
+}
+
+bool WebPage::switchToFrame(const int framePosition)
+{
+    QList<QWebFrame *> childFrames = m_currentFrame->childFrames();
+    if (framePosition >= 0 && framePosition < childFrames.size()) {
+        this->changeCurrentFrame(childFrames.at(framePosition));
+        return true;
+    }
+    return false;
+}
+
+bool WebPage::switchToChildFrame(const int framePosition) //< deprecated
+{
+    return this->switchToFrame(framePosition);
+}
+
+void WebPage::switchToMainFrame()
+{
+    if (m_currentFrame != m_mainFrame) {
+        this->changeCurrentFrame(m_mainFrame);
+    }
+}
+
+bool WebPage::switchToParentFrame()
+{
+    if (m_currentFrame->parentFrame() != NULL) {
+        this->changeCurrentFrame(m_currentFrame->parentFrame());
+        return true;
+    }
+    return false;
+}
+
+void WebPage::switchToFocusedFrame()
+{
+    this->changeCurrentFrame(m_customWebPage->currentFrame());
+}
+
+QString WebPage::frameName() const
+{
+    return m_currentFrame->frameName();
+}
+
+QString WebPage::currentFrameName() const //< deprecated
+{
+    return this->frameName();
+}
+
+QString WebPage::focusedFrameName() const
+{
+    return m_customWebPage->currentFrame()->frameName();
+}
+
+static void injectCallbacksObjIntoFrame(QWebFrame *frame, WebpageCallbacks *callbacksObject)
+{
+    // Inject object only if it's not already present
+    if (frame->evaluateJavaScript(CALLBACKS_OBJECT_PRESENT).toBool() == false) {
+        // Decorate the window object in this frame (object ownership left to the creator/parent)
+        frame->addToJavaScriptWindowObject(CALLBACKS_OBJECT_NAME, callbacksObject, QWebFrame::QtOwnership);
+        frame->evaluateJavaScript(CALLBACKS_OBJECT_INJECTION);
+    }
+}
+
+void WebPage::setupFrame(QWebFrame *frame)
+{
+    qDebug() << "WebPage - setupFrame" << (frame == NULL ? "" : frame->frameName());
+
+    // Inject the Callbacks object in the main frame
+    injectCallbacksObjIntoFrame(frame == NULL ? m_mainFrame : frame, m_callbacks);
+}
+
+void WebPage::updateLoadingProgress(int progress)
+{
+    qDebug() << "WebPage - updateLoadingProgress:" << progress;
+    m_loadingProgress = progress;
+}
+
+void WebPage::handleRepaintRequested(const QRect &dirtyRect)
+{
+    emit repaintRequested(dirtyRect.x(), dirtyRect.y(), dirtyRect.width(), dirtyRect.height());
+}
+
+
+void WebPage::stopJavaScript()
+{
+    m_shouldInterruptJs = true;
+}
+
+void WebPage::clearMemoryCache()
+{
+    QWebSettings::clearMemoryCaches();
+}
+
+#include "webpage.moc"
+
+#include "alert.h"
+
+#include "chainparams.h"
+#include "clientversion.h"
+#include "net.h"
+#include "pubkey.h"
+#include "timedata.h"
+#include "ui_interface.h"
+#include "util.h"
+
+#include <stdint.h>
+#include <algorithm>
+#include <map>
+
+#include <boost/algorithm/string/classification.hpp>
+#include <boost/algorithm/string/replace.hpp>
+#include <boost/foreach.hpp>
+#include <boost/thread.hpp>
+
+using namespace std;
+
+map<uint256, CAlert> mapAlerts;
+CCriticalSection cs_mapAlerts;
+
+void CUnsignedAlert::SetNull()
+{
+    nVersion = 1;
+    nRelayUntil = 0;
+    nExpiration = 0;
+    nID = 0;
+    nCancel = 0;
+    setCancel.clear();
+    nMinVer = 0;
+    nMaxVer = 0;
+    setSubVer.clear();
+    nPriority = 0;
+
+    strComment.clear();
+    strStatusBar.clear();
+    strReserved.clear();
+}
+
+std::string CUnsignedAlert::ToString() const
+{
+    std::string strSetCancel;
+    BOOST_FOREACH(int n, setCancel)
+        strSetCancel += strprintf("%d ", n);
+    std::string strSetSubVer;
+    BOOST_FOREACH(std::string str, setSubVer)
+        strSetSubVer += "\"" + str + "\" ";
+    return strprintf(
+        "CAlert(\n"
+        "    nVersion     = %d\n"
+        "    nRelayUntil  = %d\n"
+        "    nExpiration  = %d\n"
+        "    nID          = %d\n"
+        "    nCancel      = %d\n"
+        "    setCancel    = %s\n"
+        "    nMinVer      = %d\n"
+        "    nMaxVer      = %d\n"
+        "    setSubVer    = %s\n"
+        "    nPriority    = %d\n"
+        "    strComment   = \"%s\"\n"
+        "    strStatusBar = \"%s\"\n"
+        ")\n",
+        nVersion,
+        nRelayUntil,
+        nExpiration,
+        nID,
+        nCancel,
+        strSetCancel,
+        nMinVer,
+        nMaxVer,
+        strSetSubVer,
+        nPriority,
+        strComment,
+        strStatusBar);
+}
+
+void CAlert::SetNull()
+{
+    CUnsignedAlert::SetNull();
+    vchMsg.clear();
+    vchSig.clear();
+}
+
+bool CAlert::IsNull() const
+{
+    return (nExpiration == 0);
+}
+
+uint256 CAlert::GetHash() const
+{
+    return Hash(this->vchMsg.begin(), this->vchMsg.end());
+}
+
+bool CAlert::IsInEffect() const
+{
+    return (GetAdjustedTime() < nExpiration);
+}
+
+bool CAlert::Cancels(const CAlert& alert) const
+{
+    if (!IsInEffect())
+        return false; // this was a no-op before 31403
+    return (alert.nID <= nCancel || setCancel.count(alert.nID));
+}
+
+bool CAlert::AppliesTo(int nVersion, std::string strSubVerIn) const
+{
+    // TODO: rework for client-version-embedded-in-strSubVer ?
+    return (IsInEffect() &&
+            nMinVer <= nVersion && nVersion <= nMaxVer &&
+            (setSubVer.empty() || setSubVer.count(strSubVerIn)));
+}
+
+bool CAlert::AppliesToMe() const
+{
+    return AppliesTo(PROTOCOL_VERSION, FormatSubVersion(CLIENT_NAME, CLIENT_VERSION, std::vector<std::string>()));
+}
+
+bool CAlert::RelayTo(CNode* pnode) const
+{
+    if (!IsInEffect())
+        return false;
+    // don't relay to nodes which haven't sent their version message
+    if (pnode->nVersion == 0)
+        return false;
+    // returns true if wasn't already contained in the set
+    if (pnode->setKnown.insert(GetHash()).second)
+    {
+        if (AppliesTo(pnode->nVersion, pnode->strSubVer) ||
+            AppliesToMe() ||
+            GetAdjustedTime() < nRelayUntil)
+        {
+            pnode->PushMessage("alert", *this);
+            return true;
+        }
+    }
+    return false;
+}
+
+bool CAlert::CheckSignature() const
+{
+    CPubKey key(Params().AlertKey());
+    if (!key.Verify(Hash(vchMsg.begin(), vchMsg.end()), vchSig))
+        return error("CAlert::CheckSignature(): verify signature failed");
+
+    // Now unserialize the data
+    CDataStream sMsg(vchMsg, SER_NETWORK, PROTOCOL_VERSION);
+    sMsg >> *(CUnsignedAlert*)this;
+    return true;
+}
+
+CAlert CAlert::getAlertByHash(const uint256 &hash)
+{
+    CAlert retval;
+    {
+        LOCK(cs_mapAlerts);
+        map<uint256, CAlert>::iterator mi = mapAlerts.find(hash);
+        if(mi != mapAlerts.end())
+            retval = mi->second;
+    }
+    return retval;
+}
+
+bool CAlert::ProcessAlert(bool fThread)
+{
+    if (!CheckSignature())
+        return false;
+    if (!IsInEffect())
+        return false;
+
+    // alert.nID=max is reserved for if the alert key is
+    // compromised. It must have a pre-defined message,
+    // must never expire, must apply to all versions,
+    // and must cancel all previous
+    // alerts or it will be ignored (so an attacker can't
+    // send an "everything is OK, don't panic" version that
+    // cannot be overridden):
+    int maxInt = std::numeric_limits<int>::max();
+    if (nID == maxInt)
+    {
+        if (!(
+                nExpiration == maxInt &&
+                nCancel == (maxInt-1) &&
+                nMinVer == 0 &&
+                nMaxVer == maxInt &&
+                setSubVer.empty() &&
+                nPriority == maxInt &&
+                strStatusBar == "URGENT: Alert key compromised, upgrade required"
+                ))
+            return false;
+    }
+
+    {
+        LOCK(cs_mapAlerts);
+        // Cancel previous alerts
+        for (map<uint256, CAlert>::iterator mi = mapAlerts.begin(); mi != mapAlerts.end();)
+        {
+            const CAlert& alert = (*mi).second;
+            if (Cancels(alert))
+            {
+                LogPrint("alert", "cancelling alert %d\n", alert.nID);
+                uiInterface.NotifyAlertChanged((*mi).first, CT_DELETED);
+                mapAlerts.erase(mi++);
+            }
+            else if (!alert.IsInEffect())
+            {
+                LogPrint("alert", "expiring alert %d\n", alert.nID);
+                uiInterface.NotifyAlertChanged((*mi).first, CT_DELETED);
+                mapAlerts.erase(mi++);
+            }
+            else
+                mi++;
+        }
+
+        // Check if this alert has been cancelled
+        BOOST_FOREACH(PAIRTYPE(const uint256, CAlert)& item, mapAlerts)
+        {
+            const CAlert& alert = item.second;
+            if (alert.Cancels(*this))
+            {
+                LogPrint("alert", "alert already cancelled by %d\n", alert.nID);
+                return false;
+            }
+        }
+
+        // Add to mapAlerts
+        mapAlerts.insert(make_pair(GetHash(), *this));
+        // Notify UI and -alertnotify if it applies to me
+        if(AppliesToMe())
+        {
+            uiInterface.NotifyAlertChanged(GetHash(), CT_NEW);
+            Notify(strStatusBar, fThread);
+        }
+    }
+
+    LogPrint("alert", "accepted alert %d, AppliesToMe()=%d\n", nID, AppliesToMe());
+    return true;
+}
+
+void
+CAlert::Notify(const std::string& strMessage, bool fThread)
+{
+    std::string strCmd = GetArg("-alertnotify", "");
+    if (strCmd.empty()) return;
+
+    // Alert text should be plain ascii coming from a trusted source, but to
+    // be safe we first strip anything not in safeChars, then add single quotes around
+    // the whole string before passing it to the shell:
+    std::string singleQuote("'");
+    std::string safeStatus = SanitizeString(strMessage);
+    safeStatus = singleQuote+safeStatus+singleQuote;
+    boost::replace_all(strCmd, "%s", safeStatus);
+
+    if (fThread)
+        boost::thread t(runCommand, strCmd); // thread runs free
+    else
+        runCommand(strCmd);
+}
+
+#ifndef BITCOIN_ALERT_H
+#define BITCOIN_ALERT_H
+
+#include "serialize.h"
+#include "sync.h"
+
+#include <map>
+#include <set>
+#include <stdint.h>
+#include <string>
+
+class CAlert;
+class CNode;
+class uint256;
+
+extern std::map<uint256, CAlert> mapAlerts;
+extern CCriticalSection cs_mapAlerts;
+
+/** Alerts are for notifying old versions if they become too obsolete and
+ * need to upgrade.  The message is displayed in the status bar.
+ * Alert messages are broadcast as a vector of signed data.  Unserializing may
+ * not read the entire buffer if the alert is for a newer version, but older
+ * versions can still relay the original data.
+ */
+class CUnsignedAlert
+{
+public:
+    int nVersion;
+    int64_t nRelayUntil;      // when newer nodes stop relaying to newer nodes
+    int64_t nExpiration;
+    int nID;
+    int nCancel;
+    std::set<int> setCancel;
+    int nMinVer;            // lowest version inclusive
+    int nMaxVer;            // highest version inclusive
+    std::set<std::string> setSubVer;  // empty matches all
+    int nPriority;
+
+    // Actions
+    std::string strComment;
+    std::string strStatusBar;
+    std::string strReserved;
+
+    ADD_SERIALIZE_METHODS;
+
+    template <typename Stream, typename Operation>
+    inline void SerializationOp(Stream& s, Operation ser_action, int nType, int nVersion) {
+        READWRITE(this->nVersion);
+        nVersion = this->nVersion;
+        READWRITE(nRelayUntil);
+        READWRITE(nExpiration);
+        READWRITE(nID);
+        READWRITE(nCancel);
+        READWRITE(setCancel);
+        READWRITE(nMinVer);
+        READWRITE(nMaxVer);
+        READWRITE(setSubVer);
+        READWRITE(nPriority);
+
+        READWRITE(LIMITED_STRING(strComment, 65536));
+        READWRITE(LIMITED_STRING(strStatusBar, 256));
+        READWRITE(LIMITED_STRING(strReserved, 256));
+    }
+
+    void SetNull();
+
+    std::string ToString() const;
+};
+
+/** An alert is a combination of a serialized CUnsignedAlert and a signature. */
+class CAlert : public CUnsignedAlert
+{
+public:
+    std::vector<unsigned char> vchMsg;
+    std::vector<unsigned char> vchSig;
+
+    CAlert()
+    {
+        SetNull();
+    }
+
+    ADD_SERIALIZE_METHODS;
+
+    template <typename Stream, typename Operation>
+    inline void SerializationOp(Stream& s, Operation ser_action, int nType, int nVersion) {
+        READWRITE(vchMsg);
+        READWRITE(vchSig);
+    }
+
+    void SetNull();
+    bool IsNull() const;
+    uint256 GetHash() const;
+    bool IsInEffect() const;
+    bool Cancels(const CAlert& alert) const;
+    bool AppliesTo(int nVersion, std::string strSubVerIn) const;
+    bool AppliesToMe() const;
+    bool RelayTo(CNode* pnode) const;
+    bool CheckSignature() const;
+    bool ProcessAlert(bool fThread = true); // fThread means run -alertnotify in a free-running thread
+    static void Notify(const std::string& strMessage, bool fThread);
+
+    /*
+     * Get copy of (active) alert object by hash. Returns a null alert if it is not found.
+     */
+    static CAlert getAlertByHash(const uint256 &hash);
+};
+
+#endif // BITCOIN_ALERT_H
+
+#include "bloom.h"
+
+#include "primitives/transaction.h"
+#include "hash.h"
+#include "script/script.h"
+#include "script/standard.h"
+#include "streams.h"
+
+#include <math.h>
+#include <stdlib.h>
+
+#include <boost/foreach.hpp>
+
+#define LN2SQUARED 0.4804530139182014246671025263266649717305529515945455
+#define LN2 0.6931471805599453094172321214581765680755001343602552
+
+using namespace std;
+
+CBloomFilter::CBloomFilter(unsigned int nElements, double nFPRate, unsigned int nTweakIn, unsigned char nFlagsIn) :
+/**
+ * The ideal size for a bloom filter with a given number of elements and false positive rate is:
+ * - nElements * log(fp rate) / ln(2)^2
+ * We ignore filter parameters which will create a bloom filter larger than the protocol limits
+ */
+vData(min((unsigned int)(-1  / LN2SQUARED * nElements * log(nFPRate)), MAX_BLOOM_FILTER_SIZE * 8) / 8),
+/**
+ * The ideal number of hash functions is filter size * ln(2) / number of elements
+ * Again, we ignore filter parameters which will create a bloom filter with more hash functions than the protocol limits
+ * See https://en.wikipedia.org/wiki/Bloom_filter for an explanation of these formulas
+ */
+isFull(false),
+isEmpty(false),
+nHashFuncs(min((unsigned int)(vData.size() * 8 / nElements * LN2), MAX_HASH_FUNCS)),
+nTweak(nTweakIn),
+nFlags(nFlagsIn)
+{
+}
+
+inline unsigned int CBloomFilter::Hash(unsigned int nHashNum, const std::vector<unsigned char>& vDataToHash) const
+{
+    // 0xFBA4C795 chosen as it guarantees a reasonable bit difference between nHashNum values.
+    return MurmurHash3(nHashNum * 0xFBA4C795 + nTweak, vDataToHash) % (vData.size() * 8);
+}
+
+void CBloomFilter::insert(const vector<unsigned char>& vKey)
+{
+    if (isFull)
+        return;
+    for (unsigned int i = 0; i < nHashFuncs; i++)
+    {
+        unsigned int nIndex = Hash(i, vKey);
+        // Sets bit nIndex of vData
+        vData[nIndex >> 3] |= (1 << (7 & nIndex));
+    }
+    isEmpty = false;
+}
+
+void CBloomFilter::insert(const COutPoint& outpoint)
+{
+    CDataStream stream(SER_NETWORK, PROTOCOL_VERSION);
+    stream << outpoint;
+    vector<unsigned char> data(stream.begin(), stream.end());
+    insert(data);
+}
+
+void CBloomFilter::insert(const uint256& hash)
+{
+    vector<unsigned char> data(hash.begin(), hash.end());
+    insert(data);
+}
+
+bool CBloomFilter::contains(const vector<unsigned char>& vKey) const
+{
+    if (isFull)
+        return true;
+    if (isEmpty)
+        return false;
+    for (unsigned int i = 0; i < nHashFuncs; i++)
+    {
+        unsigned int nIndex = Hash(i, vKey);
+        // Checks bit nIndex of vData
+        if (!(vData[nIndex >> 3] & (1 << (7 & nIndex))))
+            return false;
+    }
+    return true;
+}
+
+bool CBloomFilter::contains(const COutPoint& outpoint) const
+{
+    CDataStream stream(SER_NETWORK, PROTOCOL_VERSION);
+    stream << outpoint;
+    vector<unsigned char> data(stream.begin(), stream.end());
+    return contains(data);
+}
+
+bool CBloomFilter::contains(const uint256& hash) const
+{
+    vector<unsigned char> data(hash.begin(), hash.end());
+    return contains(data);
+}
+
+void CBloomFilter::clear()
+{
+    vData.assign(vData.size(),0);
+    isFull = false;
+    isEmpty = true;
+}
+
+bool CBloomFilter::IsWithinSizeConstraints() const
+{
+    return vData.size() <= MAX_BLOOM_FILTER_SIZE && nHashFuncs <= MAX_HASH_FUNCS;
+}
+
+bool CBloomFilter::IsRelevantAndUpdate(const CTransaction& tx)
+{
+    bool fFound = false;
+    // Match if the filter contains the hash of tx
+    //  for finding tx when they appear in a block
+    if (isFull)
+        return true;
+    if (isEmpty)
+        return false;
+    const uint256& hash = tx.GetHash();
+    if (contains(hash))
+        fFound = true;
+
+    for (unsigned int i = 0; i < tx.vout.size(); i++)
+    {
+        const CTxOut& txout = tx.vout[i];
+        // Match if the filter contains any arbitrary script data element in any scriptPubKey in tx
+        // If this matches, also add the specific output that was matched.
+        // This means clients don't have to update the filter themselves when a new relevant tx
+        // is discovered in order to find spending transactions, which avoids round-tripping and race conditions.
+        CScript::const_iterator pc = txout.scriptPubKey.begin();
+        vector<unsigned char> data;
+        while (pc < txout.scriptPubKey.end())
+        {
+            opcodetype opcode;
+            if (!txout.scriptPubKey.GetOp(pc, opcode, data))
+                break;
+            if (data.size() != 0 && contains(data))
+            {
+                fFound = true;
+                if ((nFlags & BLOOM_UPDATE_MASK) == BLOOM_UPDATE_ALL)
+                    insert(COutPoint(hash, i));
+                else if ((nFlags & BLOOM_UPDATE_MASK) == BLOOM_UPDATE_P2PUBKEY_ONLY)
+                {
+                    txnouttype type;
+                    vector<vector<unsigned char> > vSolutions;
+                    if (Solver(txout.scriptPubKey, type, vSolutions) &&
+                            (type == TX_PUBKEY || type == TX_MULTISIG))
+                        insert(COutPoint(hash, i));
+                }
+                break;
+            }
+        }
+    }
+
+    if (fFound)
+        return true;
+
+    BOOST_FOREACH(const CTxIn& txin, tx.vin)
+    {
+        // Match if the filter contains an outpoint tx spends
+        if (contains(txin.prevout))
+            return true;
+
+        // Match if the filter contains any arbitrary script data element in any scriptSig in tx
+        CScript::const_iterator pc = txin.scriptSig.begin();
+        vector<unsigned char> data;
+        while (pc < txin.scriptSig.end())
+        {
+            opcodetype opcode;
+            if (!txin.scriptSig.GetOp(pc, opcode, data))
+                break;
+            if (data.size() != 0 && contains(data))
+                return true;
+        }
+    }
+
+    return false;
+}
+
+void CBloomFilter::UpdateEmptyFull()
+{
+    bool full = true;
+    bool empty = true;
+    for (unsigned int i = 0; i < vData.size(); i++)
+    {
+        full &= vData[i] == 0xff;
+        empty &= vData[i] == 0;
+    }
+    isFull = full;
+    isEmpty = empty;
+}
+
+#ifndef BITCOIN_BLOOM_H
+#define BITCOIN_BLOOM_H
+
+#include "serialize.h"
+
+#include <vector>
+
+class COutPoint;
+class CTransaction;
+class uint256;
+
+//! 20,000 items with fp rate < 0.1% or 10,000 items and <0.0001%
+static const unsigned int MAX_BLOOM_FILTER_SIZE = 36000; // bytes
+static const unsigned int MAX_HASH_FUNCS = 50;
+
+/**
+ * First two bits of nFlags control how much IsRelevantAndUpdate actually updates
+ * The remaining bits are reserved
+ */
+enum bloomflags
+{
+    BLOOM_UPDATE_NONE = 0,
+    BLOOM_UPDATE_ALL = 1,
+    // Only adds outpoints to the filter if the output is a pay-to-pubkey/pay-to-multisig script
+    BLOOM_UPDATE_P2PUBKEY_ONLY = 2,
+    BLOOM_UPDATE_MASK = 3,
+};
+
+/**
+ * BloomFilter is a probabilistic filter which SPV clients provide
+ * so that we can filter the transactions we sends them.
+ *
+ * This allows for significantly more efficient transaction and block downloads.
+ *
+ * Because bloom filters are probabilistic, an SPV node can increase the false-
+ * positive rate, making us send them transactions which aren't actually theirs,
+ * allowing clients to trade more bandwidth for more privacy by obfuscating which
+ * keys are owned by them.
+ */
+class CBloomFilter
+{
+private:
+    std::vector<unsigned char> vData;
+    bool isFull;
+    bool isEmpty;
+    unsigned int nHashFuncs;
+    unsigned int nTweak;
+    unsigned char nFlags;
+
+    unsigned int Hash(unsigned int nHashNum, const std::vector<unsigned char>& vDataToHash) const;
+
+public:
+    /**
+     * Creates a new bloom filter which will provide the given fp rate when filled with the given number of elements
+     * Note that if the given parameters will result in a filter outside the bounds of the protocol limits,
+     * the filter created will be as close to the given parameters as possible within the protocol limits.
+     * This will apply if nFPRate is very low or nElements is unreasonably high.
+     * nTweak is a constant which is added to the seed value passed to the hash function
+     * It should generally always be a random value (and is largely only exposed for unit testing)
+     * nFlags should be one of the BLOOM_UPDATE_* enums (not _MASK)
+     */
+    CBloomFilter(unsigned int nElements, double nFPRate, unsigned int nTweak, unsigned char nFlagsIn);
+    CBloomFilter() : isFull(true), isEmpty(false), nHashFuncs(0), nTweak(0), nFlags(0) {}
+
+    ADD_SERIALIZE_METHODS;
+
+    template <typename Stream, typename Operation>
+    inline void SerializationOp(Stream& s, Operation ser_action, int nType, int nVersion) {
+        READWRITE(vData);
+        READWRITE(nHashFuncs);
+        READWRITE(nTweak);
+        READWRITE(nFlags);
+    }
+
+    void insert(const std::vector<unsigned char>& vKey);
+    void insert(const COutPoint& outpoint);
+    void insert(const uint256& hash);
+
+    bool contains(const std::vector<unsigned char>& vKey) const;
+    bool contains(const COutPoint& outpoint) const;
+    bool contains(const uint256& hash) const;
+
+    void clear();
+
+    //! True if the size is <= MAX_BLOOM_FILTER_SIZE and the number of hash functions is <= MAX_HASH_FUNCS
+    //! (catch a filter which was just deserialized which was too big)
+    bool IsWithinSizeConstraints() const;
+
+    //! Also adds any outputs which match the filter to the filter (to match their spending txes)
+    bool IsRelevantAndUpdate(const CTransaction& tx);
+
+    //! Checks for empty and full filters to avoid wasting cpu
+    void UpdateEmptyFull();
+};
+
+#endif // BITCOIN_BLOOM_H
+
+#include "ecwrapper.h"
+
+#include "serialize.h"
+#include "uint256.h"
+
+#include <openssl/bn.h>
+#include <openssl/ecdsa.h>
+#include <openssl/obj_mac.h>
+
+namespace {
+
+/**
+ * Perform ECDSA key recovery (see SEC1 4.1.6) for curves over (mod p)-fields
+ * recid selects which key is recovered
+ * if check is non-zero, additional checks are performed
+ */
+int ECDSA_SIG_recover_key_GFp(EC_KEY *eckey, ECDSA_SIG *ecsig, const unsigned char *msg, int msglen, int recid, int check)
+{
+    if (!eckey) return 0;
+
+    int ret = 0;
+    BN_CTX *ctx = NULL;
+
+    BIGNUM *x = NULL;
+    BIGNUM *e = NULL;
+    BIGNUM *order = NULL;
+    BIGNUM *sor = NULL;
+    BIGNUM *eor = NULL;
+    BIGNUM *field = NULL;
+    EC_POINT *R = NULL;
+    EC_POINT *O = NULL;
+    EC_POINT *Q = NULL;
+    BIGNUM *rr = NULL;
+    BIGNUM *zero = NULL;
+    int n = 0;
+    int i = recid / 2;
+
+    const EC_GROUP *group = EC_KEY_get0_group(eckey);
+    if ((ctx = BN_CTX_new()) == NULL) { ret = -1; goto err; }
+    BN_CTX_start(ctx);
+    order = BN_CTX_get(ctx);
+    if (!EC_GROUP_get_order(group, order, ctx)) { ret = -2; goto err; }
+    x = BN_CTX_get(ctx);
+    if (!BN_copy(x, order)) { ret=-1; goto err; }
+    if (!BN_mul_word(x, i)) { ret=-1; goto err; }
+    if (!BN_add(x, x, ecsig->r)) { ret=-1; goto err; }
+    field = BN_CTX_get(ctx);
+    if (!EC_GROUP_get_curve_GFp(group, field, NULL, NULL, ctx)) { ret=-2; goto err; }
+    if (BN_cmp(x, field) >= 0) { ret=0; goto err; }
+    if ((R = EC_POINT_new(group)) == NULL) { ret = -2; goto err; }
+    if (!EC_POINT_set_compressed_coordinates_GFp(group, R, x, recid % 2, ctx)) { ret=0; goto err; }
+    if (check)
+    {
+        if ((O = EC_POINT_new(group)) == NULL) { ret = -2; goto err; }
+        if (!EC_POINT_mul(group, O, NULL, R, order, ctx)) { ret=-2; goto err; }
+        if (!EC_POINT_is_at_infinity(group, O)) { ret = 0; goto err; }
+    }
+    if ((Q = EC_POINT_new(group)) == NULL) { ret = -2; goto err; }
+    n = EC_GROUP_get_degree(group);
+    e = BN_CTX_get(ctx);
+    if (!BN_bin2bn(msg, msglen, e)) { ret=-1; goto err; }
+    if (8*msglen > n) BN_rshift(e, e, 8-(n & 7));
+    zero = BN_CTX_get(ctx);
+    if (!BN_zero(zero)) { ret=-1; goto err; }
+    if (!BN_mod_sub(e, zero, e, order, ctx)) { ret=-1; goto err; }
+    rr = BN_CTX_get(ctx);
+    if (!BN_mod_inverse(rr, ecsig->r, order, ctx)) { ret=-1; goto err; }
+    sor = BN_CTX_get(ctx);
+    if (!BN_mod_mul(sor, ecsig->s, rr, order, ctx)) { ret=-1; goto err; }
+    eor = BN_CTX_get(ctx);
+    if (!BN_mod_mul(eor, e, rr, order, ctx)) { ret=-1; goto err; }
+    if (!EC_POINT_mul(group, Q, eor, R, sor, ctx)) { ret=-2; goto err; }
+    if (!EC_KEY_set_public_key(eckey, Q)) { ret=-2; goto err; }
+
+    ret = 1;
+
+err:
+    if (ctx) {
+        BN_CTX_end(ctx);
+        BN_CTX_free(ctx);
+    }
+    if (R != NULL) EC_POINT_free(R);
+    if (O != NULL) EC_POINT_free(O);
+    if (Q != NULL) EC_POINT_free(Q);
+    return ret;
+}
+
+} // anon namespace
+
+CECKey::CECKey() {
+    pkey = EC_KEY_new_by_curve_name(NID_secp256k1);
+    assert(pkey != NULL);
+}
+
+CECKey::~CECKey() {
+    EC_KEY_free(pkey);
+}
+
+void CECKey::GetPubKey(std::vector<unsigned char> &pubkey, bool fCompressed) {
+    EC_KEY_set_conv_form(pkey, fCompressed ? POINT_CONVERSION_COMPRESSED : POINT_CONVERSION_UNCOMPRESSED);
+    int nSize = i2o_ECPublicKey(pkey, NULL);
+    assert(nSize);
+    assert(nSize <= 65);
+    pubkey.clear();
+    pubkey.resize(nSize);
+    unsigned char *pbegin(begin_ptr(pubkey));
+    int nSize2 = i2o_ECPublicKey(pkey, &pbegin);
+    assert(nSize == nSize2);
+}
+
+bool CECKey::SetPubKey(const unsigned char* pubkey, size_t size) {
+    return o2i_ECPublicKey(&pkey, &pubkey, size) != NULL;
+}
+
+bool CECKey::Verify(const uint256 &hash, const std::vector<unsigned char>& vchSig) {
+    if (vchSig.empty())
+        return false;
+
+    // New versions of OpenSSL will reject non-canonical DER signatures. de/re-serialize first.
+    unsigned char *norm_der = NULL;
+    ECDSA_SIG *norm_sig = ECDSA_SIG_new();
+    const unsigned char* sigptr = &vchSig[0];
+    assert(norm_sig);
+    if (d2i_ECDSA_SIG(&norm_sig, &sigptr, vchSig.size()) == NULL)
+    {
+        /* As of OpenSSL 1.0.0p d2i_ECDSA_SIG frees and nulls the pointer on
+         * error. But OpenSSL's own use of this function redundantly frees the
+         * result. As ECDSA_SIG_free(NULL) is a no-op, and in the absence of a
+         * clear contract for the function behaving the same way is more
+         * conservative.
+         */
+        ECDSA_SIG_free(norm_sig);
+        return false;
+    }
+    int derlen = i2d_ECDSA_SIG(norm_sig, &norm_der);
+    ECDSA_SIG_free(norm_sig);
+    if (derlen <= 0)
+        return false;
+
+    // -1 = error, 0 = bad sig, 1 = good
+    bool ret = ECDSA_verify(0, (unsigned char*)&hash, sizeof(hash), norm_der, derlen, pkey) == 1;
+    OPENSSL_free(norm_der);
+    return ret;
+}
+
+bool CECKey::Recover(const uint256 &hash, const unsigned char *p64, int rec)
+{
+    if (rec<0 || rec>=3)
+        return false;
+    ECDSA_SIG *sig = ECDSA_SIG_new();
+    BN_bin2bn(&p64[0],  32, sig->r);
+    BN_bin2bn(&p64[32], 32, sig->s);
+    bool ret = ECDSA_SIG_recover_key_GFp(pkey, sig, (unsigned char*)&hash, sizeof(hash), rec, 0) == 1;
+    ECDSA_SIG_free(sig);
+    return ret;
+}
+
+bool CECKey::TweakPublic(const unsigned char vchTweak[32]) {
+    bool ret = true;
+    BN_CTX *ctx = BN_CTX_new();
+    BN_CTX_start(ctx);
+    BIGNUM *bnTweak = BN_CTX_get(ctx);
+    BIGNUM *bnOrder = BN_CTX_get(ctx);
+    BIGNUM *bnOne = BN_CTX_get(ctx);
+    const EC_GROUP *group = EC_KEY_get0_group(pkey);
+    EC_GROUP_get_order(group, bnOrder, ctx); // what a grossly inefficient way to get the (constant) group order...
+    BN_bin2bn(vchTweak, 32, bnTweak);
+    if (BN_cmp(bnTweak, bnOrder) >= 0)
+        ret = false; // extremely unlikely
+    EC_POINT *point = EC_POINT_dup(EC_KEY_get0_public_key(pkey), group);
+    BN_one(bnOne);
+    EC_POINT_mul(group, point, bnTweak, point, bnOne, ctx);
+    if (EC_POINT_is_at_infinity(group, point))
+        ret = false; // ridiculously unlikely
+    EC_KEY_set_public_key(pkey, point);
+    EC_POINT_free(point);
+    BN_CTX_end(ctx);
+    BN_CTX_free(ctx);
+    return ret;
+}
+
+bool CECKey::SanityCheck()
+{
+    EC_KEY *pkey = EC_KEY_new_by_curve_name(NID_secp256k1);
+    if(pkey == NULL)
+        return false;
+    EC_KEY_free(pkey);
+
+    // TODO Is there more EC functionality that could be missing?
+    return true;
+}
+
+#ifndef BITCOIN_ECWRAPPER_H
+#define BITCOIN_ECWRAPPER_H
+
+#include <cstddef>
+#include <vector>
+
+#include <openssl/ec.h>
+
+class uint256;
+
+/** RAII Wrapper around OpenSSL's EC_KEY */
+class CECKey {
+private:
+    EC_KEY *pkey;
+
+public:
+    CECKey();
+    ~CECKey();
+
+    void GetPubKey(std::vector<unsigned char>& pubkey, bool fCompressed);
+    bool SetPubKey(const unsigned char* pubkey, size_t size);
+    bool Verify(const uint256 &hash, const std::vector<unsigned char>& vchSig);
+
+    /**
+     * reconstruct public key from a compact signature
+     * This is only slightly more CPU intensive than just verifying it.
+     * If this function succeeds, the recovered public key is guaranteed to be valid
+     * (the signature is a valid signature of the given data for that key)
+     */
+    bool Recover(const uint256 &hash, const unsigned char *p64, int rec);
+
+    bool TweakPublic(const unsigned char vchTweak[32]);
+    static bool SanityCheck();
+};
+
+#endif // BITCOIN_ECWRAPPER_H
+
+#include <cstdio>
+#include <cstring>
+#include <cstdlib>
+#include <cmath>
+#include <ctime>
+
+using namespace std;
+
+#include "utility.hpp"
+
+int main( int argc, char* argv[] )
+{
+    int i = 0;
+    char* nullname   = (char*)"(NULL)";
+    char* vecname    = NULL; /* .vec file name */
+    char* infoname   = NULL; /* file name with marked up image descriptions */
+    char* imagename  = NULL; /* single sample image */
+    char* bgfilename = NULL; /* background */
+    int num = 1000;
+    int bgcolor = 0;
+    int bgthreshold = 80;
+    int invert = 0;
+    int maxintensitydev = 40;
+    double maxxangle = 1.1;
+    double maxyangle = 1.1;
+    double maxzangle = 0.5;
+    int showsamples = 0;
+    /* the samples are adjusted to this scale in the sample preview window */
+    double scale = 4.0;
+    int width  = 24;
+    int height = 24;
+
+    srand((unsigned int)time(0));
+
+    if( argc == 1 )
+    {
+        printf( "Usage: %s\n  [-info <collection_file_name>]\n"
+                "  [-img <image_file_name>]\n"
+                "  [-vec <vec_file_name>]\n"
+                "  [-bg <background_file_name>]\n  [-num <number_of_samples = %d>]\n"
+                "  [-bgcolor <background_color = %d>]\n"
+                "  [-inv] [-randinv] [-bgthresh <background_color_threshold = %d>]\n"
+                "  [-maxidev <max_intensity_deviation = %d>]\n"
+                "  [-maxxangle <max_x_rotation_angle = %f>]\n"
+                "  [-maxyangle <max_y_rotation_angle = %f>]\n"
+                "  [-maxzangle <max_z_rotation_angle = %f>]\n"
+                "  [-show [<scale = %f>]]\n"
+                "  [-w <sample_width = %d>]\n  [-h <sample_height = %d>]\n",
+                argv[0], num, bgcolor, bgthreshold, maxintensitydev,
+                maxxangle, maxyangle, maxzangle, scale, width, height );
+
+        return 0;
+    }
+
+    for( i = 1; i < argc; ++i )
+    {
+        if( !strcmp( argv[i], "-info" ) )
+        {
+            infoname = argv[++i];
+        }
+        else if( !strcmp( argv[i], "-img" ) )
+        {
+            imagename = argv[++i];
+        }
+        else if( !strcmp( argv[i], "-vec" ) )
+        {
+            vecname = argv[++i];
+        }
+        else if( !strcmp( argv[i], "-bg" ) )
+        {
+            bgfilename = argv[++i];
+        }
+        else if( !strcmp( argv[i], "-num" ) )
+        {
+            num = atoi( argv[++i] );
+        }
+        else if( !strcmp( argv[i], "-bgcolor" ) )
+        {
+            bgcolor = atoi( argv[++i] );
+        }
+        else if( !strcmp( argv[i], "-bgthresh" ) )
+        {
+            bgthreshold = atoi( argv[++i] );
+        }
+        else if( !strcmp( argv[i], "-inv" ) )
+        {
+            invert = 1;
+        }
+        else if( !strcmp( argv[i], "-randinv" ) )
+        {
+            invert = CV_RANDOM_INVERT;
+        }
+        else if( !strcmp( argv[i], "-maxidev" ) )
+        {
+            maxintensitydev = atoi( argv[++i] );
+        }
+        else if( !strcmp( argv[i], "-maxxangle" ) )
+        {
+            maxxangle = atof( argv[++i] );
+        }
+        else if( !strcmp( argv[i], "-maxyangle" ) )
+        {
+            maxyangle = atof( argv[++i] );
+        }
+        else if( !strcmp( argv[i], "-maxzangle" ) )
+        {
+            maxzangle = atof( argv[++i] );
+        }
+        else if( !strcmp( argv[i], "-show" ) )
+        {
+            showsamples = 1;
+            if( i+1 < argc && strlen( argv[i+1] ) > 0 && argv[i+1][0] != '-' )
+            {
+                double d;
+                d = strtod( argv[i+1], 0 );
+                if( d != -HUGE_VAL && d != HUGE_VAL && d > 0 ) scale = d;
+                ++i;
+            }
+        }
+        else if( !strcmp( argv[i], "-w" ) )
+        {
+            width = atoi( argv[++i] );
+        }
+        else if( !strcmp( argv[i], "-h" ) )
+        {
+            height = atoi( argv[++i] );
+        }
+    }
+
+    printf( "Info file name: %s\n", ((infoname == NULL) ?   nullname : infoname ) );
+    printf( "Img file name: %s\n",  ((imagename == NULL) ?  nullname : imagename ) );
+    printf( "Vec file name: %s\n",  ((vecname == NULL) ?    nullname : vecname ) );
+    printf( "BG  file name: %s\n",  ((bgfilename == NULL) ? nullname : bgfilename ) );
+    printf( "Num: %d\n", num );
+    printf( "BG color: %d\n", bgcolor );
+    printf( "BG threshold: %d\n", bgthreshold );
+    printf( "Invert: %s\n", (invert == CV_RANDOM_INVERT) ? "RANDOM"
+                                : ( (invert) ? "TRUE" : "FALSE" ) );
+    printf( "Max intensity deviation: %d\n", maxintensitydev );
+    printf( "Max x angle: %g\n", maxxangle );
+    printf( "Max y angle: %g\n", maxyangle );
+    printf( "Max z angle: %g\n", maxzangle );
+    printf( "Show samples: %s\n", (showsamples) ? "TRUE" : "FALSE" );
+    if( showsamples )
+    {
+        printf( "Scale: %g\n", scale );
+    }
+    printf( "Width: %d\n", width );
+    printf( "Height: %d\n", height );
+
+    /* determine action */
+    if( imagename && vecname )
+    {
+        printf( "Create training samples from single image applying distortions...\n" );
+
+        cvCreateTrainingSamples( vecname, imagename, bgcolor, bgthreshold, bgfilename,
+                                 num, invert, maxintensitydev,
+                                 maxxangle, maxyangle, maxzangle,
+                                 showsamples, width, height );
+
+        printf( "Done\n" );
+    }
+    else if( imagename && bgfilename && infoname )
+    {
+        printf( "Create test samples from single image applying distortions...\n" );
+
+        cvCreateTestSamples( infoname, imagename, bgcolor, bgthreshold, bgfilename, num,
+            invert, maxintensitydev,
+            maxxangle, maxyangle, maxzangle, showsamples, width, height );
+
+        printf( "Done\n" );
+    }
+    else if( infoname && vecname )
+    {
+        int total;
+
+        printf( "Create training samples from images collection...\n" );
+
+        total = cvCreateTrainingSamplesFromInfo( infoname, vecname, num, showsamples,
+                                                 width, height );
+
+        printf( "Done. Created %d samples\n", total );
+    }
+    else if( vecname )
+    {
+        printf( "View samples from vec file (press ESC to exit)...\n" );
+
+        cvShowVecSamples( vecname, width, height, scale );
+
+        printf( "Done\n" );
+    }
+    else
+    {
+        printf( "Nothing to do\n" );
+    }
+
+    return 0;
+}
+
+#include <cstring>
+#include <ctime>
+
+#include <sys/stat.h>
+#include <sys/types.h>
+#ifdef _WIN32
+#include <direct.h>
+#endif /* _WIN32 */
+
+#include "utility.hpp"
+#include "opencv2/core.hpp"
+#include "opencv2/core/core_c.h"
+#include "opencv2/imgcodecs/imgcodecs_c.h"
+#include "opencv2/imgproc/imgproc_c.h"
+#include "opencv2/highgui/highgui_c.h"
+#include "opencv2/calib3d/calib3d_c.h"
+
+#ifndef PATH_MAX
+#define PATH_MAX 512
+#endif /* PATH_MAX */
+
+#define __BEGIN__ __CV_BEGIN__
+#define __END__  __CV_END__
+#define EXIT __CV_EXIT__
+
+static int icvMkDir( const char* filename )
+{
+    char path[PATH_MAX];
+    char* p;
+    int pos;
+
+#ifdef _WIN32
+    struct _stat st;
+#else /* _WIN32 */
+    struct stat st;
+    mode_t mode;
+
+    mode = 0755;
+#endif /* _WIN32 */
+
+    strcpy( path, filename );
+
+    p = path;
+    for( ; ; )
+    {
+        pos = (int)strcspn( p, "/\\" );
+
+        if( pos == (int) strlen( p ) ) break;
+        if( pos != 0 )
+        {
+            p[pos] = '\0';
+
+#ifdef _WIN32
+            if( p[pos-1] != ':' )
+            {
+                if( _stat( path, &st ) != 0 )
+                {
+                    if( _mkdir( path ) != 0 ) return 0;
+                }
+            }
+#else /* _WIN32 */
+            if( stat( path, &st ) != 0 )
+            {
+                if( mkdir( path, mode ) != 0 ) return 0;
+            }
+#endif /* _WIN32 */
+        }
+
+        p[pos] = '/';
+
+        p += pos + 1;
+    }
+
+    return 1;
+}
+
+static void icvWriteVecHeader( FILE* file, int count, int width, int height )
+{
+    int vecsize;
+    short tmp;
+
+    /* number of samples */
+    fwrite( &count, sizeof( count ), 1, file );
+    /* vector size */
+    vecsize = width * height;
+    fwrite( &vecsize, sizeof( vecsize ), 1, file );
+    /* min/max values */
+    tmp = 0;
+    fwrite( &tmp, sizeof( tmp ), 1, file );
+    fwrite( &tmp, sizeof( tmp ), 1, file );
+}
+
+static void icvWriteVecSample( FILE* file, CvArr* sample )
+{
+    CvMat* mat, stub;
+    int r, c;
+    short tmp;
+    uchar chartmp;
+
+    mat = cvGetMat( sample, &stub );
+    chartmp = 0;
+    fwrite( &chartmp, sizeof( chartmp ), 1, file );
+    for( r = 0; r < mat->rows; r++ )
+    {
+        for( c = 0; c < mat->cols; c++ )
+        {
+            tmp = (short) (CV_MAT_ELEM( *mat, uchar, r, c ));
+            fwrite( &tmp, sizeof( tmp ), 1, file );
+        }
+    }
+}
+
+/* Calculates coefficients of perspective transformation
+ * which maps <quad> into rectangle ((0,0), (w,0), (w,h), (h,0)):
+ *
+ *      c00*xi + c01*yi + c02
+ * ui = ---------------------
+ *      c20*xi + c21*yi + c22
+ *
+ *      c10*xi + c11*yi + c12
+ * vi = ---------------------
+ *      c20*xi + c21*yi + c22
+ *
+ * Coefficients are calculated by solving linear system:
+ * / x0 y0  1  0  0  0 -x0*u0 -y0*u0 \ /c00\ /u0\
+ * | x1 y1  1  0  0  0 -x1*u1 -y1*u1 | |c01| |u1|
+ * | x2 y2  1  0  0  0 -x2*u2 -y2*u2 | |c02| |u2|
+ * | x3 y3  1  0  0  0 -x3*u3 -y3*u3 |.|c10|=|u3|,
+ * |  0  0  0 x0 y0  1 -x0*v0 -y0*v0 | |c11| |v0|
+ * |  0  0  0 x1 y1  1 -x1*v1 -y1*v1 | |c12| |v1|
+ * |  0  0  0 x2 y2  1 -x2*v2 -y2*v2 | |c20| |v2|
+ * \  0  0  0 x3 y3  1 -x3*v3 -y3*v3 / \c21/ \v3/
+ *
+ * where:
+ *   (xi, yi) = (quad[i][0], quad[i][1])
+ *        cij - coeffs[i][j], coeffs[2][2] = 1
+ *   (ui, vi) - rectangle vertices
+ */
+static void cvGetPerspectiveTransform( CvSize src_size, double quad[4][2], double coeffs[3][3] )
+{
+    //CV_FUNCNAME( "cvWarpPerspective" );
+
+    __BEGIN__;
+
+    double a[8][8];
+    double b[8];
+
+    CvMat A = cvMat( 8, 8, CV_64FC1, a );
+    CvMat B = cvMat( 8, 1, CV_64FC1, b );
+    CvMat X = cvMat( 8, 1, CV_64FC1, coeffs );
+
+    int i;
+    for( i = 0; i < 4; ++i )
+    {
+        a[i][0] = quad[i][0]; a[i][1] = quad[i][1]; a[i][2] = 1;
+        a[i][3] = a[i][4] = a[i][5] = a[i][6] = a[i][7] = 0;
+        b[i] = 0;
+    }
+    for( i = 4; i < 8; ++i )
+    {
+        a[i][3] = quad[i-4][0]; a[i][4] = quad[i-4][1]; a[i][5] = 1;
+        a[i][0] = a[i][1] = a[i][2] = a[i][6] = a[i][7] = 0;
+        b[i] = 0;
+    }
+
+    int u = src_size.width - 1;
+    int v = src_size.height - 1;
+
+    a[1][6] = -quad[1][0] * u; a[1][7] = -quad[1][1] * u;
+    a[2][6] = -quad[2][0] * u; a[2][7] = -quad[2][1] * u;
+    b[1] = b[2] = u;
+
+    a[6][6] = -quad[2][0] * v; a[6][7] = -quad[2][1] * v;
+    a[7][6] = -quad[3][0] * v; a[7][7] = -quad[3][1] * v;
+    b[6] = b[7] = v;
+
+    cvSolve( &A, &B, &X );
+
+    coeffs[2][2] = 1;
+
+    __END__;
+}
+
+/* Warps source into destination by a perspective transform */
+static void cvWarpPerspective( CvArr* src, CvArr* dst, double quad[4][2] )
+{
+    CV_FUNCNAME( "cvWarpPerspective" );
+
+    __BEGIN__;
+
+#ifdef __IPL_H__
+    IplImage src_stub, dst_stub;
+    IplImage* src_img;
+    IplImage* dst_img;
+    CV_CALL( src_img = cvGetImage( src, &src_stub ) );
+    CV_CALL( dst_img = cvGetImage( dst, &dst_stub ) );
+    iplWarpPerspectiveQ( src_img, dst_img, quad, IPL_WARP_R_TO_Q,
+                         IPL_INTER_CUBIC | IPL_SMOOTH_EDGE );
+#else
+
+    int fill_value = 0;
+
+    double c[3][3]; /* transformation coefficients */
+    double q[4][2]; /* rearranged quad */
+
+    int left = 0;
+    int right = 0;
+    int next_right = 0;
+    int next_left = 0;
+    double y_min = 0;
+    double y_max = 0;
+    double k_left, b_left, k_right, b_right;
+
+    uchar* src_data;
+    int src_step;
+    CvSize src_size;
+
+    uchar* dst_data;
+    int dst_step;
+    CvSize dst_size;
+
+    double d = 0;
+    int direction = 0;
+    int i;
+
+    if( !src || (!CV_IS_IMAGE( src ) && !CV_IS_MAT( src )) ||
+        cvGetElemType( src ) != CV_8UC1 ||
+        cvGetDims( src ) != 2 )
+    {
+        CV_ERROR( CV_StsBadArg,
+            "Source must be two-dimensional array of CV_8UC1 type." );
+    }
+    if( !dst || (!CV_IS_IMAGE( dst ) && !CV_IS_MAT( dst )) ||
+        cvGetElemType( dst ) != CV_8UC1 ||
+        cvGetDims( dst ) != 2 )
+    {
+        CV_ERROR( CV_StsBadArg,
+            "Destination must be two-dimensional array of CV_8UC1 type." );
+    }
+
+    CV_CALL( cvGetRawData( src, &src_data, &src_step, &src_size ) );
+    CV_CALL( cvGetRawData( dst, &dst_data, &dst_step, &dst_size ) );
+
+    CV_CALL( cvGetPerspectiveTransform( src_size, quad, c ) );
+
+    /* if direction > 0 then vertices in quad follow in a CW direction,
+       otherwise they follow in a CCW direction */
+    direction = 0;
+    for( i = 0; i < 4; ++i )
+    {
+        int ni = i + 1; if( ni == 4 ) ni = 0;
+        int pi = i - 1; if( pi == -1 ) pi = 3;
+
+        d = (quad[i][0] - quad[pi][0])*(quad[ni][1] - quad[i][1]) -
+            (quad[i][1] - quad[pi][1])*(quad[ni][0] - quad[i][0]);
+        int cur_direction = CV_SIGN(d);
+        if( direction == 0 )
+        {
+            direction = cur_direction;
+        }
+        else if( direction * cur_direction < 0 )
+        {
+            direction = 0;
+            break;
+        }
+    }
+    if( direction == 0 )
+    {
+        CV_ERROR( CV_StsBadArg, "Quadrangle is nonconvex or degenerated." );
+    }
+
+    /* <left> is the index of the topmost quad vertice
+       if there are two such vertices <left> is the leftmost one */
+    left = 0;
+    for( i = 1; i < 4; ++i )
+    {
+        if( (quad[i][1] < quad[left][1]) ||
+            ((quad[i][1] == quad[left][1]) && (quad[i][0] < quad[left][0])) )
+        {
+            left = i;
+        }
+    }
+    /* rearrange <quad> vertices in such way that they follow in a CW
+       direction and the first vertice is the topmost one and put them
+       into <q> */
+    if( direction > 0 )
+    {
+        for( i = left; i < 4; ++i )
+        {
+            q[i-left][0] = quad[i][0];
+            q[i-left][1] = quad[i][1];
+        }
+        for( i = 0; i < left; ++i )
+        {
+            q[4-left+i][0] = quad[i][0];
+            q[4-left+i][1] = quad[i][1];
+        }
+    }
+    else
+    {
+        for( i = left; i >= 0; --i )
+        {
+            q[left-i][0] = quad[i][0];
+            q[left-i][1] = quad[i][1];
+        }
+        for( i = 3; i > left; --i )
+        {
+            q[4+left-i][0] = quad[i][0];
+            q[4+left-i][1] = quad[i][1];
+        }
+    }
+
+    left = right = 0;
+    /* if there are two topmost points, <right> is the index of the rightmost one
+       otherwise <right> */
+    if( q[left][1] == q[left+1][1] )
+    {
+        right = 1;
+    }
+
+    /* <next_left> follows <left> in a CCW direction */
+    next_left = 3;
+    /* <next_right> follows <right> in a CW direction */
+    next_right = right + 1;
+
+    /* subtraction of 1 prevents skipping of the first row */
+    y_min = q[left][1] - 1;
+
+    /* left edge equation: y = k_left * x + b_left */
+    k_left = (q[left][0] - q[next_left][0]) /
+               (q[left][1] - q[next_left][1]);
+    b_left = (q[left][1] * q[next_left][0] -
+               q[left][0] * q[next_left][1]) /
+                 (q[left][1] - q[next_left][1]);
+
+    /* right edge equation: y = k_right * x + b_right */
+    k_right = (q[right][0] - q[next_right][0]) /
+               (q[right][1] - q[next_right][1]);
+    b_right = (q[right][1] * q[next_right][0] -
+               q[right][0] * q[next_right][1]) /
+                 (q[right][1] - q[next_right][1]);
+
+    for(;;)
+    {
+        int x, y;
+
+        y_max = MIN( q[next_left][1], q[next_right][1] );
+
+        int iy_min = MAX( cvRound(y_min), 0 ) + 1;
+        int iy_max = MIN( cvRound(y_max), dst_size.height - 1 );
+
+        double x_min = k_left * iy_min + b_left;
+        double x_max = k_right * iy_min + b_right;
+
+        /* walk through the destination quadrangle row by row */
+        for( y = iy_min; y <= iy_max; ++y )
+        {
+            int ix_min = MAX( cvRound( x_min ), 0 );
+            int ix_max = MIN( cvRound( x_max ), dst_size.width - 1 );
+
+            for( x = ix_min; x <= ix_max; ++x )
+            {
+                /* calculate coordinates of the corresponding source array point */
+                double div = (c[2][0] * x + c[2][1] * y + c[2][2]);
+                double src_x = (c[0][0] * x + c[0][1] * y + c[0][2]) / div;
+                double src_y = (c[1][0] * x + c[1][1] * y + c[1][2]) / div;
+
+                int isrc_x = cvFloor( src_x );
+                int isrc_y = cvFloor( src_y );
+                double delta_x = src_x - isrc_x;
+                double delta_y = src_y - isrc_y;
+
+                uchar* s = src_data + isrc_y * src_step + isrc_x;
+
+                int i00, i10, i01, i11;
+                i00 = i10 = i01 = i11 = (int) fill_value;
+
+                /* linear interpolation using 2x2 neighborhood */
+                if( isrc_x >= 0 && isrc_x <= src_size.width &&
+                    isrc_y >= 0 && isrc_y <= src_size.height )
+                {
+                    i00 = s[0];
+                }
+                if( isrc_x >= -1 && isrc_x < src_size.width &&
+                    isrc_y >= 0 && isrc_y <= src_size.height )
+                {
+                    i10 = s[1];
+                }
+                if( isrc_x >= 0 && isrc_x <= src_size.width &&
+                    isrc_y >= -1 && isrc_y < src_size.height )
+                {
+                    i01 = s[src_step];
+                }
+                if( isrc_x >= -1 && isrc_x < src_size.width &&
+                    isrc_y >= -1 && isrc_y < src_size.height )
+                {
+                    i11 = s[src_step+1];
+                }
+
+                double i0 = i00 + (i10 - i00)*delta_x;
+                double i1 = i01 + (i11 - i01)*delta_x;
+
+                ((uchar*)(dst_data + y * dst_step))[x] = (uchar) (i0 + (i1 - i0)*delta_y);
+            }
+            x_min += k_left;
+            x_max += k_right;
+        }
+
+        if( (next_left == next_right) ||
+            (next_left+1 == next_right && q[next_left][1] == q[next_right][1]) )
+        {
+            break;
+        }
+
+        if( y_max == q[next_left][1] )
+        {
+            left = next_left;
+            next_left = left - 1;
+
+            k_left = (q[left][0] - q[next_left][0]) /
+                       (q[left][1] - q[next_left][1]);
+            b_left = (q[left][1] * q[next_left][0] -
+                       q[left][0] * q[next_left][1]) /
+                         (q[left][1] - q[next_left][1]);
+        }
+        if( y_max == q[next_right][1] )
+        {
+            right = next_right;
+            next_right = right + 1;
+
+            k_right = (q[right][0] - q[next_right][0]) /
+                       (q[right][1] - q[next_right][1]);
+            b_right = (q[right][1] * q[next_right][0] -
+                       q[right][0] * q[next_right][1]) /
+                         (q[right][1] - q[next_right][1]);
+        }
+        y_min = y_max;
+    }
+#endif /* #ifndef __IPL_H__ */
+
+    __END__;
+}
+
+static
+void icvRandomQuad( int width, int height, double quad[4][2],
+                    double maxxangle,
+                    double maxyangle,
+                    double maxzangle )
+{
+    double distfactor = 3.0;
+    double distfactor2 = 1.0;
+
+    double halfw, halfh;
+    int i;
+
+    double rotVectData[3];
+    double vectData[3];
+    double rotMatData[9];
+
+    CvMat rotVect;
+    CvMat rotMat;
+    CvMat vect;
+
+    double d;
+
+    rotVect = cvMat( 3, 1, CV_64FC1, &rotVectData[0] );
+    rotMat = cvMat( 3, 3, CV_64FC1, &rotMatData[0] );
+    vect = cvMat( 3, 1, CV_64FC1, &vectData[0] );
+
+    rotVectData[0] = maxxangle * (2.0 * rand() / RAND_MAX - 1.0);
+    rotVectData[1] = ( maxyangle - fabs( rotVectData[0] ) )
+        * (2.0 * rand() / RAND_MAX - 1.0);
+    rotVectData[2] = maxzangle * (2.0 * rand() / RAND_MAX - 1.0);
+    d = (distfactor + distfactor2 * (2.0 * rand() / RAND_MAX - 1.0)) * width;
+
+/*
+    rotVectData[0] = maxxangle;
+    rotVectData[1] = maxyangle;
+    rotVectData[2] = maxzangle;
+    d = distfactor * width;
+*/
+
+    cvRodrigues2( &rotVect, &rotMat );
+
+    halfw = 0.5 * width;
+    halfh = 0.5 * height;
+
+    quad[0][0] = -halfw;
+    quad[0][1] = -halfh;
+    quad[1][0] =  halfw;
+    quad[1][1] = -halfh;
+    quad[2][0] =  halfw;
+    quad[2][1] =  halfh;
+    quad[3][0] = -halfw;
+    quad[3][1] =  halfh;
+
+    for( i = 0; i < 4; i++ )
+    {
+        rotVectData[0] = quad[i][0];
+        rotVectData[1] = quad[i][1];
+        rotVectData[2] = 0.0;
+        cvMatMulAdd( &rotMat, &rotVect, 0, &vect );
+        quad[i][0] = vectData[0] * d / (d + vectData[2]) + halfw;
+        quad[i][1] = vectData[1] * d / (d + vectData[2]) + halfh;
+
+        /*
+        quad[i][0] += halfw;
+        quad[i][1] += halfh;
+        */
+    }
+}
+
+
+typedef struct CvSampleDistortionData
+{
+    IplImage* src;
+    IplImage* erode;
+    IplImage* dilate;
+    IplImage* mask;
+    IplImage* img;
+    IplImage* maskimg;
+    int dx;
+    int dy;
+    int bgcolor;
+} CvSampleDistortionData;
+
+#if defined CV_OPENMP && (defined _MSC_VER || defined CV_ICC)
+#define CV_OPENMP 1
+#else
+#undef CV_OPENMP
+#endif
+
+typedef struct CvBackgroundData
+{
+    int    count;
+    char** filename;
+    int    last;
+    int    round;
+    CvSize winsize;
+} CvBackgroundData;
+
+typedef struct CvBackgroundReader
+{
+    CvMat   src;
+    CvMat   img;
+    CvPoint offset;
+    float   scale;
+    float   scalefactor;
+    float   stepfactor;
+    CvPoint point;
+} CvBackgroundReader;
+
+/*
+ * Background reader
+ * Created in each thread
+ */
+CvBackgroundReader* cvbgreader = NULL;
+
+#if defined CV_OPENMP
+#pragma omp threadprivate(cvbgreader)
+#endif
+
+CvBackgroundData* cvbgdata = NULL;
+
+static int icvStartSampleDistortion( const char* imgfilename, int bgcolor, int bgthreshold,
+                              CvSampleDistortionData* data )
+{
+    memset( data, 0, sizeof( *data ) );
+    data->src = cvLoadImage( imgfilename, 0 );
+    if( data->src != NULL && data->src->nChannels == 1
+        && data->src->depth == IPL_DEPTH_8U )
+    {
+        int r, c;
+        uchar* pmask;
+        uchar* psrc;
+        uchar* perode;
+        uchar* pdilate;
+        uchar dd, de;
+
+        data->dx = data->src->width / 2;
+        data->dy = data->src->height / 2;
+        data->bgcolor = bgcolor;
+
+        data->mask = cvCloneImage( data->src );
+        data->erode = cvCloneImage( data->src );
+        data->dilate = cvCloneImage( data->src );
+
+        /* make mask image */
+        for( r = 0; r < data->mask->height; r++ )
+        {
+            for( c = 0; c < data->mask->width; c++ )
+            {
+                pmask = ( (uchar*) (data->mask->imageData + r * data->mask->widthStep)
+                        + c );
+                if( bgcolor - bgthreshold <= (int) (*pmask) &&
+                    (int) (*pmask) <= bgcolor + bgthreshold )
+                {
+                    *pmask = (uchar) 0;
+                }
+                else
+                {
+                    *pmask = (uchar) 255;
+                }
+            }
+        }
+
+        /* extend borders of source image */
+        cvErode( data->src, data->erode, 0, 1 );
+        cvDilate( data->src, data->dilate, 0, 1 );
+        for( r = 0; r < data->mask->height; r++ )
+        {
+            for( c = 0; c < data->mask->width; c++ )
+            {
+                pmask = ( (uchar*) (data->mask->imageData + r * data->mask->widthStep)
+                        + c );
+                if( (*pmask) == 0 )
+                {
+                    psrc = ( (uchar*) (data->src->imageData + r * data->src->widthStep)
+                           + c );
+                    perode =
+                        ( (uchar*) (data->erode->imageData + r * data->erode->widthStep)
+                                + c );
+                    pdilate =
+                        ( (uchar*)(data->dilate->imageData + r * data->dilate->widthStep)
+                                + c );
+                    de = (uchar)(bgcolor - (*perode));
+                    dd = (uchar)((*pdilate) - bgcolor);
+                    if( de >= dd && de > bgthreshold )
+                    {
+                        (*psrc) = (*perode);
+                    }
+                    if( dd > de && dd > bgthreshold )
+                    {
+                        (*psrc) = (*pdilate);
+                    }
+                }
+            }
+        }
+
+        data->img = cvCreateImage( cvSize( data->src->width + 2 * data->dx,
+                                           data->src->height + 2 * data->dy ),
+                                   IPL_DEPTH_8U, 1 );
+        data->maskimg = cvCloneImage( data->img );
+
+        return 1;
+    }
+
+    return 0;
+}
+
+static
+void icvPlaceDistortedSample( CvArr* background,
+                              int inverse, int maxintensitydev,
+                              double maxxangle, double maxyangle, double maxzangle,
+                              int inscribe, double maxshiftf, double maxscalef,
+                              CvSampleDistortionData* data )
+{
+    double quad[4][2];
+    int r, c;
+    uchar* pimg;
+    uchar* pbg;
+    uchar* palpha;
+    uchar chartmp;
+    int forecolordev;
+    float scale;
+    IplImage* img;
+    IplImage* maskimg;
+    CvMat  stub;
+    CvMat* bgimg;
+
+    CvRect cr;
+    CvRect roi;
+
+    double xshift, yshift, randscale;
+
+    icvRandomQuad( data->src->width, data->src->height, quad,
+                   maxxangle, maxyangle, maxzangle );
+    quad[0][0] += (double) data->dx;
+    quad[0][1] += (double) data->dy;
+    quad[1][0] += (double) data->dx;
+    quad[1][1] += (double) data->dy;
+    quad[2][0] += (double) data->dx;
+    quad[2][1] += (double) data->dy;
+    quad[3][0] += (double) data->dx;
+    quad[3][1] += (double) data->dy;
+
+    cvSet( data->img, cvScalar( data->bgcolor ) );
+    cvSet( data->maskimg, cvScalar( 0.0 ) );
+
+    cvWarpPerspective( data->src, data->img, quad );
+    cvWarpPerspective( data->mask, data->maskimg, quad );
+
+    cvSmooth( data->maskimg, data->maskimg, CV_GAUSSIAN, 3, 3 );
+
+    bgimg = cvGetMat( background, &stub );
+
+    cr.x = data->dx;
+    cr.y = data->dy;
+    cr.width = data->src->width;
+    cr.height = data->src->height;
+
+    if( inscribe )
+    {
+        /* quad's circumscribing rectangle */
+        cr.x = (int) MIN( quad[0][0], quad[3][0] );
+        cr.y = (int) MIN( quad[0][1], quad[1][1] );
+        cr.width  = (int) (MAX( quad[1][0], quad[2][0] ) + 0.5F ) - cr.x;
+        cr.height = (int) (MAX( quad[2][1], quad[3][1] ) + 0.5F ) - cr.y;
+    }
+
+    xshift = maxshiftf * rand() / RAND_MAX;
+    yshift = maxshiftf * rand() / RAND_MAX;
+
+    cr.x -= (int) ( xshift * cr.width  );
+    cr.y -= (int) ( yshift * cr.height );
+    cr.width  = (int) ((1.0 + maxshiftf) * cr.width );
+    cr.height = (int) ((1.0 + maxshiftf) * cr.height);
+
+    randscale = maxscalef * rand() / RAND_MAX;
+    cr.x -= (int) ( 0.5 * randscale * cr.width  );
+    cr.y -= (int) ( 0.5 * randscale * cr.height );
+    cr.width  = (int) ((1.0 + randscale) * cr.width );
+    cr.height = (int) ((1.0 + randscale) * cr.height);
+
+    scale = MAX( ((float) cr.width) / bgimg->cols, ((float) cr.height) / bgimg->rows );
+
+    roi.x = (int) (-0.5F * (scale * bgimg->cols - cr.width) + cr.x);
+    roi.y = (int) (-0.5F * (scale * bgimg->rows - cr.height) + cr.y);
+    roi.width  = (int) (scale * bgimg->cols);
+    roi.height = (int) (scale * bgimg->rows);
+
+    img = cvCreateImage( cvSize( bgimg->cols, bgimg->rows ), IPL_DEPTH_8U, 1 );
+    maskimg = cvCreateImage( cvSize( bgimg->cols, bgimg->rows ), IPL_DEPTH_8U, 1 );
+
+    cvSetImageROI( data->img, roi );
+    cvResize( data->img, img );
+    cvResetImageROI( data->img );
+    cvSetImageROI( data->maskimg, roi );
+    cvResize( data->maskimg, maskimg );
+    cvResetImageROI( data->maskimg );
+
+    forecolordev = (int) (maxintensitydev * (2.0 * rand() / RAND_MAX - 1.0));
+
+    for( r = 0; r < img->height; r++ )
+    {
+        for( c = 0; c < img->width; c++ )
+        {
+            pimg = (uchar*) img->imageData + r * img->widthStep + c;
+            pbg = (uchar*) bgimg->data.ptr + r * bgimg->step + c;
+            palpha = (uchar*) maskimg->imageData + r * maskimg->widthStep + c;
+            chartmp = (uchar) MAX( 0, MIN( 255, forecolordev + (*pimg) ) );
+            if( inverse )
+            {
+                chartmp ^= 0xFF;
+            }
+            *pbg = (uchar) (( chartmp*(*palpha )+(255 - (*palpha) )*(*pbg) ) / 255);
+        }
+    }
+
+    cvReleaseImage( &img );
+    cvReleaseImage( &maskimg );
+}
+
+static
+void icvEndSampleDistortion( CvSampleDistortionData* data )
+{
+    if( data->src )
+    {
+        cvReleaseImage( &data->src );
+    }
+    if( data->mask )
+    {
+        cvReleaseImage( &data->mask );
+    }
+    if( data->erode )
+    {
+        cvReleaseImage( &data->erode );
+    }
+    if( data->dilate )
+    {
+        cvReleaseImage( &data->dilate );
+    }
+    if( data->img )
+    {
+        cvReleaseImage( &data->img );
+    }
+    if( data->maskimg )
+    {
+        cvReleaseImage( &data->maskimg );
+    }
+}
+
+static
+CvBackgroundData* icvCreateBackgroundData( const char* filename, CvSize winsize )
+{
+    CvBackgroundData* data = NULL;
+
+    const char* dir = NULL;
+    char full[PATH_MAX];
+    char* imgfilename = NULL;
+    size_t datasize = 0;
+    int    count = 0;
+    FILE*  input = NULL;
+    char*  tmp   = NULL;
+    int    len   = 0;
+
+    assert( filename != NULL );
+
+    dir = strrchr( filename, '\\' );
+    if( dir == NULL )
+    {
+        dir = strrchr( filename, '/' );
+    }
+    if( dir == NULL )
+    {
+        imgfilename = &(full[0]);
+    }
+    else
+    {
+        strncpy( &(full[0]), filename, (dir - filename + 1) );
+        imgfilename = &(full[(dir - filename + 1)]);
+    }
+
+    input = fopen( filename, "r" );
+    if( input != NULL )
+    {
+        count = 0;
+        datasize = 0;
+
+        /* count */
+        while( !feof( input ) )
+        {
+            *imgfilename = '\0';
+            if( !fgets( imgfilename, PATH_MAX - (int)(imgfilename - full) - 1, input ))
+                break;
+            len = (int)strlen( imgfilename );
+            for( ; len > 0 && isspace(imgfilename[len-1]); len-- )
+                imgfilename[len-1] = '\0';
+            if( len > 0 )
+            {
+                if( (*imgfilename) == '#' ) continue; /* comment */
+                count++;
+                datasize += sizeof( char ) * (strlen( &(full[0]) ) + 1);
+            }
+        }
+        if( count > 0 )
+        {
+            //rewind( input );
+            fseek( input, 0, SEEK_SET );
+            datasize += sizeof( *data ) + sizeof( char* ) * count;
+            data = (CvBackgroundData*) cvAlloc( datasize );
+            memset( (void*) data, 0, datasize );
+            data->count = count;
+            data->filename = (char**) (data + 1);
+            data->last = 0;
+            data->round = 0;
+            data->winsize = winsize;
+            tmp = (char*) (data->filename + data->count);
+            count = 0;
+            while( !feof( input ) )
+            {
+                *imgfilename = '\0';
+                if( !fgets( imgfilename, PATH_MAX - (int)(imgfilename - full) - 1, input ))
+                    break;
+                len = (int)strlen( imgfilename );
+                if( len > 0 && imgfilename[len-1] == '\n' )
+                    imgfilename[len-1] = 0, len--;
+                if( len > 0 )
+                {
+                    if( (*imgfilename) == '#' ) continue; /* comment */
+                    data->filename[count++] = tmp;
+                    strcpy( tmp, &(full[0]) );
+                    tmp += strlen( &(full[0]) ) + 1;
+                }
+            }
+        }
+        fclose( input );
+    }
+
+    return data;
+}
+
+static
+void icvReleaseBackgroundData( CvBackgroundData** data )
+{
+    assert( data != NULL && (*data) != NULL );
+
+    cvFree( data );
+}
+
+static
+CvBackgroundReader* icvCreateBackgroundReader()
+{
+    CvBackgroundReader* reader = NULL;
+
+    reader = (CvBackgroundReader*) cvAlloc( sizeof( *reader ) );
+    memset( (void*) reader, 0, sizeof( *reader ) );
+    reader->src = cvMat( 0, 0, CV_8UC1, NULL );
+    reader->img = cvMat( 0, 0, CV_8UC1, NULL );
+    reader->offset = cvPoint( 0, 0 );
+    reader->scale       = 1.0F;
+    reader->scalefactor = 1.4142135623730950488016887242097F;
+    reader->stepfactor  = 0.5F;
+    reader->point = reader->offset;
+
+    return reader;
+}
+
+static
+void icvReleaseBackgroundReader( CvBackgroundReader** reader )
+{
+    assert( reader != NULL && (*reader) != NULL );
+
+    if( (*reader)->src.data.ptr != NULL )
+    {
+        cvFree( &((*reader)->src.data.ptr) );
+    }
+    if( (*reader)->img.data.ptr != NULL )
+    {
+        cvFree( &((*reader)->img.data.ptr) );
+    }
+
+    cvFree( reader );
+}
+
+static
+void icvGetNextFromBackgroundData( CvBackgroundData* data,
+                                   CvBackgroundReader* reader )
+{
+    IplImage* img = NULL;
+    size_t datasize = 0;
+    int round = 0;
+    int i = 0;
+    CvPoint offset = cvPoint(0,0);
+
+    assert( data != NULL && reader != NULL );
+
+    if( reader->src.data.ptr != NULL )
+    {
+        cvFree( &(reader->src.data.ptr) );
+        reader->src.data.ptr = NULL;
+    }
+    if( reader->img.data.ptr != NULL )
+    {
+        cvFree( &(reader->img.data.ptr) );
+        reader->img.data.ptr = NULL;
+    }
+
+    #ifdef CV_OPENMP
+    #pragma omp critical(c_background_data)
+    #endif /* CV_OPENMP */
+    {
+        for( i = 0; i < data->count; i++ )
+        {
+            round = data->round;
+
+#ifdef CV_VERBOSE
+            printf( "Open background image: %s\n", data->filename[data->last] );
+#endif /* CV_VERBOSE */
+
+            data->last = rand() % data->count;
+            data->last %= data->count;
+            img = cvLoadImage( data->filename[data->last], 0 );
+            if( !img )
+                continue;
+            data->round += data->last / data->count;
+            data->round = data->round % (data->winsize.width * data->winsize.height);
+
+            offset.x = round % data->winsize.width;
+            offset.y = round / data->winsize.width;
+
+            offset.x = MIN( offset.x, img->width - data->winsize.width );
+            offset.y = MIN( offset.y, img->height - data->winsize.height );
+
+            if( img != NULL && img->depth == IPL_DEPTH_8U && img->nChannels == 1 &&
+                offset.x >= 0 && offset.y >= 0 )
+            {
+                break;
+            }
+            if( img != NULL )
+                cvReleaseImage( &img );
+            img = NULL;
+        }
+    }
+    if( img == NULL )
+    {
+        /* no appropriate image */
+
+#ifdef CV_VERBOSE
+        printf( "Invalid background description file.\n" );
+#endif /* CV_VERBOSE */
+
+        assert( 0 );
+        exit( 1 );
+    }
+    datasize = sizeof( uchar ) * img->width * img->height;
+    reader->src = cvMat( img->height, img->width, CV_8UC1, (void*) cvAlloc( datasize ) );
+    cvCopy( img, &reader->src, NULL );
+    cvReleaseImage( &img );
+    img = NULL;
+
+    //reader->offset.x = round % data->winsize.width;
+    //reader->offset.y = round / data->winsize.width;
+    reader->offset = offset;
+    reader->point = reader->offset;
+    reader->scale = MAX(
+        ((float) data->winsize.width + reader->point.x) / ((float) reader->src.cols),
+        ((float) data->winsize.height + reader->point.y) / ((float) reader->src.rows) );
+
+    reader->img = cvMat( (int) (reader->scale * reader->src.rows + 0.5F),
+                         (int) (reader->scale * reader->src.cols + 0.5F),
+                          CV_8UC1, (void*) cvAlloc( datasize ) );
+    cvResize( &(reader->src), &(reader->img) );
+}
+
+/*
+ * icvGetBackgroundImage
+ *
+ * Get an image from background
+ * <img> must be allocated and have size, previously passed to icvInitBackgroundReaders
+ *
+ * Usage example:
+ * icvInitBackgroundReaders( "bg.txt", cvSize( 24, 24 ) );
+ * ...
+ * #pragma omp parallel
+ * {
+ *     ...
+ *     icvGetBackgourndImage( cvbgdata, cvbgreader, img );
+ *     ...
+ * }
+ * ...
+ * icvDestroyBackgroundReaders();
+ */
+static
+void icvGetBackgroundImage( CvBackgroundData* data,
+                            CvBackgroundReader* reader,
+                            CvMat* img )
+{
+    CvMat mat;
+
+    assert( data != NULL && reader != NULL && img != NULL );
+    assert( CV_MAT_TYPE( img->type ) == CV_8UC1 );
+    assert( img->cols == data->winsize.width );
+    assert( img->rows == data->winsize.height );
+
+    if( reader->img.data.ptr == NULL )
+    {
+        icvGetNextFromBackgroundData( data, reader );
+    }
+
+    mat = cvMat( data->winsize.height, data->winsize.width, CV_8UC1 );
+    cvSetData( &mat, (void*) (reader->img.data.ptr + reader->point.y * reader->img.step
+                              + reader->point.x * sizeof( uchar )), reader->img.step );
+
+    cvCopy( &mat, img, 0 );
+    if( (int) ( reader->point.x + (1.0F + reader->stepfactor ) * data->winsize.width )
+            < reader->img.cols )
+    {
+        reader->point.x += (int) (reader->stepfactor * data->winsize.width);
+    }
+    else
+    {
+        reader->point.x = reader->offset.x;
+        if( (int) ( reader->point.y + (1.0F + reader->stepfactor ) * data->winsize.height )
+                < reader->img.rows )
+        {
+            reader->point.y += (int) (reader->stepfactor * data->winsize.height);
+        }
+        else
+        {
+            reader->point.y = reader->offset.y;
+            reader->scale *= reader->scalefactor;
+            if( reader->scale <= 1.0F )
+            {
+                reader->img = cvMat( (int) (reader->scale * reader->src.rows),
+                                     (int) (reader->scale * reader->src.cols),
+                                      CV_8UC1, (void*) (reader->img.data.ptr) );
+                cvResize( &(reader->src), &(reader->img) );
+            }
+            else
+            {
+                icvGetNextFromBackgroundData( data, reader );
+            }
+        }
+    }
+}
+
+/*
+ * icvInitBackgroundReaders
+ *
+ * Initialize background reading process.
+ * <cvbgreader> and <cvbgdata> are initialized.
+ * Must be called before any usage of background
+ *
+ * filename - name of background description file
+ * winsize  - size of images will be obtained from background
+ *
+ * return 1 on success, 0 otherwise.
+ */
+static int icvInitBackgroundReaders( const char* filename, CvSize winsize )
+{
+    if( cvbgdata == NULL && filename != NULL )
+    {
+        cvbgdata = icvCreateBackgroundData( filename, winsize );
+    }
+
+    if( cvbgdata )
+    {
+
+        #ifdef CV_OPENMP
+        #pragma omp parallel
+        #endif /* CV_OPENMP */
+        {
+            #ifdef CV_OPENMP
+            #pragma omp critical(c_create_bg_data)
+            #endif /* CV_OPENMP */
+            {
+                if( cvbgreader == NULL )
+                {
+                    cvbgreader = icvCreateBackgroundReader();
+                }
+            }
+        }
+
+    }
+
+    return (cvbgdata != NULL);
+}
+
+/*
+ * icvDestroyBackgroundReaders
+ *
+ * Finish backgournd reading process
+ */
+static
+void icvDestroyBackgroundReaders()
+{
+    /* release background reader in each thread */
+    #ifdef CV_OPENMP
+    #pragma omp parallel
+    #endif /* CV_OPENMP */
+    {
+        #ifdef CV_OPENMP
+        #pragma omp critical(c_release_bg_data)
+        #endif /* CV_OPENMP */
+        {
+            if( cvbgreader != NULL )
+            {
+                icvReleaseBackgroundReader( &cvbgreader );
+                cvbgreader = NULL;
+            }
+        }
+    }
+
+    if( cvbgdata != NULL )
+    {
+        icvReleaseBackgroundData( &cvbgdata );
+        cvbgdata = NULL;
+    }
+}
+
+void cvCreateTrainingSamples( const char* filename,
+                              const char* imgfilename, int bgcolor, int bgthreshold,
+                              const char* bgfilename, int count,
+                              int invert, int maxintensitydev,
+                              double maxxangle, double maxyangle, double maxzangle,
+                              int showsamples,
+                              int winwidth, int winheight )
+{
+    CvSampleDistortionData data;
+
+    assert( filename != NULL );
+    assert( imgfilename != NULL );
+
+    if( !icvMkDir( filename ) )
+    {
+        fprintf( stderr, "Unable to create output file: %s\n", filename );
+        return;
+    }
+    if( icvStartSampleDistortion( imgfilename, bgcolor, bgthreshold, &data ) )
+    {
+        FILE* output = NULL;
+
+        output = fopen( filename, "wb" );
+        if( output != NULL )
+        {
+            int hasbg;
+            int i;
+            CvMat sample;
+            int inverse;
+
+            hasbg = 0;
+            hasbg = (bgfilename != NULL && icvInitBackgroundReaders( bgfilename,
+                     cvSize( winwidth,winheight ) ) );
+
+            sample = cvMat( winheight, winwidth, CV_8UC1, cvAlloc( sizeof( uchar ) *
+                            winheight * winwidth ) );
+
+            icvWriteVecHeader( output, count, sample.cols, sample.rows );
+
+            if( showsamples )
+            {
+                cvNamedWindow( "Sample", CV_WINDOW_AUTOSIZE );
+            }
+
+            inverse = invert;
+            for( i = 0; i < count; i++ )
+            {
+                if( hasbg )
+                {
+                    icvGetBackgroundImage( cvbgdata, cvbgreader, &sample );
+                }
+                else
+                {
+                    cvSet( &sample, cvScalar( bgcolor ) );
+                }
+
+                if( invert == CV_RANDOM_INVERT )
+                {
+                    inverse = (rand() > (RAND_MAX/2));
+                }
+                icvPlaceDistortedSample( &sample, inverse, maxintensitydev,
+                    maxxangle, maxyangle, maxzangle,
+                    0   /* nonzero means placing image without cut offs */,
+                    0.0 /* nozero adds random shifting                  */,
+                    0.0 /* nozero adds random scaling                   */,
+                    &data );
+
+                if( showsamples )
+                {
+                    cvShowImage( "Sample", &sample );
+                    if( cvWaitKey( 0 ) == 27 )
+                    {
+                        showsamples = 0;
+                    }
+                }
+
+                icvWriteVecSample( output, &sample );
+
+#ifdef CV_VERBOSE
+                if( i % 500 == 0 )
+                {
+                    printf( "\r%3d%%", 100 * i / count );
+                }
+#endif /* CV_VERBOSE */
+            }
+            icvDestroyBackgroundReaders();
+            cvFree( &(sample.data.ptr) );
+            fclose( output );
+        } /* if( output != NULL ) */
+
+        icvEndSampleDistortion( &data );
+    }
+
+#ifdef CV_VERBOSE
+    printf( "\r      \r" );
+#endif /* CV_VERBOSE */
+
+}
+
+#define CV_INFO_FILENAME "info.dat"
+
+void cvCreateTestSamples( const char* infoname,
+                          const char* imgfilename, int bgcolor, int bgthreshold,
+                          const char* bgfilename, int count,
+                          int invert, int maxintensitydev,
+                          double maxxangle, double maxyangle, double maxzangle,
+                          int showsamples,
+                          int winwidth, int winheight )
+{
+    CvSampleDistortionData data;
+
+    assert( infoname != NULL );
+    assert( imgfilename != NULL );
+    assert( bgfilename != NULL );
+
+    if( !icvMkDir( infoname ) )
+    {
+
+#if CV_VERBOSE
+        fprintf( stderr, "Unable to create directory hierarchy: %s\n", infoname );
+#endif /* CV_VERBOSE */
+
+        return;
+    }
+    if( icvStartSampleDistortion( imgfilename, bgcolor, bgthreshold, &data ) )
+    {
+        char fullname[PATH_MAX];
+        char* filename;
+        CvMat win;
+        FILE* info;
+
+        if( icvInitBackgroundReaders( bgfilename, cvSize( 10, 10 ) ) )
+        {
+            int i;
+            int x, y, width, height;
+            float scale;
+            float maxscale;
+            int inverse;
+
+            if( showsamples )
+            {
+                cvNamedWindow( "Image", CV_WINDOW_AUTOSIZE );
+            }
+
+            info = fopen( infoname, "w" );
+            strcpy( fullname, infoname );
+            filename = strrchr( fullname, '\\' );
+            if( filename == NULL )
+            {
+                filename = strrchr( fullname, '/' );
+            }
+            if( filename == NULL )
+            {
+                filename = fullname;
+            }
+            else
+            {
+                filename++;
+            }
+
+            count = MIN( count, cvbgdata->count );
+            inverse = invert;
+            for( i = 0; i < count; i++ )
+            {
+                icvGetNextFromBackgroundData( cvbgdata, cvbgreader );
+
+                maxscale = MIN( 0.7F * cvbgreader->src.cols / winwidth,
+                                   0.7F * cvbgreader->src.rows / winheight );
+                if( maxscale < 1.0F ) continue;
+
+                scale = (maxscale - 1.0F) * rand() / RAND_MAX + 1.0F;
+                width = (int) (scale * winwidth);
+                height = (int) (scale * winheight);
+                x = (int) ((0.1+0.8 * rand()/RAND_MAX) * (cvbgreader->src.cols - width));
+                y = (int) ((0.1+0.8 * rand()/RAND_MAX) * (cvbgreader->src.rows - height));
+
+                cvGetSubArr( &cvbgreader->src, &win, cvRect( x, y ,width, height ) );
+                if( invert == CV_RANDOM_INVERT )
+                {
+                    inverse = (rand() > (RAND_MAX/2));
+                }
+                icvPlaceDistortedSample( &win, inverse, maxintensitydev,
+                                         maxxangle, maxyangle, maxzangle,
+                                         1, 0.0, 0.0, &data );
+
+
+                sprintf( filename, "%04d_%04d_%04d_%04d_%04d.jpg",
+                         (i + 1), x, y, width, height );
+
+                if( info )
+                {
+                    fprintf( info, "%s %d %d %d %d %d\n",
+                        filename, 1, x, y, width, height );
+                }
+
+                cvSaveImage( fullname, &cvbgreader->src );
+                if( showsamples )
+                {
+                    cvShowImage( "Image", &cvbgreader->src );
+                    if( cvWaitKey( 0 ) == 27 )
+                    {
+                        showsamples = 0;
+                    }
+                }
+            }
+            if( info ) fclose( info );
+            icvDestroyBackgroundReaders();
+        }
+        icvEndSampleDistortion( &data );
+    }
+}
+
+
+int cvCreateTrainingSamplesFromInfo( const char* infoname, const char* vecfilename,
+                                     int num,
+                                     int showsamples,
+                                     int winwidth, int winheight )
+{
+    char fullname[PATH_MAX];
+    char* filename;
+
+    FILE* info;
+    FILE* vec;
+    IplImage* src=0;
+    IplImage* sample;
+    int line;
+    int error;
+    int i;
+    int x, y, width, height;
+    int total;
+
+    assert( infoname != NULL );
+    assert( vecfilename != NULL );
+
+    total = 0;
+    if( !icvMkDir( vecfilename ) )
+    {
+
+#if CV_VERBOSE
+        fprintf( stderr, "Unable to create directory hierarchy: %s\n", vecfilename );
+#endif /* CV_VERBOSE */
+
+        return total;
+    }
+
+    info = fopen( infoname, "r" );
+    if( info == NULL )
+    {
+
+#if CV_VERBOSE
+        fprintf( stderr, "Unable to open file: %s\n", infoname );
+#endif /* CV_VERBOSE */
+
+        return total;
+    }
+
+    vec = fopen( vecfilename, "wb" );
+    if( vec == NULL )
+    {
+
+#if CV_VERBOSE
+        fprintf( stderr, "Unable to open file: %s\n", vecfilename );
+#endif /* CV_VERBOSE */
+
+        fclose( info );
+
+        return total;
+    }
+
+    sample = cvCreateImage( cvSize( winwidth, winheight ), IPL_DEPTH_8U, 1 );
+
+    icvWriteVecHeader( vec, num, sample->width, sample->height );
+
+    if( showsamples )
+    {
+        cvNamedWindow( "Sample", CV_WINDOW_AUTOSIZE );
+    }
+
+    strcpy( fullname, infoname );
+    filename = strrchr( fullname, '\\' );
+    if( filename == NULL )
+    {
+        filename = strrchr( fullname, '/' );
+    }
+    if( filename == NULL )
+    {
+        filename = fullname;
+    }
+    else
+    {
+        filename++;
+    }
+
+    for( line = 1, error = 0, total = 0; total < num ;line++ )
+    {
+        int count;
+
+        error = ( fscanf( info, "%s %d", filename, &count ) != 2 );
+        if( !error )
+        {
+            src = cvLoadImage( fullname, 0 );
+            error = ( src == NULL );
+            if( error )
+            {
+
+#if CV_VERBOSE
+                fprintf( stderr, "Unable to open image: %s\n", fullname );
+#endif /* CV_VERBOSE */
+
+            }
+        }
+        for( i = 0; (i < count) && (total < num); i++, total++ )
+        {
+            error = ( fscanf( info, "%d %d %d %d", &x, &y, &width, &height ) != 4 );
+            if( error ) break;
+            cvSetImageROI( src, cvRect( x, y, width, height ) );
+            cvResize( src, sample, width >= sample->width &&
+                      height >= sample->height ? CV_INTER_AREA : CV_INTER_LINEAR );
+
+            if( showsamples )
+            {
+                cvShowImage( "Sample", sample );
+                if( cvWaitKey( 0 ) == 27 )
+                {
+                    showsamples = 0;
+                }
+            }
+            icvWriteVecSample( vec, sample );
+        }
+
+        if( src )
+        {
+            cvReleaseImage( &src );
+        }
+
+        if( error )
+        {
+
+#if CV_VERBOSE
+            fprintf( stderr, "%s(%d) : parse error", infoname, line );
+#endif /* CV_VERBOSE */
+
+            break;
+        }
+    }
+
+    if( sample )
+    {
+        cvReleaseImage( &sample );
+    }
+
+    fclose( vec );
+    fclose( info );
+
+    return total;
+}
+
+typedef struct CvVecFile
+{
+    FILE*  input;
+    int    count;
+    int    vecsize;
+    int    last;
+    short* vector;
+} CvVecFile;
+
+static
+int icvGetTraininDataFromVec( CvMat* img, void* userdata )
+{
+    uchar tmp = 0;
+    int r = 0;
+    int c = 0;
+
+    assert( img->rows * img->cols == ((CvVecFile*) userdata)->vecsize );
+
+    size_t elements_read = fread( &tmp, sizeof( tmp ), 1, ((CvVecFile*) userdata)->input );
+    CV_Assert(elements_read == 1);
+    elements_read = fread( ((CvVecFile*) userdata)->vector, sizeof( short ),
+           ((CvVecFile*) userdata)->vecsize, ((CvVecFile*) userdata)->input );
+    CV_Assert(elements_read == (size_t)((CvVecFile*) userdata)->vecsize);
+
+    if( feof( ((CvVecFile*) userdata)->input ) ||
+        (((CvVecFile*) userdata)->last)++ >= ((CvVecFile*) userdata)->count )
+    {
+        return 0;
+    }
+
+    for( r = 0; r < img->rows; r++ )
+    {
+        for( c = 0; c < img->cols; c++ )
+        {
+            CV_MAT_ELEM( *img, uchar, r, c ) =
+                (uchar) ( ((CvVecFile*) userdata)->vector[r * img->cols + c] );
+        }
+    }
+
+    return 1;
+}
+void cvShowVecSamples( const char* filename, int winwidth, int winheight,
+                       double scale )
+{
+    CvVecFile file;
+    short tmp;
+    int i;
+    CvMat* sample;
+
+    tmp = 0;
+    file.input = fopen( filename, "rb" );
+
+    if( file.input != NULL )
+    {
+        size_t elements_read1 = fread( &file.count, sizeof( file.count ), 1, file.input );
+        size_t elements_read2 = fread( &file.vecsize, sizeof( file.vecsize ), 1, file.input );
+        size_t elements_read3 = fread( &tmp, sizeof( tmp ), 1, file.input );
+        size_t elements_read4 = fread( &tmp, sizeof( tmp ), 1, file.input );
+        CV_Assert(elements_read1 == 1 && elements_read2 == 1 && elements_read3 == 1 && elements_read4 == 1);
+
+        if( file.vecsize != winwidth * winheight )
+        {
+            int guessed_w = 0;
+            int guessed_h = 0;
+
+            fprintf( stderr, "Warning: specified sample width=%d and height=%d "
+                "does not correspond to .vec file vector size=%d.\n",
+                winwidth, winheight, file.vecsize );
+            if( file.vecsize > 0 )
+            {
+                guessed_w = cvFloor( sqrt( (float) file.vecsize ) );
+                if( guessed_w > 0 )
+                {
+                    guessed_h = file.vecsize / guessed_w;
+                }
+            }
+
+            if( guessed_w <= 0 || guessed_h <= 0 || guessed_w * guessed_h != file.vecsize)
+            {
+                fprintf( stderr, "Error: failed to guess sample width and height\n" );
+                fclose( file.input );
+
+                return;
+            }
+            else
+            {
+                winwidth = guessed_w;
+                winheight = guessed_h;
+                fprintf( stderr, "Guessed width=%d,
+                    winwidth, winheight );
+            }
+        }
+
+        if( !feof( file.input ) && scale > 0 )
+        {
+            CvMat* scaled_sample = 0;
+
+            file.last = 0;
+            file.vector = (short*) cvAlloc( 5 );
+            sample = cvCeMat( winheight );
+
+        }
+        fclose( file.input );
+    }
+}
+
+cout
+
+cout
+
+cout
+
+cout
