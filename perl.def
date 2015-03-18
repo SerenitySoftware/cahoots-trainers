@@ -1,0 +1,5630 @@
+#!/usr/bin/perl
+
+use strict;
+use warnings;
+
+use utf8;
+use Getopt::Long;
+use Pod::Usage;
+use Time::Local;
+use Data::Dumper;
+
+binmode(STDOUT, ":utf8");
+#command line options
+my ( $help, $period, $use_ascii, $use_ansi, $use_unicode, $format, $author, $filepath, $all_branches );
+
+GetOptions(
+    'help|?'      => \$help,
+    'period|p=n'  => \$period,
+    'ascii'       => \$use_ascii,
+    'ansi'        => \$use_ansi,
+    'unicode'     => \$use_unicode,
+    'author=s'    => \$author,
+    'all'         => \$all_branches
+) or pod2usage(2);
+
+pod2usage(1) if $help;
+
+$filepath = shift @ARGV;
+
+# also tried to use unicode chars instead of colors, the exp did not go well
+#qw(⬚ ⬜ ▤ ▣ ⬛)
+#qw(⬚ ▢ ▤ ▣ ⬛)
+
+my @unicode = qw(⬚ ▢ ▤ ▣ ⬛);
+my @colors = ( 237, 139, 40, 190, 1 );
+my @ascii = ( " ", ".", "o", "O", "0" );
+my @months = qw (Jan Feb Mar Apr May Jun Jul Aug Sep Oct Nov Dec);
+
+configure(\$period, \$use_ascii, \$use_ansi, \$use_unicode, \$author);
+
+process();
+
+# 53 X 7 grid
+# consists of 0 - 370 blocks
+my ( @grid, @timeline, %pos_month, %month_pos, $jan1, $cur_year, $max_epoch, $min_epoch, $max_commits, $q1, $q2, $q3 );
+my ( $first_block, $last_block, $start_block, $end_block, $row_start, $row_end );
+#loads of global variables
+
+sub process {
+    $format
+      = $use_ansi    ? 'ansi'
+      : $use_ascii   ? 'ascii'
+      : $use_unicode ? 'unicode'
+      :                undef;
+
+    #if the user decided not to choose the format, let's pick some environmentally smart format
+    if ( !defined $format ) {
+        $format
+          = $ENV{EMACS} ? 'unicode'
+          : $ENV{TERM} eq 'dumb' ? 'ascii'
+          :                        'ansi';
+    }
+    init_cal_stuff();
+    process_current_repo();
+    my %stats = compute_stats();
+    print_grid(%stats);
+}
+
+sub process_current_repo {
+    my $git_command = git_command();
+    my @epochs      = qx/$git_command/;
+
+    if ($?) {
+        print "fatal: git-cal failed to get the git log\n";
+        exit(2);
+    }
+
+    if ( !@epochs ) {
+        print "git-cal: got empty log, nothing to do\n";
+        exit(1);
+    }
+    my $status;
+    foreach (@epochs) {
+        $status = add_epoch($_);
+        last if !$status;
+    }
+}
+
+sub git_command {
+    my $command = qq{git log --no-merges --pretty=format:"%at" --since="13 months"};
+    $command .= qq{ --author="$author"} if $author;
+    $command .= qq{ --all } if $all_branches;
+    if ($filepath) {
+        if ( -e $filepath ) {
+            $command .= qq{ -- $filepath};
+        }
+        else {
+            print "fatal: $filepath: no such file or directory\n";
+            exit(2);
+        }
+    }
+    return $command;
+}
+
+sub init_cal_stuff {
+    my ( $wday, $yday, $month, $year ) = ( localtime(time) )[ 6, 7, 4, 5 ];
+    $cur_year    = $year;
+    $jan1        = 370 - ( $yday + 6 - $wday );
+    $last_block  = $jan1 + $yday + 1;
+    $first_block = $last_block - 365;
+    $max_commits = 0;
+    push @timeline, $jan1;
+    $month_pos{0} = $jan1;
+    my $cur = $jan1;
+
+    foreach ( 0 .. $month - 1 ) {
+        $cur += number_of_days( $_, $year );
+        push @timeline, $cur;
+        $month_pos{ $_ + 1 } = $cur;
+    }
+    $cur = $jan1;
+    for ( my $m = 11; $m > $month; $m-- ) {
+        $cur -= number_of_days( $m, $year - 1 );
+        unshift @timeline, $cur;
+        $month_pos{$m} = $cur;
+    }
+
+    $pos_month{ $month_pos{$_} } = $months[$_] foreach keys %month_pos;
+
+    die "period can only be between -11 to 0 and 1 to 12" if ( defined $period && ( $period < -11 || $period > 12 ) );
+    if ( !defined $period ) {
+        $start_block = $first_block;
+        $end_block   = $last_block;
+    }
+    elsif ( $period > 0 ) {
+        $start_block = $month_pos{ $period - 1 };
+        $end_block   = $month_pos{ $period % 12 };
+        $end_block   = $last_block if $start_block > $end_block;
+    }
+    else {
+        $start_block = $timeline[ 11 + $period ];
+        $start_block = $first_block if $period == -12;
+        $end_block   = $last_block;
+    }
+    $row_start = int $start_block / 7;
+    $row_end   = int $end_block / 7;
+    $max_epoch = time - 86400 * ( $last_block - $end_block );
+    $min_epoch = time - 86400 * ( $last_block - $start_block );
+
+}
+
+
+sub add_epoch {
+    my ($epoch, $count) = @_;
+    if ( $epoch > $max_epoch || $epoch < $min_epoch ) {
+        return 1;
+    }
+    my ( $month, $year, $wday, $yday ) = ( localtime($epoch) )[ 4, 5, 6, 7 ];
+    my $pos;
+    if ( $year == $cur_year ) {
+        $pos = ( $jan1 + $yday );
+    }
+    else {
+        my $total = ( $year % 4 ) ? 365 : 366;
+        $pos = ( $jan1 - ( $total - $yday ) );
+    }
+    return 0 if $pos < 0;    #just in case
+    add_to_grid( $pos, $epoch, $count );
+    return 1;
+}
+
+sub add_to_grid {
+    my ( $pos, $epoch, $count ) = @_;
+    $count ||= 1;
+    my $r = int $pos / 7;
+    my $c = $pos % 7;
+    $grid[$r][$c]->{commits}+=$count;
+    $grid[$r][$c]->{epoch} = $epoch;
+    $max_commits = $grid[$r][$c]->{commits} if $grid[$r][$c]->{commits} > $max_commits;
+}
+
+
+sub compute_stats {
+    my %commit_counts;
+
+    my (
+      $total_commits,
+      $cur_streak,
+      $cur_start,
+      $max_streak,
+      $max_start,
+      $max_end,
+      $cur_streak_weekdays,
+      $cur_weekdays_start,
+      $max_streak_weekdays,
+      $max_weekdays_start,
+      $max_weekdays_end,
+      $q1,
+      $q2,
+      $q3,
+    ) = (0) x 14;
+
+    foreach my $r ( $row_start .. $row_end ) {
+        foreach my $c ( 0 .. 6 ) {
+            my $cur_block = ( $r * 7 ) + $c;
+            if ( $cur_block >= $start_block && $cur_block < $end_block ) {
+                my $count = $grid[$r][$c]->{commits} || 0;
+                $total_commits += $count;
+                if ($count) {
+                    $commit_counts{$count} = 1;
+                    $cur_streak++;
+                    $cur_start ||= $grid[$r][$c]->{epoch};
+                    if ( $cur_streak > $max_streak ) {
+                        $max_streak = $cur_streak;
+                        $max_start  = $cur_start;
+                        $max_end    = $grid[$r][$c]->{epoch};
+                    }
+
+                    #count++ if you work on weekends and streak will not be broken otherwise :)
+                    $cur_streak_weekdays++;
+                    $cur_weekdays_start ||= $grid[$r][$c]->{epoch};
+                    if ( $cur_streak_weekdays > $max_streak_weekdays ) {
+                        $max_streak_weekdays = $cur_streak_weekdays;
+                        $max_weekdays_start  = $cur_weekdays_start;
+                        $max_weekdays_end    = $grid[$r][$c]->{epoch};
+                    }
+                }
+                else {
+                    $cur_streak = 0;
+                    $cur_start  = 0;
+                    if ( $c > 0 && $c < 6 ) {
+                        $cur_streak_weekdays = 0;
+                        $cur_weekdays_start  = 0;
+                    }
+                }
+            }
+        }
+    }
+
+    #now compute quartiles
+    my @commit_counts = sort { $a <=> $b } ( keys %commit_counts );
+    $q1 = $commit_counts[ int( scalar @commit_counts ) / 4 ];
+    $q2 = $commit_counts[ int( scalar @commit_counts ) / 2 ];
+    $q3 = $commit_counts[ int( 3 * ( scalar @commit_counts ) / 4 ) ];
+
+    #print "commit counts: " . (scalar @commit_counts) . " - " . (join ",",@commit_counts) . "\n\n";
+    #print "quartiles: $q1 $q2 $q3\n";
+
+    #die Dumper \%stat;
+
+    my %stat = (
+      total_commits => $total_commits,
+      cur_streak    => $cur_streak  ,
+      cur_start     => $cur_start   ,
+      max_streak    => $max_streak  ,
+      max_start     => $max_start   ,
+      max_end       => $max_end     ,
+      cur_streak_weekdays => $cur_streak_weekdays,
+      cur_weekdays_start  => $cur_weekdays_start,
+      max_streak_weekdays => $max_streak_weekdays,
+      max_weekdays_start  => $max_weekdays_start,
+      max_weekdays_end    => $max_weekdays_end  ,
+      q1 => $q1,
+      q2 => $q2,
+      q3 => $q3,
+    );
+
+
+    return %stat;
+}
+
+sub print_grid {
+    my %stat = @_;
+
+    my $space = 6;
+    print_month_names($space);
+    foreach my $c ( 0 .. 6 ) {
+        printf "\n%" . ( $space - 2 ) . "s", "";
+
+        print $c == 1 ? "M "
+            : $c == 3 ? "W "
+            : $c == 5 ? "F "
+                      : "  ";
+
+        foreach my $r ( $row_start .. $row_end ) {
+            my $cur_block = ( $r * 7 ) + $c;
+            if ( $cur_block >= $start_block && $cur_block < $end_block ) {
+                my $val = $grid[$r][$c]->{commits} || 0;
+
+                my $index = $val == 0         ? 0
+                          : $val <= $stat{q1} ? 1
+                          : $val <= $stat{q2} ? 2
+                          : $val <= $stat{q3} ? 3
+                                              : 4;
+
+                print_block($index);
+            }
+            else {
+                print "  ";
+            }
+        }
+    }
+    print "\n\n";
+    printf "%" . ( 2 * ( $row_end - $row_start ) + $space - 15 ) . "s", "Less ";    #such that the right borders align
+    print_block($_) foreach ( 0 .. 4 );
+    print " More\n";
+
+    printf "%4d: Total commits\n", $stat{total_commits};
+    print_message( $stat{max_streak_weekdays}, $stat{max_weekdays_start}, $stat{max_weekdays_end}, "Longest streak excluding weekends" );
+    print_message( $stat{max_streak},          $stat{max_start},          $stat{max_end},          "Longest streak including weekends" );
+    print_message( $stat{cur_streak_weekdays}, $stat{cur_weekdays_start}, time,              "Current streak" );
+}
+
+
+sub print_block {
+    my $index = shift;
+    $index = 4 if $index > 4;
+    $_
+      = ( $format eq "ascii" ) ? "${ascii[$index]} "
+      : ( $format eq "unicode" ) ? "${unicode[$index]} "
+      :                            "\e[38;5;$colors[$index]m\x{25fc} \e[0m";
+    print;
+}
+
+
+sub print_month_names {
+    #print month labels, printing current month in the right position is tricky
+    my $space = shift;
+    if ( defined $period && $period > 0 ) {
+        printf "%" . $space . "s    %3s", "", $months[ $period - 1 ];
+        return;
+    }
+    my $label_printer = 0;
+    my $timeline_iter = defined $period ? 11 + $period : 0;
+    if ( $start_block == $first_block && $timeline[0] != 0 ) {
+        my $first_pos = int $timeline[0] / 7;
+        if ( $first_pos == 0 ) {
+            printf "%" . ( $space - 2 ) . "s", "";
+            print $pos_month{ $timeline[-1] } . " ";
+            print $pos_month{ $timeline[0] } . " ";
+            $timeline_iter++;
+        }
+        elsif ( $first_pos == 1 ) {
+            printf "%" . ( $space - 2 ) . "s", "";
+            print $pos_month{ $timeline[-1] } . " ";
+        }
+        else {
+            printf "%" . $space . "s", "";
+            printf "%-" . ( 2 * $first_pos ) . "s", $pos_month{ $timeline[-1] };
+        }
+        $label_printer = $first_pos;
+    }
+    else {
+        printf "%" . $space . "s", "";
+        $label_printer += ( int $start_block / 7 );
+    }
+
+    while ( $label_printer < $end_block / 7 && $timeline_iter <= $#timeline ) {
+        while ( ( int $timeline[$timeline_iter] / 7 ) != $label_printer ) { print "  "; $label_printer++; }
+        print "  " . $pos_month{ $timeline[$timeline_iter] } . " ";
+        $label_printer += 3;
+        $timeline_iter++;
+    }
+}
+
+sub print_message {
+    my ( $days, $start_epoch, $end_epoch, $message ) = @_;
+    if ($days) {
+        my @range;
+        foreach my $epoch ( $start_epoch, $end_epoch ) {
+            my ( $mday, $mon, $year ) = ( localtime($epoch) )[ 3, 4, 5 ];
+            my $s = sprintf( "%3s %2d %4d", $months[$mon], $mday, ( 1900 + $year ) );
+            push @range, $s;
+        }
+        printf "%4d: Days ( %-25s ) - %-40s\n", $days, ( join " - ", @range ), $message;
+    }
+    else {
+        printf "%4d: Days - %-40s\n", $days, $message;
+    }
+}
+
+sub number_of_days {
+    my ( $month, $year ) = @_;
+    return 30 if $month == 3 || $month == 5 || $month == 8 || $month == 10;
+    return 31 if $month != 1;
+    return 28 if $year % 4;
+    return 29;
+}
+
+sub configure {
+    my ($period, $ascii, $ansi, $unicode, $author) = @_;
+    my @wanted;
+    push @wanted, 'format' if (not grep { defined $$_ } ($ascii, $ansi, $unicode));
+    push @wanted, 'period' if (not defined $$period);
+    push @wanted, 'author' if (not defined $$author);
+    if (@wanted) {
+	my $git_command = "git config --get-regexp 'calendar\.*'";
+	my @parts       = split(/\s/, qx/$git_command/);
+	if(@parts) {
+	    my %config;
+	    while(my ($key, $value) = splice(@parts, 0, 2)) {
+		$key =~ s/calendar\.//;
+		$config{$key} = $value;
+	    }
+	    local @ARGV = (map  { ( "-$_" => $config{$_} ) }
+			   grep { exists $config{$_}       } @wanted);
+	    GetOptions(
+		'period=n'  => $period,
+		'format=s'  => sub {
+		    if    ($_[1] eq 'ascii')   { $$ascii   ||= 1; }
+		    elsif ($_[1] eq 'ansi')    { $$ansi    ||= 1; }
+		    elsif ($_[1] eq 'unicode') { $$unicode ||= 1; }
+		},
+		'author=s'  => $author
+		);
+	}
+    }
+}
+
+__END__
+
+package App::St;
+
+use strict;
+use warnings;
+
+#use bignum;
+
+our $VERSION = '1.1.1';
+
+sub new {
+  my ($class, %opt) = @_;
+
+  my $delimiter  = $opt{'delimiter'} || "\t";
+  my $format     = $opt{'format'}    || '%.2f';
+
+  if ($delimiter =~ /^\\[a-z]$/) {
+    $delimiter = $delimiter eq '\t' ? "\t"
+               : $delimiter eq '\n' ? "\n"
+                                    : die "Invalid delimiter: '$delimiter'\n";
+  }
+
+  if ($format =~ m{( \s* \% [\s+-]? [0-9]*\.?[0-9]* [deEfgGi] \s* )}x) {
+    $format = $1;
+  } else {
+    die "Invalid format: '$format'\n";
+  }
+
+
+  bless {
+    %opt,
+    N          => 0,
+    sum        => 0,
+    sum_square => 0,
+    mean       => 0,
+    stddev     => 0,
+    stderr     => 0,
+    min        => undef,
+    q1         => 0,
+    median     => 0,
+    q3         => 0,
+    max        => undef,
+    M2         => 0,
+    delimiter  => $delimiter,
+    format     => $format,
+    data       => [],
+  }, $class;
+}
+
+sub validate {
+  my ($self, $num) = @_;
+
+  return ($num =~ m{^
+    [+-]?
+    (?: \. ? [0-9]+
+      | [0-9]+ \. [0-9]*
+      | [0-9]* \. ? [0-9]+ [Ee] [+-]? [0-9]+
+    )
+  $}x);
+}
+
+sub process {
+  my ($self, $num) = @_;
+
+  die "Invalid input '$num'\n" if !$self->validate($num);
+
+  $self->{N}++;
+
+  $self->{sum} += $num;
+
+  $self->{min} = $num if (!defined $self->{min} or $num < $self->{min});
+  $self->{max} = $num if (!defined $self->{max} or $num > $self->{max});
+
+  my $delta = $num - $self->{mean};
+
+  $self->{mean} += $delta / $self->{N};
+  $self->{M2}   += $delta * ($num - $self->{mean});
+
+  push( @{ $self->{data} }, $num ) if $self->{keep_data};
+}
+
+sub N {
+  return $_[0]->{N};
+}
+
+sub sum {
+  return $_[0]->{sum};
+}
+
+sub min {
+  return $_[0]->{min};
+}
+
+sub max {
+  return $_[0]->{max};
+}
+
+sub mean {
+  my ($self,%opt) = @_;
+
+  my $mean = $self->{mean};
+
+  return $opt{formatted} ? $self->_format($mean)
+                         : $mean;
+}
+
+sub q1 {
+    my ($self,%opt) = @_;
+    return $self->percentile(0.25, %opt);
+}
+
+sub median {
+    my ($self,%opt) = @_;
+    return $self->percentile(0.5, %opt);
+}
+
+sub q3 {
+    my ($self,%opt) = @_;
+    return $self->percentile(0.75, %opt);
+}
+
+sub variance {
+  my ($self,%opt) = @_;
+
+  my $N  = $self->{N};
+  my $M2 = $self->{M2};
+
+  my $variance = $N > 1 ? $M2 / ($N - 1) : undef;
+
+  return $opt{formatted} ? $self->_format($variance)
+                         : $variance;
+}
+
+sub stddev {
+  my ($self,%opt) = @_;
+
+  my $variance = $self->variance();
+
+  my $stddev = defined $variance ? sqrt($variance) : undef;
+
+  return $opt{formatted} ? $self->_format($stddev)
+                         : $stddev;
+}
+
+sub stderr {
+  my ($self,%opt) = shift;
+
+  my $stddev = $self->stddev();
+  my $N      = $self->N();
+
+  my $stderr  = defined $stddev ? $stddev/sqrt($N) : undef;
+
+  return $opt{formatted} ? $self->_format($stderr)
+                         : $stderr;
+}
+
+sub percentile {
+    my ($self, $p, %opt) = @_;
+
+    my $data = $self->{data};
+
+    if (!$self->{keep_data} or scalar @{$data} == 0) {
+    }
+
+    if ($p < 0 or $p > 1) {
+        die "Invalid percentile '$p'\n";
+    }
+
+    if (!$self->{_is_sorted_}) {
+        $data = [ sort {$a <=> $b} @{ $data } ];
+        $self->{_is_sorted_} = 1;
+    }
+
+    my $N = $self->N();
+    my $idx = ($N - 1) * $p;
+
+    my $percentile =
+        int($idx) == $idx ? $data->[$idx]
+                          : ($data->[$idx] + $data->[$idx+1]) / 2;
+
+    return $opt{formatted} ? _format($percentile)
+                           : $percentile;
+}
+
+sub result {
+    my $self = shift;
+
+    my %result = (
+        N          => $self->N(),
+        sum        => $self->sum(),
+        mean       => $self->mean(),
+        stddev     => $self->stddev(),
+        stderr     => $self->stderr(),
+        min        => $self->min(),
+        max        => $self->max(),
+    );
+
+    if ($self->{keep_data}) {
+        %result = (%result,
+            (
+                q1      => $self->q1(),
+                median  => $self->median(),
+                q3      => $self->q3(),
+            )
+        );
+    }
+
+    return %result;
+}
+
+sub _format {
+  my ($self,$value,%opt) = @_;
+
+  my $format = $self->{format};
+
+  return sprintf( $format, $value );
+}
+
+1;
+
+__END__
+
+=head1 NAME
+
+App::St - Simple Statistics
+
+=head1 DESCRIPTION
+
+App::St provides the core functionality of the L<st> application.
+
+=head1 SYNOPSIS
+
+  use App::St;
+
+  my $st = App::St->new();
+
+  while (<>) {
+    chomp;
+    next unless $st->validate($_);
+    $st->process($_);
+  }
+
+  print $st->mean();
+  print $st->stddev();
+  print $st->sterr();
+
+#!perl -T
+
+use strict;
+use warnings;
+
+#use bignum;
+
+use Getopt::Long;
+use Pod::Usage;
+
+use App::St;
+
+my %opt;
+GetOptions(
+  \%opt,
+
+  # functions
+  'N|n|count',
+  'mean|avg|m',
+  'stddev|sd',
+  'stderr|sem|se',
+  'sum|s',
+  'variance|var',
+
+  'min|q0',
+  'q1',
+  'median|q2',
+  'q3',
+  'max|q4',
+  'mode',
+  'percentile=i',
+  'quartile=i',
+
+  # predefined output sets
+  'summary',
+  'complete|everything|all',
+  'default',
+
+  # output control
+  'delimiter|d=s',
+  'format|fmt|f=s',
+  'no-header|nh',
+  'transpose-output|transverse-output|to',
+
+  # error handling
+  'quiet|q',
+  'strict',
+
+  'help|h',
+) or pod2usage(1);
+
+pod2usage(1) if $opt{help};
+
+my %config = get_config(%opt);
+my @stats  = statistical_options(%opt);
+
+if ($opt{summary} or $opt{complete} or $opt{q1} or $opt{median} or $opt{q3} or $opt{quantile}) {
+    $config{keep_data} = 1;
+}
+
+my $st = App::St->new(%config);
+
+my $n = 0;
+while (my $num = <>) {
+  chomp $num;
+
+  $n++;
+  if (!$st->validate($num)) {
+      my $err = "Invalid value '$num' on input line $.\n";
+      if ($opt{strict}) {
+        die $err;
+      } elsif (!$opt{quiet}) {
+        warn $err;
+      }
+      next;
+  }
+
+  $st->process($num);
+}
+
+exit if $st->N() == 0;
+
+my %result = $st->result();
+
+my @opt = grep { defined $result{$_} } statistical_options(%opt);
+
+if (scalar @opt == 1) {
+  print sprintf( $config{format}, $result{$opt[0]} ), "\n";
+  exit;
+}
+
+if ($config{'transpose-output'}) {
+  for my $opt (@opt) {
+    print "$opt$config{delimiter}" unless $config{'no-header'};
+    print sprintf( $config{format}, $result{$opt} ), "\n";
+  }
+} else {
+  print join($config{delimiter}, @opt), "\n" unless $config{'no-header'};
+  print join($config{delimiter}, map { sprintf ($config{format}, $result{$_}) } @opt), "\n";
+}
+
+exit;
+
+###
+
+sub get_config {
+  my %opt = @_;
+
+  my %config = map { $_ => $opt{$_} } grep { defined $opt{$_} } qw/delimiter format no-header transpose-output quiet strict/;
+
+  my $delimiter  = $opt{'delimiter'} || "\t";
+  my $format     = $opt{'format'}    || '%g';
+
+  if ($delimiter =~ /^\\[a-z]$/) {
+    $delimiter = $delimiter eq '\t' ? "\t"
+               : $delimiter eq '\n' ? "\n"
+                                    : die "Invalid delimiter: '$delimiter'\n";
+  }
+
+  if ($format =~ m{( \s* \% [\s+-]? [0-9]*\.?[0-9]* [deEfgGi] \s* )}x) {
+    $format = $1;
+  } else {
+    die "Invalid format: '$format'\n";
+  }
+
+  return (%config, delimiter => $delimiter, format => $format);
+
+}
+
+sub statistical_options {
+  my %opt = @_;
+
+  # predefined sets
+  my %predefined = (
+    complete => [ qw/N min q1 median q3 max sum mean stddev stderr variance percentile quartile mode/ ],
+    summary  => [ qw/min q1 median q3 max/ ],
+    default  => [ qw/N min max sum mean stddev/ ],
+  );
+
+  # selected options
+  my %selected = map { $_ => 1 } grep { defined $opt{$_} } @{ $predefined{complete} };
+
+  # expand with predefined sets
+  for my $set (keys %predefined) {
+    if ($opt{$set}) {
+      %selected = (%selected, map { $_ => 1 } @{ $predefined{$set} });
+    }
+  }
+
+  my @selected = %selected ? grep { defined $selected{$_} } @{ $predefined{complete} }
+                           : @{ $predefined{default} };
+
+  return @selected;
+}
+
+__END__
+
+#!/usr/bin/env perl
+use strict;
+use App::FatPacker ();
+use File::Path 2.08 qw(remove_tree);
+use File::Basename;
+use Cwd;
+
+chdir dirname($0);
+
+remove_tree("fatlib");
+
+my $modules = [ split /\s+/, <<MODULES ];
+local/lib.pm
+Capture/Tiny.pm
+CPAN/Perl/Releases.pm
+MODULES
+
+my $packer = App::FatPacker->new;
+my @packlists = $packer->packlists_containing($modules);
+$packer->packlists_to_tree(cwd . "/fatlib", \@packlists);
+
+use Config;
+remove_tree("fatlib/$Config{archname}");
+
+use File::Find;
+File::Find::find({
+    wanted => sub {
+        /^.*\.pod\z/s && unlink;
+    } }, 'fatlib');
+
+exit if exists $ENV{PERLBREW_PERLSTRIP} && !$ENV{PERLBREW_PERLSTRIP};
+
+if (my $strip = `which perlstrip`) {
+    chomp($strip);
+    my @files;
+    File::Find::find({
+        wanted => sub {
+            /^.*\.pm\z/s or return;
+            push @files, $File::Find::name;
+
+        } }, 'fatlib');
+
+    for (@files){
+        system($strip, "-s", $_);
+    }
+}
+
+# -*- perl -*-
+
+use strict;
+use FindBin;
+use Cwd qw(realpath);
+use File::Spec::Functions;
+use Pod::Usage;
+
+my $perlbrew_pm = realpath catfile($FindBin::Bin, "..", "lib", "App", "perlbrew.pm");
+my $perlbrew_pl = realpath catfile($FindBin::Bin, "..", "bin", "perlbrew");
+my $readme      =  realpath catfile($FindBin::Bin, "..", "README");
+
+my $out = "";
+open my $fh, ">", \$out;
+
+pod2usage(
+    -exitval   => "NOEXIT",
+    -verbose   => 99,
+    -sections  => ["NAME", "DESCRIPTION", "INSTALLATION"],
+    -input     => $perlbrew_pm,
+    -output    => $fh,
+    -noperldoc => 1
+);
+
+pod2usage(
+    -exitval   => "NOEXIT",
+    -verbose   => 99,
+    -sections  => ["CONFIGURATION"],
+    -input     => $perlbrew_pl,
+    -output    => $fh,
+    -noperldoc => 1
+);
+
+pod2usage(
+    -exitval   => "NOEXIT",
+    -verbose   => 99,
+    -sections  => ["PROJECT DEVELOPMENT", "AUTHOR", "COPYRIGHT", "LICENSE", "DISCLAIMER OF WARRANTY"],
+    -input     => $perlbrew_pm,
+    -output    => $fh,
+    -noperldoc => 1
+);
+
+open(my $readme_fh, ">", $readme) or die "Failed to open $readme";
+
+print $readme_fh $out;
+
+print "Done.\n";
+
+package App::perlbrew;
+use strict;
+use warnings;
+use 5.008;
+our $VERSION = "0.73";
+use Config;
+
+BEGIN {
+    # Special treat for Cwd to prevent it to be loaded from somewhere binary-incompatible with system perl.
+    my @oldinc = @INC;
+
+    @INC = (
+        $Config{sitelibexp}."/".$Config{archname},
+        $Config{sitelibexp},
+        @Config{qw<vendorlibexp vendorarchexp archlibexp privlibexp>},
+    );
+
+    require Cwd;
+    @INC = @oldinc;
+}
+
+use Getopt::Long ();
+
+sub min(@) {
+    my $m = $_[0];
+    for(@_) {
+        $m = $_ if $_ < $m;
+    }
+    return $m;
+}
+
+sub uniq {
+    my %seen; grep { !$seen{$_}++ } @_;
+}
+
+### global variables
+
+# set $ENV{SHELL} to executable path of parent process (= shell) if it's missing
+# (e.g. if this script was executed by a daemon started with "service xxx start")
+# ref: https://github.com/gugod/App-perlbrew/pull/404
+$ENV{SHELL} ||= readlink joinpath("/proc", getppid, "exe") if -d "/proc";
+
+local $SIG{__DIE__} = sub {
+    my $message = shift;
+    warn $message;
+    exit(1);
+};
+
+our $CONFIG;
+our $PERLBREW_ROOT = $ENV{PERLBREW_ROOT} || joinpath($ENV{HOME}, "perl5", "perlbrew");
+our $PERLBREW_HOME = $ENV{PERLBREW_HOME} || joinpath($ENV{HOME}, ".perlbrew");
+
+my @flavors = ( { d_option => 'usethreads',
+                  implies  => 'multi',
+                  common   => 1,
+                  opt      => 'thread|threads' }, # threads is for backward compatibility
+
+                { d_option => 'usemultiplicity',
+                  opt      => 'multi' },
+
+                { d_option => 'uselongdouble',
+                  common   => 1,
+                  opt      => 'ld' },
+
+                { d_option => 'use64bitint',
+                  common   => 1,
+                  opt      => '64int' },
+
+                { d_option => 'use64bitall',
+                  implies  => '64int',
+                  opt      => '64all' },
+
+                { d_option => 'DEBUGGING',
+                  opt      => 'debug' },
+
+                { d_option => 'cc=clang',
+                  opt      => 'clang' },
+              );
+
+
+my %flavor;
+my $flavor_ix = 0;
+for (@flavors) {
+    my ($name) = $_->{opt} =~ /([^|]+)/;
+    $_->{name} = $name;
+    $_->{ix} = ++$flavor_ix;
+    $flavor{$name} = $_;
+}
+for (@flavors) {
+    if (my $implies = $_->{implies}) {
+        $flavor{$implies}{implied_by} = $_->{name};
+    }
+}
+
+### functions
+
+sub joinpath { join "/", @_ }
+sub splitpath { split "/", $_[0] }
+
+sub mkpath {
+    require File::Path;
+    File::Path::mkpath([@_], 0, 0777);
+}
+
+sub rmpath {
+    require File::Path;
+    File::Path::rmtree([@_], 0, 0);
+}
+
+sub files_are_the_same {
+    ## Check dev and inode num. Not useful on Win32.
+    ## The for loop should always return false on Win32, as a result.
+
+    my @files = @_;
+    my @stats = map {[ stat($_) ]} @files;
+
+    my $stats0 = join " ", @{$stats[0]}[0,1];
+    for (@stats) {
+        return 0 if ((! defined($_->[1])) || $_->[1] == 0);
+        unless ($stats0 eq join(" ", $_->[0], $_->[1])) {
+            return 0;
+        }
+    }
+    return 1
+}
+
+{
+    my %commands = (
+        curl => {
+            test     => '--version >/dev/null 2>&1',
+            get      => '--silent --location --fail -o - {url}',
+            download => '--silent --location --fail -o {output} {url}',
+            order    => 1,
+        },
+        wget => {
+            test     => '--version >/dev/null 2>&1',
+            get      => '--quiet -O - {url}',
+            download => '--quiet -O {output} {url}',
+            order    => 2,
+        },
+        fetch => {
+            test     => '--version >/dev/null 2>&1',
+            get      => '-o - {url}',
+            download => '{url}',
+            order    => 3,
+        }
+    );
+
+    our $HTTP_USER_AGENT_PROGRAM;
+    sub http_user_agent_program {
+        $HTTP_USER_AGENT_PROGRAM ||= do {
+            my $program;
+
+            for my $p (sort {$commands{$a}{order}<=>$commands{$b}{order}} keys %commands) {
+                my $code = system("$p $commands{$p}->{test}") >> 8;
+                if ($code != 127) {
+                    $program = $p;
+                    last;
+                }
+            }
+
+            unless($program) {
+                die "[ERROR] Cannot find a proper http user agent program. Please install curl or wget.\n";
+            }
+
+            $program;
+        };
+
+        die "[ERROR] Unrecognized http user agent program: $HTTP_USER_AGENT_PROGRAM. It can only be one of: ".join(",", keys %commands)."\n" unless $commands{$HTTP_USER_AGENT_PROGRAM};
+
+        return $HTTP_USER_AGENT_PROGRAM;
+    }
+
+    sub http_user_agent_command {
+        my ($purpose, $params) = @_;
+        my $ua = http_user_agent_program;
+        my $cmd = $ua . " " . $commands{ $ua }->{ $purpose };
+        for (keys %$params) {
+            $cmd =~ s!{$_}!$params->{$_}!g;
+        }
+        return ($ua, $cmd) if wantarray;
+        return $cmd;
+    }
+
+    sub http_download {
+        my ($url, $path) = @_;
+
+        if (-e $path) {
+            die "ERROR: The download target < $path > already exists.\n";
+        }
+
+        my $download_command = http_user_agent_command( download => { url => $url, output => $path } );
+
+        my $status = system($download_command);
+        unless ($status == 0) {
+            return "ERROR: Failed to execute the command\n\n\t$download_command\n\nReason:\n\n\t$?";
+        }
+        return 0;
+    }
+
+    sub http_get {
+        my ($url, $header, $cb) = @_;
+
+        if (ref($header) eq 'CODE') {
+            $cb = $header;
+            $header = undef;
+        }
+
+        my ($program, $command) = http_user_agent_command( get => { url =>  $url } );
+
+        open my $fh, '-|', $command
+            or die "open() for '$command': $!";
+
+        local $/;
+        my $body = <$fh>;
+        close $fh;
+
+        die 'Page not retrieved; HTTP error code 400 or above.'
+            if $program eq 'curl' # Exit code is 22 on 404s etc
+            and $? >> 8 == 22; # exit code is packed into $?; see perlvar
+        die 'Page not retrieved: fetch failed.'
+            if $program eq 'fetch' # Exit code is not 0 on error
+            and $?;
+        die 'Server issued an error response.'
+            if $program eq 'wget' # Exit code is 8 on 404s etc
+            and $? >> 8 == 8;
+
+        return $cb ? $cb->($body) : $body;
+    }
+}
+
+sub perl_version_to_integer {
+    my $version = shift;
+    my @v = split(/[\.\-_]/, $version);
+    return undef if @v < 2;
+    if ($v[1] <= 5) {
+        $v[2] ||= 0;
+        $v[3] = 0;
+    }
+    else {
+        $v[3] ||= $v[1] >= 6 ? 9 : 0;
+        $v[3] =~ s/[^0-9]//g;
+    }
+
+    return $v[1]*1000000 + $v[2]*1000 + $v[3];
+}
+
+# straight copy of Wikipedia's "Levenshtein Distance"
+sub editdist {
+    my @a = split //, shift;
+    my @b = split //, shift;
+
+    # There is an extra row and column in the matrix. This is the
+    # distance from the empty string to a substring of the target.
+    my @d;
+    $d[$_][0] = $_ for (0 .. @a);
+    $d[0][$_] = $_ for (0 .. @b);
+
+    for my $i (1 .. @a) {
+        for my $j (1 .. @b) {
+            $d[$i][$j] = ($a[$i-1] eq $b[$j-1] ? $d[$i-1][$j-1]
+                : 1 + min($d[$i-1][$j], $d[$i][$j-1], $d[$i-1][$j-1]));
+        }
+    }
+
+    return $d[@a][@b];
+}
+
+### methods
+
+sub new {
+    my($class, @argv) = @_;
+
+    my %opt = (
+        original_argv  => \@argv,
+        args => [],
+        force => 0,
+        quiet => 0,
+        D => [],
+        U => [],
+        A => [],
+        sitecustomize => '',
+        noman => '',
+        variation => '',
+        both => [],
+	append => '',
+    );
+
+    $opt{$_} = '' for keys %flavor;
+
+    if (@argv) {
+        # build a local @ARGV to allow us to use an older
+        # Getopt::Long API in case we are building on an older system
+        local (@ARGV) = @argv;
+
+        Getopt::Long::Configure(
+            'pass_through',
+            'no_ignore_case',
+            'bundling',
+            'permute',          # default behaviour except 'exec'
+        );
+
+        $class->parse_cmdline(\%opt);
+
+        $opt{args} = \@ARGV;
+
+        # fix up the effect of 'bundling'
+        foreach my $flags (@opt{qw(D U A)}) {
+            foreach my $value (@{$flags}) {
+                $value =~ s/^=//;
+            }
+        }
+    }
+
+    return bless \%opt, $class;
+}
+
+sub parse_cmdline {
+    my ($self, $params, @ext) = @_;
+
+    my @f = map { $flavor{$_}{opt} || $_ } keys %flavor;
+
+    return Getopt::Long::GetOptions(
+        $params,
+
+        'force|f!',
+        'notest|n!',
+        'quiet|q!',
+        'verbose|v',
+        'as=s',
+      	'append=s',
+        'help|h',
+        'version',
+        'root=s',
+        'switch',
+        'all',
+        'shell=s',
+
+        # options passed directly to Configure
+        'D=s@',
+        'U=s@',
+        'A=s@',
+
+        'j=i',
+        # options that affect Configure and customize post-build
+        'sitecustomize=s',
+        'noman',
+
+        # flavors support
+        'both|b=s@',
+        'all-variations',
+        'common-variations',
+        @f,
+
+        @ext
+    )
+}
+
+sub root {
+    my ($self, $new_root) = @_;
+
+    if (defined($new_root)) {
+        $self->{root} = $new_root;
+    }
+
+    return $self->{root} || $PERLBREW_ROOT;
+}
+
+sub current_perl {
+    my ($self, $v) = @_;
+    $self->{current_perl} = $v if $v;
+    return $self->{current_perl} || $self->env('PERLBREW_PERL')  || '';
+}
+
+sub current_lib {
+    my ($self, $v) = @_;
+    $self->{current_lib} = $v if $v;
+    return $self->{current_lib} || $self->env('PERLBREW_LIB')  || '';
+}
+
+sub current_shell {
+    my ($self, $x) = @_;
+    $self->{current_shell} = $x if $x;
+    return $self->{current_shell} ||= do {
+        my $shell_name = (splitpath($self->{shell} || $self->env('SHELL')))[-1];
+        $shell_name =~ s/\d+$//;
+        $shell_name;
+    };
+}
+
+sub current_env {
+    my ($self) = @_;
+    my $l = $self->current_lib;
+    $l = "@" . $l if $l;
+    return $self->current_perl . $l;
+}
+
+sub installed_perl_executable {
+    my ($self, $name) = @_;
+    die unless $name;
+
+    my $executable = joinpath($self->root, "perls", $name, "bin", "perl");
+    return $executable if -e $executable;
+    return "";
+}
+
+sub configure_args {
+    my ($self, $name) = @_;
+
+    my $perl_cmd = $self->installed_perl_executable( $name );
+    my $code = 'while(($_,$v)=each(%Config)){print"$_ $v" if /config_arg/}';
+
+    my @output = split "\n" => $self->do_capture($perl_cmd, '-MConfig', '-wle', $code);
+
+    my %arg;
+    for(@output) {
+        my ($k,$v) = split " ", $_, 2;
+        $arg{$k} = $v;
+    }
+
+    if (wantarray) {
+        return map { $arg{"config_arg$_"} } (1 .. $arg{config_argc})
+    }
+
+    return $arg{config_args}
+}
+
+sub cpan_mirror {
+    my ($self, $v) = @_;
+    unless($self->{cpan_mirror}) {
+        $self->{cpan_mirror} = $self->env("PERLBREW_CPAN_MIRROR") || "http://www.cpan.org";
+        $self->{cpan_mirror} =~ s{/+$}{};
+    }
+    return $self->{cpan_mirror};
+}
+
+sub env {
+    my ($self, $name) = @_;
+    return $ENV{$name} if $name;
+    return \%ENV;
+}
+
+sub path_with_tilde {
+    my ($self, $dir) = @_;
+    my $home = $self->env('HOME');
+    $dir =~ s!\Q$home/\E!~/! if $home;
+    return $dir;
+}
+
+sub is_shell_csh {
+    my ($self) = @_;
+    return 1 if $self->env('SHELL') =~ /(t?csh)/;
+    return 0;
+}
+
+sub run {
+    my($self) = @_;
+    $self->run_command($self->args);
+}
+
+sub args {
+    my ( $self ) = @_;
+    return @{ $self->{args} };
+}
+
+sub commands {
+    my ( $self ) = @_;
+
+    my $package =  ref $self ? ref $self : $self;
+
+    my @commands;
+    my $symtable = do {
+        no strict 'refs';
+        \%{$package . '::'};
+    };
+
+    foreach my $sym (keys %$symtable) {
+        if($sym =~ /^run_command_/) {
+            my $glob = $symtable->{$sym};
+            if(defined *$glob{CODE}) {
+                $sym =~ s/^run_command_//;
+                $sym =~ s/_/-/g;
+                push @commands, $sym;
+            }
+        }
+    }
+
+    return @commands;
+}
+
+sub find_similar_commands {
+    my ( $self, $command ) = @_;
+    my $SIMILAR_DISTANCE = 6;
+
+    my @commands = sort {
+        $a->[1] <=> $b->[1]
+    } grep {
+        defined
+    } map {
+        my $d = editdist($_, $command);
+
+        ($d < $SIMILAR_DISTANCE) ? [ $_, $d ] : undef
+    } $self->commands;
+
+    if(@commands) {
+        my $best  = $commands[0][1];
+        @commands = map { $_->[0] } grep { $_->[1] == $best } @commands;
+    }
+
+    return @commands;
+}
+
+sub run_command {
+    my ( $self, $x, @args ) = @_;
+    my $command = $x;
+
+    if($self->{version}) {
+        $x = 'version';
+    }
+    elsif(!$x) {
+        $x = 'help';
+        @args = (0, $self->{help} ? 2 : 0);
+    }
+    elsif($x eq 'help') {
+        @args = (0, 2) unless @args;
+    }
+
+    my $s = $self->can("run_command_$x");
+    unless ($s) {
+        $x =~ y/-/_/;
+        $s = $self->can("run_command_$x");
+    }
+
+    unless($s) {
+        my @commands = $self->find_similar_commands($x);
+
+        if(@commands > 1) {
+            @commands = map { '    ' . $_ } @commands;
+            die "Unknown command: `$command`. Did you mean one of the following?\n" . join("\n", @commands) . "\n";
+        } elsif(@commands == 1) {
+            die "Unknown command: `$command`. Did you mean `$commands[0]`?\n";
+        } else {
+            die "Unknown command: `$command`. Typo?\n";
+        }
+    }
+
+    $self->$s(@args);
+}
+
+sub run_command_version {
+    my ( $self ) = @_;
+    my $package = ref $self;
+    my $version = $self->VERSION;
+    print "$0  - $package/$version\n";
+}
+
+sub run_command_help {
+    my ($self, $status, $verbose, $return_text) = @_;
+
+    require Pod::Usage;
+
+    if ($status && !defined($verbose)) {
+        if ($self->can("run_command_help_${status}")) {
+            $self->can("run_command_help_${status}")->($self);
+        }
+        else {
+            my $out = "";
+            open my $fh, ">", \$out;
+
+            Pod::Usage::pod2usage(
+                -exitval   => "NOEXIT",
+                -verbose   => 99,
+                -sections  => "COMMAND: " . uc($status),
+                -output    => $fh,
+                -noperldoc => 1
+            );
+            $out =~ s/\A[^\n]+\n//s;
+            $out =~ s/^    //gm;
+
+            if ($out =~ /\A\s*\Z/) {
+                $out = "Cannot find documentation for '$status'\n\n";
+            }
+
+            return "\n$out" if ($return_text);
+            print "\n$out";
+            close $fh;
+        }
+    }
+    else {
+        Pod::Usage::pod2usage(
+            -noperldoc => 1,
+            -verbose => $verbose||0,
+            -exitval => (defined $status ? $status : 1)
+        );
+    }
+}
+
+# introspection for compgen
+my %comp_installed = (
+    use    => 1,
+    switch => 1,
+);
+
+sub run_command_compgen {
+    my($self, $cur, @args) = @_;
+
+    $cur = 0 unless defined($cur);
+
+    # do `tail -f bashcomp.log` for debugging
+    if($self->env('PERLBREW_DEBUG_COMPLETION')) {
+        open my $log, '>>', 'bashcomp.log';
+        print $log "[$$] $cur of [@args]\n";
+    }
+    my $subcommand           = $args[1];
+    my $subcommand_completed = ( $cur >= 2 );
+
+    if(!$subcommand_completed) {
+        $self->_compgen($subcommand, $self->commands);
+    }
+    else { # complete args of a subcommand
+        if($comp_installed{$subcommand}) {
+            if($cur <= 2) {
+                my $part;
+                if(defined($part = $args[2])) {
+                    $part = qr/ \Q$part\E /xms;
+                }
+                $self->_compgen($part,
+                    map{ $_->{name} } $self->installed_perls());
+            }
+        }
+        elsif($subcommand eq 'help') {
+            if($cur <= 2) {
+                $self->_compgen($args[2], $self->commands());
+            }
+        }
+        else {
+            # TODO
+        }
+    }
+}
+
+sub _compgen {
+    my($self, $part, @reply) = @_;
+    if(defined $part) {
+        $part = qr/\A \Q$part\E /xms if ref($part) ne ref(qr//);
+        @reply = grep { /$part/ } @reply;
+    }
+    foreach my $word(@reply) {
+        print $word, "\n";
+    }
+}
+
+sub run_command_available {
+    my ( $self, $dist, $opts ) = @_;
+
+    my @available = $self->available_perls(@_);
+    my @installed = $self->installed_perls(@_);
+
+    my $is_installed;
+    for my $available (@available) {
+        $is_installed = 0;
+        for my $installed (@installed) {
+            my $name = $installed->{name};
+            my $cur  = $installed->{is_current};
+            if ( $available eq $installed->{name} ) {
+                $is_installed = 1;
+                last;
+            }
+        }
+        print $is_installed ? 'i ' : '  ', $available, "\n";
+    }
+}
+
+sub available_perls {
+    my ( $self, $dist, $opts ) = @_;
+
+    my $url = $self->{all}  ? "http://www.cpan.org/src/5.0/"
+                            : "http://www.cpan.org/src/README.html" ;
+
+    my $html = http_get( $url, undef, undef );
+
+    unless($html) {
+        die "\nERROR: Unable to retrieve the list of perls.\n\n";
+    }
+
+    my @available_versions;
+
+    for ( split "\n", $html ) {
+        if ( $self->{all} ) {
+            push @available_versions, $1
+                if m|<a href="perl.*?\.tar\.gz">(.+?)</a>|;
+        }
+        else {
+            push @available_versions, $1
+                if m|<td><a href="http://www.cpan.org/src/.+?">(.+?)</a></td>|;
+        }
+    }
+    s/\.tar\.gz// for @available_versions;
+
+    return @available_versions;
+}
+
+sub perl_release {
+    my ($self, $version) = @_;
+
+    # try src/5.0 symlinks, either perl-5.X or perl5.X; favor .tar.bz2 over .tar.gz
+    my $index = http_get("http://www.cpan.org/src/5.0/");
+    if ($index) {
+        for my $prefix ( "perl-", "perl" ){
+            for my $suffix ( ".tar.bz2", ".tar.gz" ) {
+                my $dist_tarball = "$prefix$version$suffix";
+                my $dist_tarball_url = $self->cpan_mirror() . "/src/5.0/$dist_tarball";
+                return ( $dist_tarball, $dist_tarball_url )
+                    if ( $index =~ /href\s*=\s*"\Q$dist_tarball\E"/ms );
+            }
+        }
+    }
+
+    # try CPAN::Perl::Releases
+    require CPAN::Perl::Releases;
+    my $tarballs = CPAN::Perl::Releases::perl_tarballs($version);
+
+    my $x = (values %$tarballs)[0];
+
+    if ($x) {
+        my $dist_tarball = (split("/", $x))[-1];
+        my $dist_tarball_url = $self->cpan_mirror() . "/authors/id/$x";
+        return ($dist_tarball, $dist_tarball_url);
+    }
+
+    # try to find it on search.cpan.org
+    my $mirror = $self->config->{mirror};
+    my $header = $mirror ? { 'Cookie' => "cpan=$mirror->{url}" } : undef;
+    my $html = http_get("http://search.cpan.org/dist/perl-${version}", $header);
+
+    unless ($html) {
+        die "ERROR: Failed to locate perl-${version} tarball.";
+    }
+
+    my ($dist_path, $dist_tarball) =
+        $html =~ m[<a href="(/CPAN/authors/id/.+/(perl-${version}.tar.(gz|bz2)))">Download</a>];
+    die "ERROR: Cannot find the tarball for perl-$version\n"
+        if !$dist_path and !$dist_tarball;
+    my $dist_tarball_url = "http://search.cpan.org${dist_path}";
+    return ($dist_tarball, $dist_tarball_url);
+}
+
+sub run_command_init {
+    my $self = shift;
+    my @args = @_;
+
+    if (@args && $args[0] eq '-') {
+        if ($self->current_shell =~ /(ba|z)?sh/) {
+            $self->run_command_init_in_bash;
+        }
+        exit 0;
+    }
+
+    mkpath($_) for (grep { ! -d $_ } map { joinpath($self->root, $_) } qw(perls dists build etc bin));
+
+    my ($f, $fh) = @_;
+
+    my $etc_dir = joinpath($self->root, "etc");
+
+    for (["bashrc", "BASHRC_CONTENT"],
+         ["cshrc", "CSHRC_CONTENT"],
+         ["csh_reinit",  "CSH_REINIT_CONTENT"],
+         ["csh_wrapper", "CSH_WRAPPER_CONTENT"],
+         ["csh_set_path", "CSH_SET_PATH_CONTENT"],
+         ["perlbrew-completion.bash", "BASH_COMPLETION_CONTENT"],
+         ["perlbrew.fish", "PERLBREW_FISH_CONTENT" ],
+     ) {
+        my ($file_name, $method) = @$_;
+        my $path = joinpath($etc_dir, $file_name);
+        if (! -f $path) {
+            open($fh, ">", $path) or die "Fail to create $path. Please check the permission of $etc_dir and try `perlbrew init` again.";
+            print $fh $self->$method;
+            close $fh;
+        }
+        else {
+            if (-w $path && open($fh, ">", $path)) {
+                print $fh $self->$method;
+                close $fh;
+            }
+            else {
+                print "NOTICE: $path already exists and not updated.\n" unless $self->{quiet};
+            }
+        }
+    }
+
+    my ( $shrc, $yourshrc );
+    if ( $self->current_shell =~ m/(t?csh)/ ) {
+        $shrc     = 'cshrc';
+        $yourshrc = $1 . "rc";
+    }
+    elsif ($self->current_shell =~ m/zsh\d?$/) {
+        $shrc = "bashrc";
+        $yourshrc = 'zshenv';
+    }
+    elsif( $self->current_shell eq 'fish' ) {
+        $shrc = "perlbrew.fish";
+        $yourshrc = 'config/fish/config.fish';
+    }
+    else {
+        $shrc = "bashrc";
+        $yourshrc = "bash_profile";
+    }
+
+    my $root_dir = $self->path_with_tilde($self->root);
+    my $pb_home_dir = $self->path_with_tilde($PERLBREW_HOME);
+
+    my $code = qq(    source $root_dir/etc/${shrc});
+    if ($PERLBREW_HOME ne joinpath($self->env('HOME'), ".perlbrew")) {
+        $code = "    export PERLBREW_HOME=$pb_home_dir\n" . $code;
+    }
+
+    if ( $self->env('SHELL') =~ m/fish/ ) {
+        $code =~ s/source/./;
+        $code =~ s/export (\S+)=(\S+)/set -x $1 $2/;
+    }
+
+    print <<INSTRUCTION;
+perlbrew root ($root_dir) is initialized.
+Append the following piece of code to the end of your ~/.${yourshrc} and start a
+new shell, perlbrew should be up and fully functional from there:
+$code
+Simply run `perlbrew` for usage details.
+Happy brewing!
+INSTRUCTION
+
+}
+
+sub run_command_init_in_bash {
+    print BASHRC_CONTENT();
+}
+
+sub run_command_self_install {
+    my $self = shift;
+
+    my $executable = $0;
+    my $target = joinpath($self->root, "bin", "perlbrew");
+
+    if (files_are_the_same($executable, $target)) {
+        print "You are already running the installed perlbrew:\n\n    $executable\n";
+        exit;
+    }
+
+    mkpath( joinpath($self->root, "bin" ));
+
+    open my $fh, "<", $executable;
+    my @lines =  <$fh>;
+    close $fh;
+
+    $lines[0] = $self->system_perl_shebang . "\n";
+
+    open $fh, ">", $target;
+    print $fh $_ for @lines;
+    close $fh;
+
+    chmod(0755, $target);
+
+    my $path = $self->path_with_tilde($target);
+
+    print "perlbrew is installed: $path\n" unless $self->{quiet};
+
+    $self->run_command_init();
+    return;
+}
+
+sub do_install_git {
+    my $self = shift;
+    my $dist = shift;
+
+    my $dist_name;
+    my $dist_git_describe;
+    my $dist_version;
+
+    opendir my $cwd_orig, ".";
+
+    chdir $dist;
+
+    if (`git describe` =~ /v((5\.\d+\.\d+(?:-RC\d)?)(-\d+-\w+)?)$/) {
+        $dist_name = 'perl';
+        $dist_git_describe = "v$1";
+        $dist_version = $2;
+    }
+
+    chdir $cwd_orig;
+
+    require File::Spec;
+    my $dist_extracted_dir = File::Spec->rel2abs( $dist );
+    $self->do_install_this($dist_extracted_dir, $dist_version, "$dist_name-$dist_version");
+    return;
+}
+
+sub do_install_url {
+    my $self = shift;
+    my $dist = shift;
+
+    my $dist_name = 'perl';
+    # need the period to account for the file extension
+    my ($dist_version) = $dist =~ m/-([\d.]+(?:-RC\d+)?|git)\./;
+    my ($dist_tarball) = $dist =~ m{/([^/]*)$};
+
+    my $dist_tarball_path = joinpath($self->root, "dists", $dist_tarball);
+    my $dist_tarball_url  = $dist;
+    $dist = "$dist_name-$dist_version"; # we install it as this name later
+
+    if ($dist_tarball_url =~ m/^file/) {
+        print "Installing $dist from local archive $dist_tarball_url\n";
+        $dist_tarball_url =~ s/^file:\/+/\//;
+        $dist_tarball_path = $dist_tarball_url;
+    }
+    else {
+        print "Fetching $dist as $dist_tarball_path\n";
+        my $error = http_download($dist_tarball_url, $dist_tarball_path);
+        die "ERROR: Failed to download $dist_tarball_url\n" if $error;
+    }
+
+    my $dist_extracted_path = $self->do_extract_tarball($dist_tarball_path);
+    $self->do_install_this($dist_extracted_path, $dist_version, $dist);
+    return;
+}
+
+sub do_extract_tarball {
+    my $self = shift;
+    my $dist_tarball = shift;
+
+    # Assuming the dir extracted from the tarball is named after the tarball.
+    my $dist_tarball_basename = $dist_tarball;
+    $dist_tarball_basename =~ s{.*/([^/]+)\.tar\.(?:gz|bz2)$}{$1};
+
+    # Note that this is incorrect for blead.
+    my $extracted_dir = "@{[ $self->root ]}/build/$dist_tarball_basename";
+
+    # Was broken on Solaris, where GNU tar is probably
+    # installed as 'gtar' - RT #61042
+    my $tarx =
+        ($^O eq 'solaris' ? 'gtar ' : 'tar ') .
+        ( $dist_tarball =~ m/bz2$/ ? 'xjf' : 'xzf' );
+
+    if (-d $extracted_dir) {
+        rmpath($extracted_dir);
+    }
+
+    my $extract_command = "cd @{[ $self->root ]}/build; $tarx $dist_tarball";
+    die "Failed to extract $dist_tarball" if system($extract_command);
+    return $extracted_dir;
+}
+
+sub do_install_blead {
+    my $self = shift;
+    my $dist = shift;
+
+    my $dist_name           = 'perl';
+    my $dist_git_describe   = 'blead';
+    my $dist_version        = 'blead';
+
+    # We always blindly overwrite anything that's already there,
+    # because blead is a moving target.
+    my $dist_tarball = 'blead.tar.gz';
+    my $dist_tarball_path = joinpath($self->root, "dists", $dist_tarball);
+    print "Fetching $dist_git_describe as $dist_tarball_path\n";
+
+    my $error = http_download("http://perl5.git.perl.org/perl.git/snapshot/$dist_tarball", $dist_tarball_path);
+
+    if ($error) {
+        die "\nERROR: Failed to download perl-blead tarball.\n\n";
+    }
+
+    # Returns the wrong extracted dir for blead
+    $self->do_extract_tarball($dist_tarball_path);
+
+    my $build_dir = joinpath($self->root, "build");
+    local *DIRH;
+    opendir DIRH, $build_dir or die "Couldn't open ${build_dir}: $!";
+    my @contents = readdir DIRH;
+    closedir DIRH or warn "Couldn't close ${build_dir}: $!";
+    my @candidates = grep { m/^perl-[0-9a-f]{7,8}$/ } @contents;
+    # Use a Schwartzian Transform in case there are lots of dirs that
+    # look like "perl-$SHA1", which is what's inside blead.tar.gz,
+    # so we stat each one only once.
+    @candidates =   map  { $_->[0] }
+                    sort { $b->[1] <=> $a->[1] } # descending
+                    map  { [ $_, (stat( joinpath($build_dir, $_) ))[9] ] } @candidates;
+    my $dist_extracted_dir = joinpath($self->root, "build", $candidates[0]); # take the newest one
+    $self->do_install_this($dist_extracted_dir, $dist_version, "$dist_name-$dist_version");
+    return;
+}
+
+sub resolve_stable_version {
+    my ($self) = @_;
+
+    my ($latest_ver, $latest_minor);
+    for my $cand ($self->available_perls) {
+        my ($ver, $minor) = $cand =~ m/^perl-(5\.(6|8|[0-9]+[02468])\.[0-9]+)$/
+            or next;
+        ($latest_ver, $latest_minor) = ($ver, $minor)
+            if !defined $latest_minor
+            || $latest_minor < $minor;
+    }
+
+    die "Can't determine latest stable Perl release\n"
+        if !defined $latest_ver;
+
+    return $latest_ver;
+}
+
+sub do_install_release {
+    my ($self, $dist, $dist_version) = @_;
+
+    my ($dist_tarball, $dist_tarball_url) = $self->perl_release($dist_version);
+    my $dist_tarball_path = joinpath($self->root, "dists", $dist_tarball);
+
+    if (-f $dist_tarball_path) {
+        print "Using the previously fetched ${dist_tarball}\n"
+            if $self->{verbose};
+    }
+    else {
+        print "Fetching perl $dist_version as $dist_tarball_path\n" unless $self->{quiet};
+        $self->run_command_download($dist);
+    }
+
+    my $dist_extracted_path = $self->do_extract_tarball($dist_tarball_path);
+    $self->do_install_this( $dist_extracted_path, $dist_version, $dist );
+    return;
+}
+
+sub run_command_install {
+    my ( $self, $dist, $opts ) = @_;
+
+    unless($dist) {
+        $self->run_command_help("install");
+        exit(-1);
+    }
+
+    $self->{dist_name} = $dist; # for help msg generation, set to non
+                                # normalized name
+
+    if ($dist =~ /^(?:perl-?)?([\d._]+(?:-RC\d+)?|git|stable|blead)$/) {
+        my $version = ($1 eq 'stable' ? $self->resolve_stable_version : $1);
+        $dist = "perl-$version"; # normalize dist name
+
+        my $installation_name = ($self->{as} || $dist) . $self->{variation} . $self->{append};
+        if (not $self->{force} and $self->is_installed( $installation_name )) {
+            die "\nABORT: $installation_name is already installed.\n\n";
+        }
+
+        if ($version eq 'blead') {
+            $self->do_install_blead($dist);
+        }
+        else {
+            $self->do_install_release( $dist, $version );
+        }
+
+    }
+    # else it is some kind of special install:
+    elsif (-d "$dist/.git") {
+        $self->do_install_git($dist);
+    }
+    elsif (-f $dist) {
+        $self->do_install_archive($dist);
+    }
+    elsif ($dist =~ m/^(?:https?|ftp|file)/) { # more protocols needed?
+        $self->do_install_url($dist);
+    }
+    else {
+        die "Unknown installation target \"$dist\", abort.\nPlease see `perlbrew help` " .
+            "for the instruction on using the install command.\n\n";
+    }
+
+    if ($self->{switch}) {
+        if (defined(my $installation_name = $self->{installation_name})) {
+            $self->switch_to($installation_name)
+        }
+        else {
+            warn "can't switch, unable to infer final destination name.\n\n";
+        }
+    }
+    return;
+}
+
+sub check_and_calculate_variations {
+    my $self = shift;
+    my @both = @{$self->{both}};
+
+    if ($self->{'all-variations'}) {
+        @both = keys %flavor;
+    }
+    elsif ($self->{'common-variations'}) {
+        push @both, grep $flavor{$_}{common}, keys %flavor;
+    }
+
+    # check the validity of the varitions given via 'both'
+    for my $both (@both) {
+        $flavor{$both} or die "$both is not a supported flavor.\n\n";
+        $self->{$both} and die "options --both $both and --$both can not be used together";
+        if (my $implied_by = $flavor{$both}{implied_by}) {
+            $self->{$implied_by} and die "options --both $both and --$implied_by can not be used together";
+        }
+    }
+
+    # flavors selected always
+    my $start = '';
+    $start .= "-$_" for grep $self->{$_}, keys %flavor;
+
+    # make variations
+    my @var = $start;
+    for my $both (@both) {
+        my $append = join('-', $both, grep defined, $flavor{$both}{implies});
+        push @var, map "$_-$append", @var;
+    }
+
+    # normalize the variation names
+    @var = map { join '-', '', sort { $flavor{$a}{ix} <=> $flavor{$b}{ix} } grep length, split /-+/, $_ } @var;
+    s/(\b\w+\b)(?:-\1)+/$1/g for @var; # remove duplicate flavors
+
+    # After inspecting perl Configure script this seems to be the most
+    # reliable heuristic to determine if perl would have 64bit IVs by
+    # default or not:
+    if ($Config::Config{longsize} >= 8) {
+        # We are in a 64bit platform. 64int and 64all are always set but
+        # we don't want them to appear on the final perl name
+        s/-64\w+//g for @var;
+    }
+
+    # remove duplicated variations
+    my %var = map { $_ => 1 } @var;
+    sort keys %var;
+}
+
+sub run_command_install_multiple {
+    my ( $self, @dists) = @_;
+
+    unless(@dists) {
+        $self->run_command_help("install-multiple");
+        exit(-1);
+    }
+
+    die "--switch can not be used with command install-multiple.\n\n"
+        if $self->{switch};
+    die "--as can not be used when more than one distribution is given.\n\n"
+        if $self->{as} and @dists > 1;
+
+    my @variations = $self->check_and_calculate_variations;
+    print join("\n",
+               "Compiling the following distributions:",
+               map("    $_$self->{append}", @dists),
+               "  with the following variations:",
+               map((/-(.*)/ ? "    $1" : "    default"), @variations),
+               "", "");
+
+    my @ok;
+    for my $dist (@dists) {
+        for my $variation (@variations) {
+            local $@;
+            eval {
+                $self->{$_} = '' for keys %flavor;
+                $self->{$_} = 1 for split /-/, $variation;
+                $self->{variation} = $variation;
+                $self->{installation_name} = undef;
+
+                $self->run_command_install($dist);
+                push @ok, $self->{installation_name};
+            };
+            if ($@) {
+                $@ =~ s/\n+$/\n/;
+                print "Installation of $dist$variation failed: $@";
+            }
+        }
+    }
+
+    print join("\n",
+               "",
+               "The following perls have been installed:",
+               map ("    $_", grep defined, @ok),
+               "", "");
+    return
+}
+
+sub run_command_download {
+    my ($self, $dist) = @_;
+
+    $dist = $self->resolve_stable_version
+        if $dist && $dist eq 'stable';
+
+    my ($dist_version) = $dist =~ /^ (?:perl-?)? (.*) $/xs;
+
+    die "\"$dist\" does not look like a perl distribution name. " unless $dist_version =~ /^\d\./;
+
+    my ($dist_tarball, $dist_tarball_url) = $self->perl_release($dist_version);
+    my $dist_tarball_path = joinpath($self->root, "dists", $dist_tarball);
+
+    if (-f $dist_tarball_path && !$self->{force}) {
+        print "$dist_tarball already exists\n";
+    }
+    else {
+        print "Download $dist_tarball_url to $dist_tarball_path\n" unless $self->{quiet};
+        my $error = http_download($dist_tarball_url, $dist_tarball_path);
+        if ($error) {
+            die "ERROR: Failed to download $dist_tarball_url\n";
+        }
+    }
+}
+
+sub purify {
+    my ($self, $envname) = @_;
+    my @paths = grep { index($_, $PERLBREW_HOME) < 0 && index($_, $self->root) < 0 } split /:/, $self->env($envname);
+    return wantarray ? @paths : join(":", @paths);
+}
+
+sub system_perl_executable {
+    my ($self) = @_;
+
+    my $system_perl_executable = do {
+        local $ENV{PATH} = $self->pristine_path;
+        `perl -MConfig -e 'print \$Config{perlpath}'`
+    };
+
+    return $system_perl_executable;
+}
+
+sub system_perl_shebang {
+    my ($self) = @_;
+    return $Config{sharpbang}. $self->system_perl_executable;
+}
+
+sub pristine_path {
+    my ($self) = @_;
+    return $self->purify("PATH");
+}
+
+sub pristine_manpath {
+    my ($self) = @_;
+    return $self->purify("MANPATH");
+}
+
+sub run_command_display_system_perl_executable {
+    print $_[0]->system_perl_executable . "\n";
+}
+
+sub run_command_display_system_perl_shebang {
+    print $_[0]->system_perl_shebang . "\n";
+}
+
+sub run_command_display_pristine_path {
+    print $_[0]->pristine_path . "\n";
+}
+
+sub run_command_display_pristine_manpath {
+    print $_[0]->pristine_manpath . "\n";
+}
+
+sub do_install_archive {
+    require File::Basename;
+
+    my $self = shift;
+    my $dist_tarball_path = shift;
+    my $dist_version;
+    my $installation_name;
+
+    if (File::Basename::basename($dist_tarball_path) =~ m{perl-?(5.+)\.tar\.(gz|bz2)\Z}) {
+        $dist_version = $1;
+        $installation_name = "perl-${dist_version}";
+    }
+
+    unless ($dist_version && $installation_name) {
+        die "Unable to determine perl version from archive filename.\n\nThe archive name should look like perl-5.x.y.tar.gz or perl-5.x.y.tar.bz2\n";
+    }
+
+    my $dist_extracted_path = $self->do_extract_tarball($dist_tarball_path);
+    $self->do_install_this($dist_extracted_path, $dist_version, $installation_name);
+    return;
+}
+
+sub do_install_this {
+    my ($self, $dist_extracted_dir, $dist_version, $installation_name) = @_;
+
+    my $variation = $self->{variation};
+    my $append = $self->{append};
+
+    $self->{dist_extracted_dir} = $dist_extracted_dir;
+    $self->{log_file} = joinpath($self->root, "build.${installation_name}${variation}${append}.log");
+
+    my @d_options = @{ $self->{D} };
+    my @u_options = @{ $self->{U} };
+    my @a_options = @{ $self->{A} };
+    my $sitecustomize = $self->{sitecustomize};
+    $installation_name = $self->{as} if $self->{as};
+    $installation_name .= "$variation$append";
+
+    $self->{installation_name} = $installation_name;
+
+    if ( $sitecustomize ) {
+        die "Could not read sitecustomize file '$sitecustomize'\n"
+            unless -r $sitecustomize;
+        push @d_options, "usesitecustomize";
+    }
+
+    if ( $self->{noman} ) {
+        push @d_options, qw/man1dir=none man3dir=none/;
+    }
+
+    for my $flavor (keys %flavor) {
+        $self->{$flavor} and push @d_options, $flavor{$flavor}{d_option}
+    }
+
+    my $perlpath = $self->root . "/perls/$installation_name";
+    my $patchperl = $self->root . "/bin/patchperl";
+
+    unless (-x $patchperl && -f _) {
+        $patchperl = "patchperl";
+    }
+
+    unshift @d_options, qq(prefix=$perlpath);
+    push @d_options, "usedevel" if $dist_version =~ /5\.\d[13579]|git|blead/;
+
+    unless (grep { /eval:scriptdir=/} @a_options) {
+        push @a_options, "'eval:scriptdir=${perlpath}/bin'";
+    }
+
+    my $version = perl_version_to_integer($dist_version);
+    if (defined $version and $version < perl_version_to_integer( '5.6.0' ) ) {
+        # ancient perls do not support -A for Configure
+        @a_options = ();
+    }
+
+    print "Installing $dist_extracted_dir into " . $self->path_with_tilde("@{[ $self->root ]}/perls/$installation_name") . "\n\n";
+    print <<INSTALL if !$self->{verbose};
+This could take a while. You can run the following command on another shell to track the status:
+  tail -f @{[ $self->path_with_tilde($self->{log_file}) ]}
+INSTALL
+
+    my @preconfigure_commands = (
+        "cd $dist_extracted_dir",
+        "rm -f config.sh Policy.sh",
+        $patchperl,
+    );
+
+    my $configure_flags = $self->env("PERLBREW_CONFIGURE_FLAGS") || '-de';
+
+    my @configure_commands = (
+        "sh Configure $configure_flags " .
+            join( ' ',
+                ( map { qq{'-D$_'} } @d_options ),
+                ( map { qq{'-U$_'} } @u_options ),
+                ( map { qq{'-A$_'} } @a_options ),
+            ),
+        (defined $version and $version < perl_version_to_integer( '5.8.9' ))
+                ? ("$^X -i -nle 'print unless /command-line/' makefile x2p/makefile")
+                : ()
+    );
+
+    my @build_commands = (
+        "make " . ($self->{j} ? "-j$self->{j}" : "")
+    );
+
+    # Test via "make test_harness" if available so we'll get
+    # automatic parallel testing via $HARNESS_OPTIONS. The
+    # "test_harness" target was added in 5.7.3, which was the last
+    # development release before 5.8.0.
+    my $test_target = "test";
+    if ($dist_version =~ /^5\.(\d+)\.(\d+)/
+        && ($1 >= 8 || $1 == 7 && $2 == 3)) {
+        $test_target = "test_harness";
+    }
+    local $ENV{TEST_JOBS}=$self->{j}
+      if $test_target eq "test_harness" && ($self->{j}||1) > 1;
+
+    my @install_commands = $self->{notest} ? "make install" : ("make $test_target", "make install");
+    @install_commands    = join " && ", @install_commands unless($self->{force});
+
+    my $cmd = join " && ",
+    (
+        @preconfigure_commands,
+        @configure_commands,
+        @build_commands,
+        @install_commands
+    );
+
+    unlink($self->{log_file});
+
+    if($self->{verbose}) {
+        $cmd = "($cmd) 2>&1 | tee $self->{log_file}";
+        print "$cmd\n" if $self->{verbose};
+    } else {
+        $cmd = "($cmd) >> '$self->{log_file}' 2>&1 ";
+    }
+
+    delete $ENV{$_} for qw(PERL5LIB PERL5OPT);
+
+    if ($self->do_system($cmd)) {
+        my $newperl = joinpath($self->root, "perls", $installation_name, "bin", "perl");
+        unless (-e $newperl) {
+            $self->run_command_symlink_executables($installation_name);
+        }
+        if ( $sitecustomize ) {
+            my $capture = $self->do_capture("$newperl -V:sitelib");
+            my ($sitelib) = $capture =~ /sitelib='(.*)';/;
+            mkpath($sitelib) unless -d $sitelib;
+            my $target = "$sitelib/sitecustomize.pl";
+            open my $dst, ">", $target
+                or die "Could not open '$target' for writing: $!\n";
+            open my $src, "<", $sitecustomize
+                or die "Could not open '$sitecustomize' for reading: $!\n";
+            print {$dst} do { local $/; <$src> };
+        }
+
+        my $version_file =
+          joinpath( $self->root, 'perls', $installation_name, '.version' );
+
+        if ( -e $version_file ) {
+            unlink($version_file)
+              or die "Could not unlink $version_file file: $!\n";
+        }
+
+        print "$installation_name is successfully installed.\n";
+    }
+    else {
+        die $self->INSTALLATION_FAILURE_MESSAGE;
+    }
+    return;
+}
+
+sub do_install_program_from_url {
+    my ($self, $url, $program_name, $body_filter) = @_;
+
+    my $out = $self->root . "/bin/" . $program_name;
+
+    if (-f $out && !$self->{force}) {
+        require ExtUtils::MakeMaker;
+
+        my $ans = ExtUtils::MakeMaker::prompt("\n$out already exists, are you sure to override ? [y/N]", "N");
+
+        if ($ans !~ /^Y/i) {
+            print "\n$program_name installation skipped.\n\n" unless $self->{quiet};
+            return;
+        }
+    }
+
+    my $body = http_get($url) or die "\nERROR: Failed to retrieve $program_name executable.\n\n";
+
+    unless ($body =~ m{\A#!/}s) {
+        my $x = joinpath($self->env('TMPDIR') || "/tmp", "${program_name}.downloaded.$$");
+        my $message = "\nERROR: The downloaded $program_name program seem to be invalid. Please check if the following URL can be reached correctly\n\n\t$url\n\n...and try again latter.";
+
+        unless (-f $x) {
+            open my $OUT, ">", $x;
+            print $OUT $body;
+            close($OUT);
+            $message .= "\n\nThe previously downloaded file is saved at $x for manual inspection.\n\n";
+        }
+
+        die $message;
+    }
+
+    if ($body_filter && ref($body_filter) eq "CODE") {
+        $body = $body_filter->($body);
+    }
+
+    mkpath("@{[ $self->root ]}/bin") unless -d "@{[ $self->root ]}/bin";
+    open my $OUT, '>', $out or die "cannot open file($out): $!";
+    print $OUT $body;
+    close $OUT;
+    chmod 0755, $out;
+    print "\n$program_name is installed to\n\n    $out\n\n" unless $self->{quiet};
+}
+
+sub do_exit_with_error_code {
+  my ($self, $code) = @_;
+  exit($code);
+}
+
+sub do_system_with_exit_code {
+  my ($self, @cmd) = @_;
+  return system(@cmd);
+}
+
+sub do_system {
+  my ($self, @cmd) = @_;
+  return ! $self->do_system_with_exit_code(@cmd);
+}
+
+sub do_capture {
+  my ($self, @cmd) = @_;
+  require Capture::Tiny;
+  return Capture::Tiny::capture( sub {
+    $self->do_system(@cmd);
+  });
+}
+
+sub format_perl_version {
+    my $self    = shift;
+    my $version = shift;
+    return sprintf "%d.%d.%d",
+      substr( $version, 0, 1 ),
+      substr( $version, 2, 3 ),
+      substr( $version, 5 ) || 0;
+
+}
+
+sub installed_perls {
+    my $self    = shift;
+
+    my @result;
+    my $root = $self->root;
+
+    for (<$root/perls/*>) {
+        my ($name) = $_ =~ m/\/([^\/]+$)/;
+        my $executable = joinpath($_, 'bin', 'perl');
+        my $version_file = joinpath($_,'.version');
+        my $orig_version;
+        if ( -e $version_file ){
+            open my $fh, '<', $version_file;
+            local $/;
+            $orig_version = <$fh>;
+            chomp $orig_version;
+        } else {
+            $orig_version = `$executable -e 'print \$]'`;
+            if ( defined $orig_version and length $orig_version ){
+                if (open my $fh, '>', $version_file ){
+                    print {$fh} $orig_version;
+		}
+            }
+        }
+
+        push @result, {
+            name        => $name,
+            orig_version=> $orig_version,
+            version     => $self->format_perl_version($orig_version),
+            is_current  => ($self->current_perl eq $name) && !($self->current_lib),
+            libs => [ $self->local_libs($name) ],
+            executable  => $executable
+        };
+    }
+
+    return sort { $a->{orig_version} <=> $b->{orig_version} or $a->{name} cmp $b->{name}  } @result;
+}
+
+sub local_libs {
+    my ($self, $perl_name) = @_;
+
+    my @libs = map { substr($_, length($PERLBREW_HOME) + 6) } <$PERLBREW_HOME/libs/*>;
+
+    if ($perl_name) {
+        @libs = grep { /^$perl_name\@/ } @libs;
+    }
+
+    my $current = $self->current_perl . '@' . ($self->env("PERLBREW_LIB") || '');
+
+    @libs = map {
+        my ($p, $l) = split(/@/, $_);
+
+        +{
+            name       => $_,
+            is_current => $_ eq $current,
+            perl_name  => $p,
+            lib_name   => $l
+        }
+    } @libs;
+    return @libs;
+}
+
+sub is_installed {
+    my ($self, $name) = @_;
+
+    return grep { $name eq $_->{name} } $self->installed_perls;
+}
+
+sub assert_known_installation {
+    my ($self, $name) = @_;
+    return 1 if $self->is_installed($name);
+    die "ERROR: The installation \"$name\" is unknown\n\n";
+}
+
+# Return a hash of PERLBREW_* variables
+sub perlbrew_env {
+    my ($self, $name) = @_;
+    my ($perl_name, $lib_name);
+
+    if ($name) {
+        ($perl_name, $lib_name) = $self->resolve_installation_name($name);
+
+        unless ($perl_name) {
+            die "\nERROR: The installation \"$name\" is unknown.\n\n";
+        }
+
+        unless (!$lib_name || grep { $_->{lib_name} eq $lib_name } $self->local_libs($perl_name)) {
+            die "\nERROR: The lib name \"$lib_name\" is unknown.\n\n";
+        }
+    }
+
+    my %env = (
+        PERLBREW_VERSION => $VERSION,
+        PERLBREW_PATH    => joinpath($self->root, "bin"),
+        PERLBREW_MANPATH => "",
+        PERLBREW_ROOT => $self->root
+    );
+
+    require local::lib;
+    my $current_local_lib_root = $self->env("PERL_LOCAL_LIB_ROOT") || "";
+    my $current_local_lib_context = local::lib->new;
+    my @perlbrew_local_lib_root =  uniq(grep { /\Q${PERLBREW_HOME}\E/ } split(/:/, $current_local_lib_root));
+    if ($current_local_lib_root =~ /^\Q$PERLBREW_HOME\E/) {
+        $current_local_lib_context = $current_local_lib_context->activate($_) for @perlbrew_local_lib_root;
+    }
+
+    if ($perl_name) {
+        if(-d  "@{[ $self->root ]}/perls/$perl_name/bin") {
+            $env{PERLBREW_PERL}    = $perl_name;
+            $env{PERLBREW_PATH}   .= ":" . joinpath($self->root, "perls", $perl_name, "bin");
+            $env{PERLBREW_MANPATH} = joinpath($self->root, "perls", $perl_name, "man")
+        }
+
+        if ($lib_name) {
+            $current_local_lib_context = $current_local_lib_context->deactivate($_) for @perlbrew_local_lib_root;
+
+            my $base = "$PERLBREW_HOME/libs/${perl_name}\@${lib_name}";
+
+            if (-d $base) {
+                $current_local_lib_context = $current_local_lib_context->activate($base);
+                $env{PERLBREW_PATH}    = joinpath($base, "bin") . ":" . $env{PERLBREW_PATH};
+                $env{PERLBREW_MANPATH} = joinpath($base, "man") . ":" . $env{PERLBREW_MANPATH};
+                $env{PERLBREW_LIB}  = $lib_name;
+            }
+        } else {
+            $current_local_lib_context = $current_local_lib_context->deactivate($_) for @perlbrew_local_lib_root;
+            $env{PERLBREW_LIB} = undef;
+        }
+
+        my %ll_env = $current_local_lib_context->build_environment_vars;
+        delete $ll_env{PATH};
+        for my $key (keys %ll_env) {
+            $env{$key} = $ll_env{$key};
+        }
+    } else {
+        $current_local_lib_context = $current_local_lib_context->deactivate($_) for @perlbrew_local_lib_root;
+
+        my %ll_env = $current_local_lib_context->build_environment_vars;
+        delete $ll_env{PATH};
+        for my $key (keys %ll_env) {
+            $env{$key} = $ll_env{$key};
+        }
+        $env{PERLBREW_LIB} = undef;
+        $env{PERLBREW_PERL} = undef;
+    }
+
+    return %env;
+}
+
+sub run_command_list {
+    my $self = shift;
+
+    for my $i ( $self->installed_perls ) {
+        print $i->{is_current} ? '* ': '  ',
+            $i->{name},
+            (index($i->{name}, $i->{version}) < 0) ? " ($i->{version})" : "",
+            "\n";
+
+        for my $lib (@{$i->{libs}}) {
+            print $lib->{is_current} ? "* " : "  ",
+                $lib->{name}, "\n"
+        }
+    }
+
+    return 0;
+}
+
+sub launch_sub_shell {
+    my ($self, $name) = @_;
+    my $shell = $self->env('SHELL');
+
+    my $shell_opt = "";
+
+    if ($shell =~ /\/zsh\d?$/) {
+        $shell_opt = "-d -f";
+
+        if ($^O eq 'darwin') {
+            my $root_dir = $self->root;
+            print <<"WARNINGONMAC"
+--------------------------------------------------------------------------------
+WARNING: zsh perlbrew sub-shell is not working on Mac OSX Lion.
+It is known that on MacOS Lion, zsh always resets the value of PATH on launching
+a sub-shell. Effectively nullify the changes required by perlbrew sub-shell. You
+may `echo \$PATH` to examine it and if you see perlbrew related paths are in the
+end, instead of in the beginning, you are unfortunate.
+You are advised to include the following line to your ~/.zshenv as a better
+way to work with perlbrew:
+    source $root_dir/etc/bashrc
+--------------------------------------------------------------------------------
+WARNINGONMAC
+
+
+        }
+    }
+
+    my %env = ($self->perlbrew_env($name), PERLBREW_SKIP_INIT => 1);
+
+    unless ($ENV{PERLBREW_VERSION}) {
+        my $root = $self->root;
+        # The user does not source bashrc/csh in their shell initialization.
+        $env{PATH}    = $env{PERLBREW_PATH}    . ":" . join ":", grep { !/$root\/bin/ } split ":", $ENV{PATH};
+        $env{MANPATH} = $env{PERLBREW_MANPATH} . ":" . join ":", grep { !/$root\/man/ }
+            ( defined($ENV{MANPATH}) ? split(":", $ENV{MANPATH}) : () );
+    }
+
+    my $command = "env ";
+    while (my ($k, $v) = each(%env)) {
+        no warnings "uninitialized";
+        $command .= "$k=\"$v\" ";
+    }
+    $command .= " $shell $shell_opt";
+
+    my $pretty_name = defined($name) ? $name : "the default perl";
+    print "\nA sub-shell is launched with $pretty_name as the activated perl. Run 'exit' to finish it.\n\n";
+    exec($command);
+}
+
+sub run_command_use {
+    my $self = shift;
+    my $perl = shift;
+
+    if ( !$perl ) {
+        my $current = $self->current_perl;
+        $current .= '@' . $self->current_lib if ($self->current_lib);
+        if ($current) {
+            print "Currently using $current\n";
+        } else {
+            print "No version in use; defaulting to system\n";
+        }
+        return;
+    }
+
+    $self->launch_sub_shell($perl);
+
+}
+
+sub run_command_switch {
+    my ( $self, $dist, $alias ) = @_;
+
+    unless ( $dist ) {
+        my $current = $self->current_perl;
+        $current .= '@' . $self->current_lib if ($self->current_lib);
+        printf "Currently switched %s\n",
+            ( $current ? "to $current" : 'off' );
+        return;
+    }
+
+    $self->switch_to($dist, $alias);
+}
+
+sub switch_to {
+    my ( $self, $dist, $alias ) = @_;
+
+    die "Cannot use for alias something that starts with 'perl-'\n"
+      if $alias && $alias =~ /^perl-/;
+
+    die "${dist} is not installed\n" unless -d joinpath($self->root, "perls", $dist);
+
+    if ($self->env("PERLBREW_BASHRC_VERSION")) {
+        local $ENV{PERLBREW_PERL} = $dist;
+        my $HOME = $self->env('HOME');
+        my $pb_home = $self->env("PERLBREW_HOME") || $PERLBREW_HOME;
+
+        mkpath($pb_home);
+        system("$0 env $dist > " . joinpath($pb_home, "init"));
+
+        print "Switched to $dist.\n\n";
+    }
+    else {
+        $self->launch_sub_shell($dist);
+    }
+}
+
+sub run_command_off {
+    my $self = shift;
+    $self->launch_sub_shell;
+}
+
+sub run_command_switch_off {
+    my $self = shift;
+    my $pb_home = $self->env("PERLBREW_HOME") || $PERLBREW_HOME;
+
+    mkpath($pb_home);
+    system("env PERLBREW_PERL= $0 env > " . joinpath($pb_home, "init"));
+
+    print "\nperlbrew is switched off. Please exit this shell and start a new one to make it effective.\n";
+    print "To immediately make it effective, run this line in this terminal:\n\n    exec @{[ $self->env('SHELL') ]}\n\n";
+}
+
+sub run_command_mirror {
+    my($self) = @_;
+    print "Fetching mirror list\n";
+    my $raw = http_get("http://search.cpan.org/mirror");
+
+    unless ($raw) {
+        die "\nERROR: Failed to retrieve the mirror list.\n\n";
+    }
+
+    my $found;
+    my @mirrors;
+    foreach my $line ( split m{\n}, $raw ) {
+        $found = 1 if $line =~ m{<select name="mirror">};
+        next if ! $found;
+        last if $line =~ m{</select>};
+        if ( $line =~ m{<option value="(.+?)">(.+?)</option>} ) {
+            my $url  = $1;
+            my $name = $2;
+            $name =~ s/&#(\d+);/chr $1/seg;
+            $url =~ s/&#(\d+);/chr $1/seg;
+            push @mirrors, { url => $url, name => $name };
+        }
+    }
+
+    require ExtUtils::MakeMaker;
+    my $select;
+    my $max = @mirrors;
+    my $id  = 0;
+    while ( @mirrors ) {
+        my @page = splice(@mirrors,0,20);
+        my $base = $id;
+        printf "[% 3d] %s\n", ++$id, $_->{name} for @page;
+        my $remaining = $max - $id;
+        my $ask = "Select a mirror by number or press enter to see the rest "
+                . "($remaining more) [q to quit, m for manual entry]";
+        my $val = ExtUtils::MakeMaker::prompt( $ask );
+        if ( ! length $val )  { next }
+        elsif ( $val eq 'q' ) { last }
+        elsif ( $val eq 'm' ) {
+            my $url  = ExtUtils::MakeMaker::prompt("Enter the URL of your CPAN mirror:");
+            my $name = ExtUtils::MakeMaker::prompt("Enter a Name: [default: My CPAN Mirror]") || "My CPAN Mirror";
+            $select = { name => $name, url => $url };
+            last;
+        }
+        elsif ( not $val =~ /\s*(\d+)\s*/ ) {
+            die "Invalid answer: must be 'q', 'm' or a number\n";
+        }
+        elsif (1 <= $val and $val <= $max) {
+            $select = $page[ $val - 1 - $base ];
+            last;
+        }
+        else {
+            die "Invalid ID: must be between 1 and $max\n";
+        }
+    }
+    die "You didn't select a mirror!\n" if ! $select;
+    print "Selected $select->{name} ($select->{url}) as the mirror\n";
+    my $conf = $self->config;
+    $conf->{mirror} = $select;
+    $self->_save_config;
+    return;
+}
+
+sub run_command_env {
+    my($self, $name) = @_;
+
+    my %env = $self->perlbrew_env($name);
+
+    my @statements;
+    for my $k (sort keys %env) {
+        my $v = $env{$k};
+        if (defined($v) && $v ne '') {
+            $v =~ s/(\\")/\\$1/g;
+            push @statements, ["set", $k, $v];
+        } else {
+            if (exists $ENV{$k}) {
+                push @statements, ["unset", $k];
+            }
+        }
+    }
+
+    if ($self->env('SHELL') =~ /(ba|k|z|\/)sh\d?$/) {
+        for (@statements) {
+            my ($o,$k,$v) = @$_;
+            if ($o eq 'unset') {
+                print "unset $k\n";
+            } else {
+                $v =~ s/(\\")/\\$1/g;
+                print "export $k=\"$v\"\n";
+            }
+        }
+    } else {
+        for (@statements) {
+            my ($o,$k,$v) = @$_;
+            if ($o eq 'unset') {
+                print "unsetenv $k\n";
+            } else {
+                print "setenv $k \"$v\"\n";
+            }
+        }
+    }
+}
+
+sub run_command_symlink_executables {
+    my($self, @perls) = @_;
+    my $root = $self->root;
+
+    unless (@perls) {
+        @perls = map { m{/([^/]+)$} } grep { -d $_ && ! -l $_ } <$root/perls/*>;
+    }
+
+    for my $perl (@perls) {
+        for my $executable (<$root/perls/$perl/bin/*>) {
+            my ($name, $version) = $executable =~ m/bin\/(.+?)(5\.\d.*)?$/;
+            system("ln -fs $executable $root/perls/$perl/bin/$name") if $version;
+        }
+    }
+}
+
+sub run_command_install_patchperl {
+    my ($self) = @_;
+    $self->do_install_program_from_url(
+        'https://raw.githubusercontent.com/gugod/patchperl-packing/master/patchperl',
+        'patchperl',
+        sub {
+            my ($body) = @_;
+            $body =~ s/\A#!.+?\n/ $self->system_perl_shebang . "\n" /se;
+            return $body;
+        }
+    );
+}
+
+sub run_command_install_cpanm {
+    my ($self) = @_;
+    $self->do_install_program_from_url('https://raw.githubusercontent.com/miyagawa/cpanminus/master/cpanm' => 'cpanm');
+}
+
+sub run_command_self_upgrade {
+    my ($self) = @_;
+    my $TMPDIR = $ENV{TMPDIR} || "/tmp";
+    my $TMP_PERLBREW = joinpath($TMPDIR, "perlbrew");
+
+    require FindBin;
+    unless(-w $FindBin::Bin) {
+        die "Your perlbrew installation appears to be system-wide.  Please upgrade through your package manager.\n";
+    }
+
+    http_get('http://get.perlbrew.pl', undef, sub {
+        my ( $body ) = @_;
+
+        open my $fh, '>', $TMP_PERLBREW or die "Unable to write perlbrew: $!";
+        print $fh $body;
+        close $fh;
+    });
+
+    chmod 0755, $TMP_PERLBREW;
+    my $new_version = qx($TMP_PERLBREW version);
+    chomp $new_version;
+    if($new_version =~ /App::perlbrew\/(\d+\.\d+)$/) {
+        $new_version = $1;
+    } else {
+        die "Unable to detect version of new perlbrew!\n";
+    }
+    if($new_version <= $VERSION) {
+        print "Your perlbrew is up-to-date.\n";
+        return;
+    }
+    system $TMP_PERLBREW, "self-install";
+    unlink $TMP_PERLBREW;
+}
+
+sub run_command_uninstall {
+    my ( $self, $target ) = @_;
+
+    unless($target) {
+        $self->run_command_help("uninstall");
+        exit(-1);
+    }
+
+    my $dir = "@{[ $self->root ]}/perls/$target";
+
+    if (-l $dir) {
+        die "\nThe given name `$target` is an alias, not a real installation. Cannot perform uninstall.\nTo delete the alias, run:\n\n    perlbrew alias delete $target\n\n";
+    }
+
+    unless(-d $dir) {
+        die "'$target' is not installed\n";
+    }
+    exec 'rm', '-rf', $dir;
+}
+
+sub run_command_exec {
+    my $self = shift;
+    my %opts;
+
+    local (@ARGV) = @{$self->{original_argv}};
+
+    Getopt::Long::Configure ('require_order');
+    my @command_options = ('with=s', 'halt-on-error');
+
+    $self->parse_cmdline (\%opts, @command_options);
+    shift @ARGV; # "exec"
+    $self->parse_cmdline (\%opts, @command_options);
+
+    my @exec_with;
+    if ($opts{with}) {
+        my %installed = map { $_->{name} => $_ } map { ($_, @{$_->{libs}}) } $self->installed_perls;
+
+        my $d = ($opts{with} =~ / /) ? qr( +) : qr(,+);
+        my @with = grep { $_ } map {
+            my ($p,$l) = $self->resolve_installation_name($_);
+            $p .= "\@$l" if $l;
+            $p;
+        } split $d, $opts{with};
+        @exec_with = map { $installed{$_} } @with;
+    }
+    else {
+        @exec_with = map { ($_, @{$_->{libs}}) } $self->installed_perls;
+    }
+    if (0 == @exec_with) {
+        print "No perl installation found.\n" unless $self->{quiet};
+    }
+    my $overall_success = 1;
+    for my $i ( @exec_with ) {
+        next if -l $self->root . '/perls/' . $i->{name}; # Skip Aliases
+        my %env = $self->perlbrew_env($i->{name});
+        next if !$env{PERLBREW_PERL};
+        local @ENV{ keys %env } = values %env;
+        local $ENV{PATH}    = join(':', $env{PERLBREW_PATH}, $ENV{PATH});
+        local $ENV{MANPATH} = join(':', $env{PERLBREW_MANPATH}, $ENV{MANPATH}||"");
+        local $ENV{PERL5LIB} = $env{PERL5LIB} || "";
+        print "$i->{name}\n==========\n" unless $self->{quiet};
+        if (my $err = $self->do_system_with_exit_code(@ARGV)) {
+            my $exit_code = $err >> 8;
+            # return 255 for case when process was terminated with signal, in that case real exit code is useless and weird
+            $exit_code = 255 if $exit_code > 255;
+            $overall_success = 0;
+            unless ($self->{quiet}) {
+                print "Command terminated with non-zero status.\n";
+                print STDERR "Command [" .
+                    join(' ', map { /\s/ ? "'$_'" : $_ } @ARGV) . # trying reverse shell escapes - quote arguments containing spaces
+                    "] terminated with exit code $exit_code (\$? = $err) under the following perl environment:\n";
+                print STDERR $self->format_info_output;
+            }
+            $self->do_exit_with_error_code($exit_code) if ($opts{'halt-on-error'});
+        }
+        print "\n\n" unless $self->{quiet};
+    }
+    $self->do_exit_with_error_code(1) unless $overall_success;
+}
+sub run_command_clean {
+    my ($self) = @_;
+    my $root = $self->root;
+    my @build_dirs = <$root/build/*>;
+    for my $dir (@build_dirs) {
+        print "Removing $dir\n";
+        rmpath($dir);
+    }
+    my @tarballs = <$root/dists/*>;
+    for my $file ( @tarballs ) {
+        print "Removing $file\n";
+        unlink($file);
+    }
+    print "\nDone\n";
+}
+sub run_command_alias {
+    my ($self, $cmd, $name, $alias) = @_;
+    unless($cmd) {
+        $self->run_command_help("alias");
+        exit(-1);
+    }
+    my $path_name  = joinpath($self->root, "perls", $name);
+    my $path_alias = joinpath($self->root, "perls", $alias) if $alias;
+    if ($alias && -e $path_alias && !-l $path_alias) {
+        die "\nABORT: The installation name `$alias` is not an alias, cannot override.\n\n";
+    }
+    if ($cmd eq 'create') {
+        $self->assert_known_installation($name);
+        if ( $self->is_installed($alias) && !$self->{force} ) {
+            die "\nABORT: The installation `${alias}` already exists. Cannot override.\n\n";
+        }
+        unlink($path_alias) if -e $path_alias;
+        symlink($path_name, $path_alias);
+    }
+    elsif($cmd eq 'delete') {
+        $self->assert_known_installation($name);
+        unless (-l $path_name) {
+            die "\nABORT: The installation name `$name` is not an alias, cannot remove.\n\n";
+        }
+        unlink($path_name);
+    }
+    elsif($cmd eq 'rename') {
+        $self->assert_known_installation($name);
+        unless (-l $path_name) {
+            die "\nABORT: The installation name `$name` is not an alias, cannot rename.\n\n";
+        }
+        if (-l $path_alias && !$self->{force}) {
+            die "\nABORT: The alias `$alias` already exists, cannot rename to it.\n\n";
+        }
+        rename($path_name, $path_alias);
+    }
+    elsif($cmd eq 'help') {
+        $self->run_command_help("alias");
+    }
+    else {
+        die "\nERROR: Unrecognized action: `${cmd}`.\n\n";
+    }
+}
+sub run_command_display_bashrc {
+    print BASHRC_CONTENT();
+}
+sub run_command_display_cshrc {
+    print CSHRC_CONTENT();
+}
+sub run_command_display_installation_failure_message {
+    my ($self) = @_;
+}
+sub run_command_lib {
+    my ($self, $subcommand, @args) = @_;
+    unless ($subcommand) {
+        $self->run_command_help("lib");
+        exit(-1);
+    }
+    my $sub = "run_command_lib_$subcommand";
+    if ($self->can($sub)) {
+        $self->$sub( @args );
+    }
+    else {
+        print "Unknown command: $subcommand\n";
+    }
+}
+sub run_command_lib_create {
+    my ($self, $name) = @_;
+    die "ERROR: No lib name\n", $self->run_command_help("lib", undef, 'return_text') unless $name;
+    $name =~ s/^/@/ unless $name =~ /@/;
+    my ($perl_name, $lib_name) = $self->resolve_installation_name($name);
+    if (!$perl_name) {
+        my ($perl_name, $lib_name) = split('@', $name);
+        die "ERROR: '$perl_name' is not installed yet, '$name' cannot be created.\n";
+    }
+    my $fullname = $perl_name . '@' . $lib_name;
+    my $dir = joinpath($PERLBREW_HOME,  "libs", $fullname);
+    if (-d $dir) {
+        die "$fullname is already there.\n";
+    }
+    mkpath($dir);
+    print "lib '$fullname' is created.\n"
+        unless $self->{quiet};
+    return;
+}
+sub run_command_lib_delete {
+    my ($self, $name) = @_;
+    die "ERROR: No lib to delete\n", $self->run_command_help("lib", undef, 'return_text') unless $name;
+    $name =~ s/^/@/ unless $name =~ /@/;
+    my ($perl_name, $lib_name) = $self->resolve_installation_name($name);
+    my $fullname = $perl_name . '@' . $lib_name;
+    my $current  = $self->current_perl . '@' . $self->current_lib;
+    my $dir = joinpath($PERLBREW_HOME,  "libs", $fullname);
+    if (-d $dir) {
+        if ($fullname eq $current) {
+            die "$fullname is currently being used in the current shell, it cannot be deleted.\n";
+        }
+        rmpath($dir);
+        print "lib '$fullname' is deleted.\n"
+            unless $self->{quiet};
+    }
+    else {
+        die "ERROR: '$fullname' does not exist.\n";
+    }
+    return;
+}
+sub run_command_lib_list {
+    my ($self) = @_;
+    my $dir = joinpath($PERLBREW_HOME,  "libs");
+    return unless -d $dir;
+    opendir my $dh, $dir or die "open $dir failed: $!";
+    my @libs = grep { !/^\./ && /\@/ } readdir($dh);
+    my $current = $self->current_env;
+    for (@libs) {
+        print $current eq $_ ? "* " : "  ";
+        print "$_\n";
+    }
+}
+sub run_command_upgrade_perl {
+    my ($self) = @_;
+    my $PERL_VERSION_RE = qr/(\d+)\.(\d+)\.(\d+)/;
+    my ( $current ) = grep { $_->{is_current} } $self->installed_perls;
+    unless(defined $current) {
+        print "no perlbrew environment is currently in use\n";
+        exit(1);
+    }
+    my ( $major, $minor, $release );
+    if($current->{version} =~ /^$PERL_VERSION_RE$/) {
+        ( $major, $minor, $release ) = ( $1, $2, $3 );
+    } else {
+        print "unable to parse version '$current->{version}'\n";
+        exit(1);
+    }
+    my @available = grep {
+        /^perl-$major\.$minor/
+    } $self->available_perls;
+    my $latest_available_perl = $release;
+    foreach my $perl (@available) {
+        if($perl =~ /^perl-$PERL_VERSION_RE$/) {
+            my $this_release = $3;
+            if($this_release > $latest_available_perl) {
+                $latest_available_perl = $this_release;
+            }
+        }
+    }
+    if($latest_available_perl == $release) {
+        print "This perlbrew environment ($current->{name}) is already up-to-date.\n";
+        exit(0);
+    }
+    my $dist_version = "$major.$minor.$latest_available_perl";
+    my $dist         = "perl-$dist_version";
+    print "Upgrading $current->{name} to $dist_version\n" unless $self->{quiet};
+    local $self->{as}        = $current->{name};
+    local $self->{dist_name} = $dist;
+    $self->do_install_release($dist, $dist_version);
+}
+sub run_command_list_modules {
+    my ($self) = @_;
+    my $class = ref($self) || __PACKAGE__;
+    my $app = $class->new(
+        qw(--quiet exec --with),
+        $self->current_env,
+        'perl', '-MExtUtils::Installed', '-le',
+        'BEGIN{@INC=grep {$_ ne q!.!} @INC}; print for ExtUtils::Installed->new->modules;'
+    );
+    $app->run;
+}
+sub resolve_installation_name {
+    my ($self, $name) = @_;
+    die "App::perlbrew->resolve_installation_name requires one argument." unless $name;
+    my ($perl_name, $lib_name) = split('@', $name);
+    $perl_name = $name unless $lib_name;
+    $perl_name ||= $self->current_perl;
+    if ( !$self->is_installed($perl_name) ) {
+        if ($self->is_installed("perl-${perl_name}") ) {
+            $perl_name = "perl-${perl_name}";
+        }
+        else {
+            return undef;
+        }
+    }
+    return wantarray ? ($perl_name, $lib_name) : $perl_name;
+}
+sub format_info_output
+{
+    my ($self, $module) = @_;
+    my $out = '';
+    $out .= "Current perl:\n";
+    if ($self->current_perl) {
+        $out .= "  Name: " . $self->current_env . "\n";
+        $out .= "  Path: " . $self->installed_perl_executable($self->current_perl) . "\n";
+        $out .= "  Config: " . $self->configure_args( $self->current_perl ) . "\n";
+        $out .= join('', "  Compiled at: ", (map {
+            /  Compiled at (.+)\n/ ? $1 : ()
+        } `@{[ $self->installed_perl_executable($self->current_perl) ]} -V`), "\n");
+    }
+    else {
+        $out .= "Using system perl." . "\n";
+        $out .= "Shebang: " . $self->system_perl_shebang . "\n";
+    }
+    $out .= "\nperlbrew:\n";
+    $out .= "  version: " . $self->VERSION . "\n";
+    $out .= "  ENV:\n";
+    for(map{"PERLBREW_$_"}qw(ROOT HOME PATH MANPATH)) {
+        $out .= "    $_: " . ($self->env($_)||"") . "\n";
+    }
+    if ( $module ) {
+        my $code = qq{eval "require $module" and do { (my \$f = "$module") =~ s<::></>g; \$f .= ".pm"; print "$module\n  Location: \$INC{\$f}\n  Version: " . ($module->VERSION ? $module->VERSION : "no VERSION specified" ) } or do { print "$module could not be found, is it installed?" } };
+        $out .= "\nModule: ".$self->do_capture( $self->installed_perl_executable($self->current_perl), "-le", $code );
+    }
+    $out;
+}
+sub run_command_info {
+    my ($self) = shift;
+    print $self->format_info_output(@_);
+}
+sub config {
+    my($self) = @_;
+    $self->_load_config if ! $CONFIG;
+    return $CONFIG;
+}
+sub config_file {
+    my ($self) = @_;
+    joinpath( $self->root, 'Config.pm' );
+}
+sub _save_config {
+    my($self) = @_;
+    require Data::Dumper;
+    open my $FH, '>', $self->config_file or die "Unable to open config (@{[ $self->config_file ]}): $!";
+    my $d = Data::Dumper->new([$CONFIG],['App::perlbrew::CONFIG']);
+    print $FH $d->Dump;
+    close $FH;
+}
+sub _load_config {
+    my($self) = @_;
+    if ( ! -e $self->config_file ) {
+        local $CONFIG = {} if ! $CONFIG;
+        $self->_save_config;
+    }
+    open my $FH, '<', $self->config_file or die "Unable to open config (@{[ $self->config_file ]}): $!\n";
+    my $raw = do { local $/; my $rv = <$FH>; $rv };
+    close $FH;
+    my $rv = eval $raw;
+    if ( $@ ) {
+        warn "Error loading conf: $@\n";
+        $CONFIG = {};
+        return;
+    }
+    $CONFIG = {} if ! $CONFIG;
+    return;
+}
+sub BASHRC_CONTENT() {
+    return "export PERLBREW_BASHRC_VERSION=$VERSION\n" .
+           (exists $ENV{PERLBREW_ROOT} ? "export PERLBREW_ROOT=$PERLBREW_ROOT\n" : "") . "\n" . <<'RC';
+__perlbrew_reinit() {
+    if [[ ! -d "$PERLBREW_HOME" ]]; then
+        mkdir -p "$PERLBREW_HOME"
+    fi
+    echo '# DO NOT EDIT THIS FILE' > "$PERLBREW_HOME/init"
+    command perlbrew env $1 | \grep PERLBREW_ >> "$PERLBREW_HOME/init"
+    . "$PERLBREW_HOME/init"
+    __perlbrew_set_path
+}
+__perlbrew_purify () {
+    local path patharray outsep
+    IFS=: read -r${BASH_VERSION+a}${ZSH_VERSION+A} patharray <<< "$1"
+    for path in "${patharray[@]}" ; do
+        case "$path" in
+            (*"$PERLBREW_HOME"*) ;;
+            (*"$PERLBREW_ROOT"*) ;;
+            (*) printf '%s' "$outsep$path" ; outsep=: ;;
+        esac
+    done
+}
+__perlbrew_set_path () {
+    export MANPATH=$PERLBREW_MANPATH${PERLBREW_MANPATH:+:}$(__perlbrew_purify "$(manpath 2>/dev/null)")
+    export PATH=${PERLBREW_PATH:-$PERLBREW_ROOT/bin}:$(__perlbrew_purify "$PATH")
+    hash -r
+}
+__perlbrew_set_env() {
+    local code
+    code="$($perlbrew_command env $@)" || return $?
+    eval "$code"
+}
+__perlbrew_activate() {
+    [[ -n $(alias perl 2>/dev/null) ]] && unalias perl 2>/dev/null
+    if [[ -n "$PERLBREW_PERL" ]]; then
+        __perlbrew_set_env "$PERLBREW_PERL${PERLBREW_LIB:+@}$PERLBREW_LIB"
+    fi
+    __perlbrew_set_path
+}
+__perlbrew_deactivate() {
+    __perlbrew_set_env
+    unset PERLBREW_PERL
+    unset PERLBREW_LIB
+    __perlbrew_set_path
+}
+perlbrew () {
+    local exit_status
+    local short_option
+    export SHELL
+    if [[ $1 == -* ]]; then
+        short_option=$1
+        shift
+    else
+        short_option=""
+    fi
+    case $1 in
+        (use)
+            if [[ -z "$2" ]] ; then
+                echo -n "Currently using ${PERLBREW_PERL:-system perl}"
+                [ -n "$PERLBREW_LIB" ] && echo -n "@$PERLBREW_LIB"
+                echo
+            else
+                __perlbrew_set_env "$2"
+                exit_status="$?"
+                if [[ $exit_status -eq 0 ]]
+                then
+                    __perlbrew_set_path
+                fi
+            fi
+            ;;
+        (switch)
+              if [[ -z "$2" ]] ; then
+                  command perlbrew switch
+              else
+                  perlbrew use $2
+                  exit_status=$?
+                  if [[ ${exit_status} -eq 0 ]]; then
+                      __perlbrew_reinit $2
+                  fi
+              fi
+              ;;
+        (off)
+            __perlbrew_deactivate
+            echo "perlbrew is turned off."
+            ;;
+        (switch-off)
+            __perlbrew_deactivate
+            __perlbrew_reinit
+            echo "perlbrew is switched off."
+            ;;
+        (*)
+            command perlbrew $short_option "$@"
+            exit_status=$?
+            ;;
+    esac
+    hash -r
+    return ${exit_status:-0}
+}
+[[ -z "$PERLBREW_ROOT" ]] && export PERLBREW_ROOT="$HOME/perl5/perlbrew"
+[[ -z "$PERLBREW_HOME" ]] && export PERLBREW_HOME="$HOME/.perlbrew"
+if [[ ! -n "$PERLBREW_SKIP_INIT" ]]; then
+    if [[ -f "$PERLBREW_HOME/init" ]]; then
+        . "$PERLBREW_HOME/init"
+    fi
+fi
+perlbrew_bin_path="${PERLBREW_ROOT}/bin"
+if [[ -f $perlbrew_bin_path/perlbrew ]]; then
+    perlbrew_command="$perlbrew_bin_path/perlbrew"
+else
+    perlbrew_command="perlbrew"
+fi
+unset perlbrew_bin_path
+__perlbrew_activate
+RC
+}
+sub BASH_COMPLETION_CONTENT() {
+    return <<'COMPLETION';
+if [[ -n ${ZSH_VERSION-} ]]; then
+    autoload -U +X bashcompinit && bashcompinit
+fi
+export PERLBREW="command perlbrew"
+_perlbrew_compgen()
+{
+    COMPREPLY=( $($PERLBREW compgen $COMP_CWORD ${COMP_WORDS[*]}) )
+}
+complete -F _perlbrew_compgen perlbrew
+COMPLETION
+}
+
+$cur_indent = 0;	# Number of leading tabs
+$cur_columns = 0;	# Number of columns
+@bits = ();			# Store previous lines
+$output = "";
+$minimum_width = 3;
+$padding = 1;
+$g_is_final_newline = 0;
+$g_empty_line = 0;
+
+# Iteratively work through text:
+#	Does line match number of opening tabs?
+#	Does line match number of total tabs?
+#	As long as yes, process, and move to next line
+
+while ($line = <>) {
+	if ($line =~ /\n$/) {
+		# Require two blank lines to reset
+		if ($g_empty_line == 1) {
+			$g_is_final_newline = 1;
+		} else {
+			$g_empty_line = 1;
+			$g_is_final_newline = 0;
+		}
+	} else {
+		$g_empty_line = 0;
+		$g_is_final_newline = 0;
+	}
+	chomp $line;
+
+	# Trim spaces before and after tabs
+	$line =~ s/  +\t/\t/g;
+	$line =~ s/\t +/\t/g;
+
+	# Add space to end of line to prevent deleting lines with only tabs
+	$line .= " ";
+
+	$line =~ /^(\t*)/;
+#	if (length($1) == $cur_indent) {
+#	This check was disabled to simplify things - may need to add it back
+	if ($cur_indent == $cur_indent) {
+		# We're at the same level of indentation
+		# Do we have the same number of columns?
+		$columns = ($line =~ tr/\t/\t/);
+		if ($columns == $cur_columns) {
+			# yup
+			push @bits, [split (/\t/, $line)];
+		} else {
+			# Nope - new block
+			$output .= alignbits(@bits);
+			$line =~ /^(\t*)/;
+			$cur_indent = length($1);
+			$cur_columns = ($line =~ tr/\t/\t/);
+			@bits = ();
+			push @bits, [split (/\t/, $line)];
+		}
+	} else {
+		# New indent, so it's a new block
+
+		$output .= alignbits(@bits);
+		$line =~ /^(\t*)/;
+		$cur_indent = length($1);
+		$cur_columns = ($line =~ tr/\t/\t/);
+		@bits = ();
+		push @bits, [split (/\t/, $line)];
+	}
+}
+
+$output .= alignbits(@bits);
+
+
+print $output;
+
+sub alignbits{
+	my(@bits) = @_;
+	my $output = "";
+	my @width = ();
+
+	# Remove space that was added to end of lines
+	for $i (0 .. $#bits) {
+		$bits[$i][$#{$bits[$i]}] =~ s/ $//;
+	}
+
+	for $i (0 .. $#bits) {
+		for $j (0 .. $#{$bits[$i]}) {
+			if ($bits[$i][$j] =~ /^\s*\-+\s*$/) {
+				# Special case for table headers
+				$bits[$i][$j] = "-";
+			}
+			if (length($bits[$i][$j]) + $padding > $width[$j]) {
+				$width[$j] = length($bits[$i][$j]) + $padding;
+			}
+		}
+	}
+
+	for $i (0 .. $#bits) {
+		for $j (0 .. $#{$bits[$i]} ) {
+			if ($bits[$i][$j] =~ /^\s*\-+\s*$/) {
+				# Special case for table headers
+				$bits[$i][$j] = "-" x ($width[$j]);
+			}
+			if ($bits[$i][$j] =~ /^[\d\$\-\.,]*\d[,\d\$\-\.]*$/) {
+				# Numeric field
+				$output .= ( $width[$j] > $minimum_width || $bits[$i][$j] =~ /\S/ )? sprintf "%*s", $width[$j], $bits[$i][$j] : "";
+				#	$output .= " " x $padding if ($j != $#{$bits[$i]});
+			} else {
+				# Non-numeric field
+				if ($j == $#{$bits[$i]}) {
+					$output .= $bits[$i][$j];
+				} else {
+					$output .= ($width[$j] > $minimum_width || $bits[$i][$j] =~ /\S/ )? sprintf "%-*s", $width[$j], $bits[$i][$j] : "";
+				}
+			}
+			if ($j == $#{$bits[$i]}) {
+				$output .= "\n";
+			} else {
+				$output .= "\t";
+			}
+		}
+	}
+
+	if (! $g_is_final_newline) {
+		$output =~ s/\n$//s;
+	}
+	return $output;
+}
+
+# local $/;
+$word_to_match = $ENV{'TM_CURRENT_WORD'};
+
+# Read in source file
+$multimarkdown_file = $ENV{'TM_FILEPATH'};
+
+
+open(MULTI, "<$multimarkdown_file");
+local $/;
+$multi_source = <MULTI>;
+
+if ( $word_to_match =~ s/^\^/\\^/) {
+
+	# Match Footnotes
+	# the '^' makes things tricky
+
+	$multi_source =~ s/^(?:\[($word_to_match.+?)\]:)?.*$/$1/img;
+	$word_to_match =~ s/\\\^/^/g;
+
+} elsif ($word_to_match =~ /^\#/) {
+
+	# Match MultiMarkdown Citations
+
+	$multi_source =~ s/^(?:\[($word_to_match.+?)\]:)?.*$/$1/img;
+
+	#BibTex Citations
+
+	# Slurp any .bib files
+	open (BIB, "cd $ENV{'TM_DIRECTORY'}; cat *.bib |");
+	local $/;
+	$bibtex = <BIB>;
+	$word_only = $word_to_match;
+	$word_only =~ s/^#//;
+	$bibtex =~ s{
+		^(?:@.*?\{($word_only.+?)\,)?.*$
+		}{
+			$match = $1;
+			$match =~ s/(...)/#$1/;
+			$match;
+		}xeimg;
+	$multi_source .= $bibtex;
+
+} else {
+
+	# Match regular anchor (link or image)
+
+	$multi_source =~ s{
+		^(?:
+			(?:\#{1,6}\s*|\[)
+			($word_to_match.+?)					# Match Heading
+			(?:\]:|\s*\#)
+		)?
+		(?:.*\[($word_to_match.+?)\]>>)?		# Match Equation label
+		(?:\[($word_to_match.+?)\])?			# Match image or anchor def
+		(?:\[.*?\]\[($word_to_match.+?)\])?		# Match Table label (or at least a label
+		.*?$									# at the beginning of a line)
+	}{
+		"$1$2$3$4";
+	}gemix;
+}
+
+# Strip blank lines
+$multi_source =~ s/\n\s*\n/\n/gs;
+
+# Fix case (TextMate won't autocomplete different cases)
+if ($word_to_match =~ /^\^/) {
+	$multi_source =~ s/\^+$word_to_match/$word_to_match/igm;
+} else {
+	$multi_source =~ s/^$word_to_match/$word_to_match/igm;
+}
+
+# Print
+
+print $multi_source;
+
+#!/usr/bin/env perl
+#
+# mmd_merge.pl
+#
+# Combine text documents to create a MultiMarkdown structured document
+#
+# Copyright (c) 2009 Fletcher T. Penney
+#	<http://fletcherpenney.net/>
+#
+# MultiMarkdown Version 2.0.b6
+#
+
+use strict;
+use warnings;
+
+my $data = "";
+my $line = "";
+
+my $count = @ARGV;
+
+if ($count == 0) {
+	# We're in "stdin mode"
+
+	# process stdin
+	undef $/;
+	my $data .= <>;
+
+	mergeLines($data);
+} else {
+	foreach(@ARGV) {
+		open(INPUT, "<$_");
+		local $/;
+		my $data = <INPUT>;
+		close(INPUT);
+		mergeLines($data);
+	}
+}
+
+
+sub mergeLines {
+	my $file = shift;
+
+	while ($file =~ /^(.*?)$/mg) {
+		$line = $1;
+		if (($line !~ /^\s*$/) && ($line !~ /^\#/)) {
+			$line =~ s/ {4}/\t/g;
+			$line =~ s/\s*$//;
+			my $indent = ($line =~ tr/\t/\t/);
+			$line =~ /^\s*(.*?)\s*$/;
+
+			open(FILE, "<$1");
+			local $/;
+			my $file = <FILE>;
+			close FILE;
+
+			for (my $i = 0; $i< $indent; $i++) {
+				$file =~ s/^\#/##/gm;
+			}
+
+			$data .= $file;
+		}
+	}
+
+	print $data;
+}
+
+#!/usr/bin/env perl
+#
+# $Id: table_cleanup.pl 499 2008-03-23 13:03:19Z fletcher $
+#
+# Cleanup the spacing and alignment of MultiMarkdown tables
+#
+# Used by my TextMate Bundle, but can be used elsewhere as well
+#
+# Copyright (c) 2006-2008 Fletcher T. Penney
+#	<http://fletcherpenney.net/>
+#
+# MultiMarkdown Version 2.0.b6
+#
+
+local $/;
+$text = <>;
+
+my %max_width = ();
+my @alignments = ();
+
+
+# Reusable regexp's to match table
+my $less_than_tab = 3;
+
+my $line_start = qr{
+	[ ]{0,$less_than_tab}
+}mx;
+
+my $table_row = qr{
+	[^\n]*?\|[^\n]*?\n
+}mx;
+
+my $first_row = qr{
+	$line_start
+	\S+.*?\|.*?\n
+}mx;
+
+my $table_rows = qr{
+	(?:\n?$table_row)
+}mx;
+
+my $table_caption = qr{
+	$line_start
+	\[.*?\][ \t]*\n
+}mx;
+
+my $table_divider = qr{
+	$line_start
+	[\|\-\+\:\.][ \-\+\|\:\.]*?\|[ \-\+\|\:\.]*
+}mx;
+
+my $whole_table = qr{
+	($table_caption)?		# Optional caption
+	($first_row				# First line must start at beginning
+	($table_row)*?)?		# Header Rows
+	$table_divider			# Divider/Alignment definitions
+	$table_rows+			# Body Rows
+	\n?[^\n]*?\|[^\n]*?		# Allow last row not to have a "\n" for cleaning while editing
+	($table_caption)?		# Optional caption
+}mx;
+
+
+# Find whole tables, then break them up and process them
+
+$text =~ s{
+	^($whole_table)			# Whole table in $1
+	(\n|\Z)					# End of file or 2 blank lines
+}{
+	my $table = $1 . "\n";
+	my $table_original = $table;
+	$result = "";
+	@alignments = ();
+	%max_width = ();
+
+	# Strip Caption and Summary
+	$table =~ s/^$line_start\[\s*(.*?)\s*\](\[\s*(.*?)\s*\])?[ \t]*$//m;
+	$table =~ s/\n$line_start\[\s*(.*?)\s*\][ \t]*\n/\n/s;
+
+	$table = "\n" . $table;
+	# Need to be greedy
+	$table =~ s/\n($table_divider)\n($table_rows+)//s;
+	my $alignment_string = $1;
+	my $body = $2;
+	my $header = $table;
+	# Process column alignment
+	while ($alignment_string =~ /\|?\s*(.+?)\s*(\||\Z)/gs) {
+		my $cell = $1;
+		if ($cell =~ /\:$/) {
+			if ($cell =~ /^\:/) {
+				push(@alignments,"center");
+			} else {
+				push(@alignments,"right");
+			}
+		} else {
+			if ($cell =~ /^\:/) {
+				push(@alignments,"left");
+			} else {
+				if (($cell =~ /^\./) || ($cell =~ /\.$/)) {
+					push(@alignments,"char");
+				} else {
+					push(@alignments,"");
+				}
+			}
+		}
+	}
+	$table = $header . "\n" . $body;
+
+	# First pass - find widest cell in each column (for single column cells only)
+	foreach my $line (split(/\n/, $table)) {
+		my $count = 0;
+		while ($line =~ /(\|?\s*[^\|]+?\s*(\|+|\Z))/gs) {
+			my $cell = $1;		# Width of actual text in cell
+			my $ending = $2;	# Is there a trailing `|`?
+
+			if ($ending =~ /\|\|/) {
+				# For first pass, do single cells only
+				$count += (length($ending));
+				next;
+			}
+			setWidth($count, $cell);
+			$count++
+		}
+	}
+
+	# Second pass - handle cells that span multiple rows
+	foreach my $line (split(/\n/, $table)) {
+		my $count = 0;
+		while ($line =~ /(\|?\s*[^\|]+?\s*(\|+|\Z))/gs) {
+			my $cell = $1;		# Width of actual text in cell
+			my $ending = $2;	# Is there a trailing `|`?
+
+			if ($ending =~ /\|\|/) {
+				setWidth($count, $cell);
+				$count += (length($ending));
+				next;
+			}
+			$count++
+		}
+	}
+
+	# Fix length of alignment definitions
+
+	$table_original =~ s{
+		\n($table_divider)\n
+	}{
+		my $divider = $1;
+		my $count = 0;
+		$divider =~ s{
+			(\|?)\s*([^\|]+?)\s*(\|+|\Z)
+		}{
+			my $opening = $1;
+			my $cell = $2;
+			my $ending = $3;
+			my $result = "";
+			my $goal_length = $max_width{$count} -3;
+			if ($count == 0) {
+				if ($opening eq ""){
+					$goal_length++;
+				} else {
+					$goal_length--;
+				}
+			}
+			if ($cell =~ /^\:/) {
+				$goal_length--;
+				$result = ":";
+			}
+			if ($cell =~ /[\:\+]$/) {
+				$goal_length--;
+			}
+			for (my $i=0;$i < $goal_length;$i++){
+				$result.="-";
+			}
+			if ($cell =~ /\:$/) {
+				$result .=":";
+			}
+			if ($cell =~ /\+$/) {
+				$result .="+";
+			}
+			$count++;
+			$opening . "$result" . $ending;
+		}xsge;
+		"\n$divider\n";
+	}sxe;
+	# Second pass - reformat table cells to appropriate width
+	$table_original =~ s{
+		# match each line
+		(.*)
+	}{
+		$line = $1;
+		my $result = "";
+		my $count = 0;
+
+		# Now process them
+
+		if (($line =~ /^\[/) && ($line !~ /\|/)){
+			$result .= $line;
+		} else {
+		while ($line =~ /(\|?)\s*([^\|]+?)\s*(\|+|\Z)/gs) {
+			my $opening = $1;
+			my $cell = $2;
+			my $ending = $3;
+			my $lead = 0;
+			my $pad_lead = 0;
+			my $pad_trail = 0;
+			my $len = length($2);		# Length of actual contents
+
+			# Not all first column cells have a leading `|`
+			if ($count > 0) {
+				$pad_lead = 1;
+			} elsif (length($opening) > 0) {
+				$pad_lead = 1;
+			}
+			# Buffer before trailing `|`
+			if (length($ending) > 0) {
+				$pad_trail = 1;
+			}
+			# How much space to fill? (account for multiple columns)
+			my $width = 0;
+			if ($ending =~ /\|/) {
+				$width = maxWidth($count,length($ending));
+			} else {
+				$width = maxWidth($count, 1);
+			}
+
+			if ($alignments[$count] =~ /^(left)?$/) {
+				$lead = $len + $pad_lead;
+				$trail = $width - $lead  - length($opening);
+			}
+			if ($alignments[$count] =~ /^right$/) {
+				if ($count == 0) {
+					if ($opening eq "") {
+						$opening = "|";
+						$pad_lead = 1;
+						$width++;
+					}
+				}
+				$trail = $pad_trail+length($ending);
+				$lead = $width - $trail - length($opening);
+			}
+
+			if ($alignments[$count] =~ /^center$/) {
+				if ($count == 0) {
+					if ($opening eq "") {
+						$opening = "|";
+						$pad_lead = 1;
+						$width++;
+					}
+				}
+				# Divide padding space
+				my $pad_total =  $width - $len;
+				$pad_lead = int($pad_total/2)+1;
+				$pad_trail = $pad_total - $pad_lead;
+				$trail = $pad_trail+length($ending);
+				$lead = $width - $trail - length($opening);
+			}
+			$result .= $opening . sprintf("%*s", $lead, $cell) . sprintf("%*s", $trail, $ending);
+
+			if ($ending =~ /\|\|/) {
+				$count += (length($ending));
+			} else {
+				$count++;
+			}
+		}
+		}
+
+		$result;
+	}xmge;
+
+	$table_original;
+}xsge;
+
+
+print $text;
+
+
+sub maxWidth {
+	# Return the total width for a range of columns
+	my ($start_col, $cols) = @_;
+	my $total = 0;
+
+	for (my $i = $start_col;$i < ($start_col + $cols);$i++) {
+		$total += $max_width{$i};
+	}
+
+	return $total;
+}
+
+sub setWidth {
+	# Set widths for column(s) based on cell contents
+	my ($start_col, $cell) = @_;
+
+	$cell =~ /(\|?)\s*([^\|]+?)\s*(\|+|\Z)/;
+	my $opening = 	$1;
+	my $contents =	$2;
+	my $closing =	$3;
+
+	my $padding =	0;
+
+	$padding++ if (length($opening) > 0);	# For first cell
+	$padding++ if ($start_col > 0);			# All cells except first definitely have an opening `|`
+	$padding++ if (length($closing) > 0);
+
+	$contents =~ s/&\s*(.*?)\s*$/$1/;	# I don't remember what this does
+
+	my $cell_length = length($contents) + $padding + length($opening)  + length($closing);
+
+	if ($closing =~ /\|\|/) {
+		# This cell spans multiple columns
+		my @current_max = ();
+		my $cols = length($closing);
+		my $current_total = 0;
+
+		for (my $i = $start_col;$i < ($start_col + $cols);$i++) {
+			$current_total += $max_width{$i};
+		}
+
+		if ($current_total < $cell_length) {
+			my %columns = ();
+			# Proportionally divide extra space
+			for (my $i = $start_col; $i < ($start_col + $cols);$i++) {
+				$max_width{$i} = int($max_width{$i} * ($cell_length/$current_total));
+				$columns{$i} = $max_width{$i};
+			}
+			$current_total = 0;
+			for (my $i = $start_col;$i < ($start_col + $cols);$i++) {
+				$current_total += $max_width{$i};
+			}
+			my $missing = $cell_length - $current_total;
+
+			# Now find the amount lost from fractions, and add back to largest columns
+			foreach my $a_col (sort { $max_width{$b} <=> $max_width{$a} }keys %columns) {
+				if ($missing > 0) {
+					$max_width{$a_col}++;
+					$missing--;
+				}
+			}
+		}
+
+	} else {
+		if ($max_width{$start_col}< $cell_length) {
+			$max_width{$start_col} = $cell_length;
+		}
+	}
+
+}
+
+#!/usr/bin/env perl
+
+# MultiMarkdown -- A modification of John Gruber's original Markdown
+#	that adds new features and an output format that can more readily
+#	be converted into other document formats
+#
+# $Id: MultiMarkdown.pl 525 2009-06-15 18:45:44Z fletcher $
+#
+# Original Code Copyright (c) 2004-2007 John Gruber
+#	<http://daringfireball.net/projects/markdown/>
+#
+# MultiMarkdown changes Copyright (c) 2005-2009 Fletcher T. Penney
+#	<http://fletcherpenney.net/>
+#
+# MultiMarkdown Version 2.0.b6
+#
+# Based on Markdown.pl 1.0.2b8 -  Wed 09 May 2007
+#
+#
+#	TODO: Change math mode delimiter?
+#	TODO: Still need to get the glossary working in non-memoir documents
+#	TODO: A mechanism to include arbitrary code (LaTeX, etc) without being "ugly"
+#	TODO: Look into discussion re: assigning classes to div's/span's on Markdown list.
+#	TODO: Improve support for tables with long items and overall width in LaTeX
+#	TODO: Need a syntax for long table cells in MMD, even if no rowspan feature yet
+#	TODO: Create utilities to convert MMD tables to/from tab-delimited
+
+
+package MultiMarkdown;
+require 5.006_000;
+use strict;
+use warnings;
+
+use File::Basename;
+
+eval {require MT};  # Test to see if we're running in MT.
+unless ($@) {
+	require Text::ASCIIMathML;
+} else {	# Otherwise look for ASCIIMathML.pm next to MultiMarkdown.pl
+	my $me = $0;				# Where am I?
+
+	# Am I running in Windoze?
+	my $os = $^O;
+
+	# Get just the directory portion
+	if ($os =~ /MSWin/) {
+		$me = dirname($me) . "\\";
+	} else {
+		$me = dirname($me) . "/";
+	}
+	require $me ."ASCIIMathML.pm";
+}
+
+
+use Digest::MD5 qw(md5_hex);
+use vars qw($VERSION $g_use_metadata $g_base_url
+	$g_bibliography_title $g_allow_mathml $g_base_header_level $mathParser);
+$VERSION = '2.0.b6';
+
+$mathParser = new Text::ASCIIMathML();
+
+## Disabled; causes problems under Perl 5.6.1:
+# use utf8;
+# binmode( STDOUT, ":utf8" );  # c.f.: http://acis.openlib.org/dev/perl-unicode-struggle.html
+
+#
+# Global default settings:
+#
+my $g_empty_element_suffix = " />";     # Change to ">" for HTML output
+my $g_tab_width = 4;
+my $g_allow_mathml = 1;
+my $g_base_header_level = 1;
+
+#
+# Globals:
+#
+
+# Reusable patterns to match balanced [brackets] and (parens). See
+# Friedl's "Mastering Regular Expressions", 2nd Ed., pp. 328-331.
+my ($g_nested_brackets, $g_nested_parens);
+$g_nested_brackets = qr{
+	(?> 								# Atomic matching
+	   [^\[\]]+							# Anything other than brackets
+	 |
+	   \[
+		 (??{ $g_nested_brackets })		# Recursive set of nested brackets
+	   \]
+	)*
+}x;
+
+# Doesn't allow for whitespace, because we're using it to match URLs:
+$g_nested_parens = qr{
+	(?> 								# Atomic matching
+	   [^()\s]+							# Anything other than parens or whitespace
+	 |
+	   \(
+		 (??{ $g_nested_parens })		# Recursive set of nested brackets
+	   \)
+	)*
+}x;
+
+
+# Table of hash values for escaped characters:
+my %g_escape_table;
+foreach my $char (split //, '\\`*_{}[]()>#+-.!') {
+	$g_escape_table{$char} = md5_hex($char);
+}
+
+
+# Global hashes, used by various utility routines
+my %g_urls = ();
+my %g_titles= ();
+my %g_html_blocks = ();
+my %g_metadata = ();
+my %g_metadata_newline = ();
+my %g_crossrefs = ();
+my %g_footnotes = ();
+my %g_attributes = ();
+my @g_used_footnotes = ();
+my $g_footnote_counter = 0;
+
+my $g_citation_counter = 0;
+my @g_used_references = ();
+my %g_references = ();
+$g_bibliography_title = "Bibliography";
+
+$g_use_metadata = 1;
+$g_metadata_newline{default} = "\n";
+$g_metadata_newline{keywords} = ", ";
+my $g_document_format = "";
+
+# Used to track when we're inside an ordered or unordered list
+# (see _ProcessListItems() for details):
+my $g_list_level = 0;
+
+
+#### Blosxom plug-in interface ##########################################
+
+# Set $g_blosxom_use_meta to 1 to use Blosxom's meta plug-in to determine
+# which posts Markdown should process, using a "meta-markup: markdown"
+# header. If it's set to 0 (the default), Markdown will process all
+# entries.
+my $g_blosxom_use_meta = 0;
+
+sub start { 1; }
+sub story {
+	my($pkg, $path, $filename, $story_ref, $title_ref, $body_ref) = @_;
+
+	if ( (! $g_blosxom_use_meta) or
+	     (defined($meta::markup) and ($meta::markup =~ /^\s*markdown\s*$/i))
+	     ){
+			$$body_ref  = Markdown($$body_ref);
+     }
+     1;
+}
+
+
+#### Movable Type plug-in interface #####################################
+eval {require MT};  # Test to see if we're running in MT.
+unless ($@) {
+    require MT;
+    import  MT;
+    require MT::Template::Context;
+    import  MT::Template::Context;
+
+	eval {require MT::Plugin};  # Test to see if we're running >= MT 3.0.
+	unless ($@) {
+		require MT::Plugin;
+		import  MT::Plugin;
+		my $plugin = new MT::Plugin({
+			name => "MultiMarkdown",
+			description => "Based on the original Markdown",
+			doc_link => 'http://fletcherpenney.net/multimarkdown/'
+		});
+		MT->add_plugin( $plugin );
+	}
+
+	MT::Template::Context->add_container_tag(MultiMarkdownOptions => sub {
+		my $ctx	 = shift;
+		my $args = shift;
+		my $builder = $ctx->stash('builder');
+		my $tokens = $ctx->stash('tokens');
+
+		if (defined ($args->{'output'}) ) {
+			$ctx->stash('multimarkdown_output', lc $args->{'output'});
+		}
+
+		defined (my $str = $builder->build($ctx, $tokens) )
+			or return $ctx->error($builder->errstr);
+		$str;		# return value
+	});
+
+	MT->add_text_filter('multimarkdown' => {
+		label     => 'MultiMarkdown',
+		docs      => 'http://fletcherpenney.net/MultiMarkdown/',
+		on_format => sub {
+			my $text = shift;
+			my $ctx  = shift;
+			my $raw  = 0;
+		    if (defined $ctx) {
+		    	my $output = $ctx->stash('multimarkdown_output');
+				if (defined $output  &&  $output =~ m/^html/i) {
+					$g_empty_element_suffix = ">";
+					$ctx->stash('multimarkdown_output', '');
+				}
+				elsif (defined $output  &&  $output eq 'raw') {
+					$raw = 1;
+					$ctx->stash('multimarkdown_output', '');
+				}
+				else {
+					$raw = 0;
+					$g_empty_element_suffix = " />";
+				}
+			}
+			$text = $raw ? $text : Markdown($text);
+			$text;
+		},
+	});
+
+	# If SmartyPants is loaded, add a combo Markdown/SmartyPants text filter:
+	my $smartypants;
+
+	{
+		no warnings "once";
+		$smartypants = $MT::Template::Context::Global_filters{'smarty_pants'};
+	}
+
+	if ($smartypants) {
+		MT->add_text_filter('multimarkdown_with_smartypants' => {
+			label     => 'MultiMarkdown With SmartyPants',
+			docs      => 'http://fletcherpenney.net/MultiMarkdown/',
+			on_format => sub {
+				my $text = shift;
+				my $ctx  = shift;
+				if (defined $ctx) {
+					my $output = $ctx->stash('multimarkdown_output');
+					if (defined $output  &&  $output eq 'html') {
+						$g_empty_element_suffix = ">";
+					}
+					else {
+						$g_empty_element_suffix = " />";
+					}
+				}
+				$text = Markdown($text);
+				$text = $smartypants->($text, '1');
+			},
+		});
+	}
+}
+else {
+#### BBEdit/command-line text filter interface ##########################
+# Needs to be hidden from MT (and Blosxom when running in static mode).
+
+    # We're only using $blosxom::version once; tell Perl not to warn us:
+	no warnings 'once';
+    unless ( defined($blosxom::version) ) {
+		use warnings;
+
+		#### Check for command-line switches: #################
+		my %cli_opts;
+		use Getopt::Long;
+		Getopt::Long::Configure('pass_through');
+		GetOptions(\%cli_opts,
+			'version',
+			'shortversion',
+			'html4tags',
+		);
+		if ($cli_opts{'version'}) {		# Version info
+			print "\nThis is MultiMarkdown, version $VERSION.\n";
+			print "Original code Copyright 2004 John Gruber\n";
+			print "MultiMarkdown changes Copyright 2005-2009 Fletcher Penney\n";
+			print "http://fletcherpenney.net/multimarkdown/\n";
+			print "http://daringfireball.net/projects/markdown/\n\n";
+			exit 0;
+		}
+		if ($cli_opts{'shortversion'}) {		# Just the version number string.
+			print $VERSION;
+			exit 0;
+		}
+		if ($cli_opts{'html4tags'}) {			# Use HTML tag style instead of XHTML
+			$g_empty_element_suffix = ">";
+		}
+
+
+		#### Process incoming text: ###########################
+		my $text;
+		{
+			local $/;               # Slurp the whole file
+			$text = <>;
+		}
+        print Markdown($text);
+    }
+}
+
+
+
+sub Markdown {
+#
+# Main function. The order in which other subs are called here is
+# essential. Link and image substitutions need to happen before
+# _EscapeSpecialCharsWithinTagAttributes(), so that any *'s or _'s in the <a>
+# and <img> tags get encoded.
+#
+	my $text = shift;
+
+	# Clear the global hashes. If we don't clear these, you get conflicts
+	# from other articles when generating a page which contains more than
+	# one article (e.g. an index page that shows the N most recent
+	# articles):
+	%g_urls = ();
+	%g_titles = ();
+	%g_html_blocks = ();
+	%g_metadata = ();
+	%g_crossrefs = ();
+	%g_footnotes = ();
+	@g_used_footnotes = ();
+	$g_footnote_counter = 0;
+	@g_used_references = ();
+	%g_references = ();
+	$g_citation_counter = 0;
+	%g_attributes = ();
+
+
+	# Standardize line endings:
+	$text =~ s{\r\n}{\n}g; 	# DOS to Unix
+	$text =~ s{\r}{\n}g; 	# Mac to Unix
+
+	# Make sure $text ends with a couple of newlines:
+	$text .= "\n\n";
+
+	# Convert all tabs to spaces.
+	$text = _Detab($text);
+
+	# Strip any lines consisting only of spaces and tabs.
+	# This makes subsequent regexen easier to write, because we can
+	# match consecutive blank lines with /\n+/ instead of something
+	# contorted like /[ \t]*\n+/ .
+	$text =~ s/^[ \t]+$//mg;
+
+	# Strip out MetaData
+	$text = _ParseMetaData($text) if $g_use_metadata;
+
+	# And recheck for leading blank lines
+	$text =~ s/^\n+//s;
+
+	# Turn block-level HTML blocks into hash entries
+	$text = _HashHTMLBlocks($text);
+
+	# Strip footnote and link definitions, store in hashes.
+	$text = _StripFootnoteDefinitions($text);
+
+	$text = _StripLinkDefinitions($text);
+
+	_GenerateImageCrossRefs($text);
+
+	$text = _StripMarkdownReferences($text);
+
+	$text = _RunBlockGamut($text);
+
+	$text = _DoMarkdownCitations($text);
+
+	$text = _DoFootnotes($text);
+
+	$text = _UnescapeSpecialChars($text);
+
+	# Clean encoding within HTML comments
+	$text = _UnescapeComments($text);
+
+	$text = _FixFootnoteParagraphs($text);
+	$text .= _PrintFootnotes();
+
+	$text .= _PrintMarkdownBibliography();
+
+	$text = _ConvertCopyright($text);
+
+	if (lc($g_document_format) =~ /^complete\s*$/i) {
+		return xhtmlMetaData() . "<body>\n\n" . $text . "\n</body>\n</html>";
+	} elsif (lc($g_document_format) =~ /^snippet\s*$/i) {
+		return $text . "\n";
+	} else {
+		return $g_document_format . textMetaData() . $text . "\n";
+	}
+
+}
+
+
+sub _StripLinkDefinitions {
+#
+# Strips link definitions from text, stores the URLs and titles in
+# hash references.
+#
+	my $text = shift;
+	my $less_than_tab = $g_tab_width - 1;
+
+	# Link defs are in the form: ^[id]: url "optional title"
+	while ($text =~ s{
+						# Pattern altered for MultiMarkdown
+						# in order to not match citations or footnotes
+						^[ ]{0,$less_than_tab}\[([^#^].*)\]:	# id = $1
+						  [ \t]*
+						  \n?				# maybe *one* newline
+						  [ \t]*
+						<?(\S+?)>?			# url = $2
+						  [ \t]*
+						  \n?				# maybe one newline
+						  [ \t]*
+						(?:
+							(?<=\s)			# lookbehind for whitespace
+							["(]
+							(.+?)			# title = $3
+							[")]
+							[ \t]*
+						)?	# title is optional
+
+						# MultiMarkdown addition for attribute support
+						\n?
+						(				# Attributes = $4
+							(?<=\s)			# lookbehind for whitespace
+							(([ \t]*\n)?[ \t]*((\S+=\S+)|(\S+=".*?")))*
+						)?
+						[ \t]*
+						# /addition
+						(?:\n+|\Z)
+					}
+					{}mx) {
+#		$g_urls{lc $1} = _EncodeAmpsAndAngles( $2 );	# Link IDs are case-insensitive
+		$g_urls{lc $1} = $2;	# Link IDs are case-insensitive
+		if ($3) {
+			$g_titles{lc $1} = $3;
+			$g_titles{lc $1} =~ s/"/&quot;/g;
+		}
+
+		# MultiMarkdown addition "
+		if ($4) {
+			$g_attributes{lc $1} = $4;
+		}
+		# /addition
+	}
+
+	return $text;
+}
+
+sub _StripHTML {
+	# Strip (X)HTML code from string
+	my $text = shift;
+
+	$text =~ s/<.*?>//g;
+
+	return $text;
+}
+
+sub _HashHTMLBlocks {
+	my $text = shift;
+	my $less_than_tab = $g_tab_width - 1;
+
+	# Hashify HTML blocks:
+	# We only want to do this for block-level HTML tags, such as headers,
+	# lists, and tables. That's because we still want to wrap <p>s around
+	# "paragraphs" that are wrapped in non-block-level tags, such as anchors,
+	# phrase emphasis, and spans. The list of tags we're looking for is
+	# hard-coded:
+	my $block_tags = qr{
+		  (?:
+			p         |  div     |  h[1-6]  |  blockquote  |  pre       |  table  |
+			dl        |  ol      |  ul      |  script      |  noscript  |  form   |
+			fieldset  |  iframe     |  ins         |  del
+		  )
+		}x;			# MultiMarkdown does not include `math` in the above list so that
+					# Equations can optionally be included in separate paragraphs
+
+	my $tag_attrs = qr{
+						(?:				# Match one attr name/value pair
+							\s+				# There needs to be at least some whitespace
+											# before each attribute name.
+							[\w.:_-]+		# Attribute name
+							\s*=\s*
+							(?:
+								".+?"		# "Attribute value"
+							 |
+								'.+?'		# 'Attribute value'
+							)
+						)*				# Zero or more
+					}x;
+
+	my $empty_tag = qr{< \w+ $tag_attrs \s* />}xms;
+	my $open_tag =  qr{< $block_tags $tag_attrs \s* >}xms;
+	my $close_tag = undef;	# let Text::Balanced handle this
+
+	use Text::Balanced qw(gen_extract_tagged);
+	my $extract_block = gen_extract_tagged($open_tag, $close_tag, undef, { ignore => [$empty_tag] });
+
+	my @chunks;
+	## TO-DO: the 0,3 on the next line ought to respect the
+	## tabwidth, or else, we should mandate 4-space tabwidth and
+	## be done with it:
+	while ($text =~ s{^(([ ]{0,3}<)?.*\n)}{}m) {
+		my $cur_line = $1;
+		if (defined $2) {
+			# current line could be start of code block
+
+			my ($tag, $remainder) = $extract_block->($cur_line . $text);
+			if ($tag) {
+				my $key = md5_hex($tag);
+				$g_html_blocks{$key} = $tag;
+				push @chunks, "\n\n" . $key . "\n\n";
+				$text = $remainder;
+			}
+			else {
+				# No tag match, so toss $cur_line into @chunks
+				push @chunks, $cur_line;
+			}
+		}
+		else {
+			# current line could NOT be start of code block
+			push @chunks, $cur_line;
+		}
+
+	}
+	push @chunks, $text; # Whatever is left.
+
+	$text = join '', @chunks;
+
+
+
+	# Special case just for <hr />. It was easier to make a special case than
+	# to make the other regex more complicated.
+	$text =~ s{
+				(?:
+					(?<=\n\n)		# Starting after a blank line
+					|				# or
+					\A\n?			# the beginning of the doc
+				)
+				(						# save in $1
+					[ ]{0,$less_than_tab}
+					<(hr)				# start tag = $2
+					\b					# word break
+					([^<>])*?			#
+					/?>					# the matching end tag
+					[ \t]*
+					(?=\n{2,}|\Z)		# followed by a blank line or end of document
+				)
+			}{
+				my $key = md5_hex($1);
+				$g_html_blocks{$key} = $1;
+				"\n\n" . $key . "\n\n";
+			}egx;
+
+	# Special case for standalone HTML comments:
+	$text =~ s{
+				(?:
+					(?<=\n\n)		# Starting after a blank line
+					|				# or
+					\A\n?			# the beginning of the doc
+				)
+				(						# save in $1
+					[ ]{0,$less_than_tab}
+					(?s:
+						<!
+						(--.*?--\s*)+
+						>
+					)
+					[ \t]*
+					(?=\n{2,}|\Z)		# followed by a blank line or end of document
+				)
+			}{
+				my $key = md5_hex($1);
+				$g_html_blocks{$key} = $1;
+				"\n\n" . $key . "\n\n";
+			}egx;
+
+	# PHP and ASP-style processor instructions (<?…?> and <%…%>)
+	$text =~ s{
+				(?:
+					(?<=\n\n)		# Starting after a blank line
+					|				# or
+					\A\n?			# the beginning of the doc
+				)
+				(						# save in $1
+					[ ]{0,$less_than_tab}
+					(?s:
+						<([?%])			# $2
+						.*?
+						\2>
+					)
+					[ \t]*
+					(?=\n{2,}|\Z)		# followed by a blank line or end of document
+				)
+			}{
+				my $key = md5_hex($1);
+				$g_html_blocks{$key} = $1;
+				"\n\n" . $key . "\n\n";
+			}egx;
+
+
+	return $text;
+}
+
+
+sub _RunBlockGamut {
+#
+# These are all the transformations that form block-level
+# tags like paragraphs, headers, and list items.
+#
+	my $text = shift;
+
+	$text = _DoHeaders($text);
+
+	# Do tables first to populate the table id's for cross-refs
+	# Escape <pre><code> so we don't get greedy with tables
+	$text = _DoTables($text);
+
+	# And now, protect our tables
+	$text = _HashHTMLBlocks($text);
+
+	# Do Horizontal Rules:
+	$text =~ s{^[ ]{0,2}([ ]?\*[ ]?){3,}[ \t]*$}{\n<hr$g_empty_element_suffix\n}gmx;
+	$text =~ s{^[ ]{0,2}([ ]? -[ ]?){3,}[ \t]*$}{\n<hr$g_empty_element_suffix\n}gmx;
+	$text =~ s{^[ ]{0,2}([ ]? _[ ]?){3,}[ \t]*$}{\n<hr$g_empty_element_suffix\n}gmx;
+
+	$text = _DoDefinitionLists($text);
+	$text = _DoLists($text);
+	$text = _DoCodeBlocks($text);
+	$text = _DoBlockQuotes($text);
+
+	# We already ran _HashHTMLBlocks() before, in Markdown(), but that
+	# was to escape raw HTML in the original Markdown source. This time,
+	# we're escaping the markup we've just created, so that we don't wrap
+	# <p> tags around block-level tags.
+	$text = _HashHTMLBlocks($text);
+	$text = _FormParagraphs($text);
+
+	return $text;
+}
+
+
+sub _RunSpanGamut {
+#
+# These are all the transformations that occur *within* block-level
+# tags like paragraphs, headers, and list items.
+#
+	my $text = shift;
+
+	$text = _DoCodeSpans($text);
+	$text = _DoMathSpans($text);
+	$text = _EscapeSpecialCharsWithinTagAttributes($text);
+	$text = _EncodeBackslashEscapes($text);
+
+	# Process anchor and image tags. Images must come first,
+	# because ![foo][f] looks like an anchor.
+	$text = _DoImages($text);
+	$text = _DoAnchors($text);
+
+	# Make links out of things like `<http://example.com/>`
+	# Must come after _DoAnchors(), because you can use < and >
+	# delimiters in inline links like [this](<url>).
+	$text = _DoAutoLinks($text);
+	$text = _EncodeAmpsAndAngles($text);
+	$text = _DoItalicsAndBold($text);
+
+	# Do hard breaks:
+	$text =~ s/ {2,}\n/ <br$g_empty_element_suffix\n/g;
+
+	return $text;
+}
+
+
+sub _EscapeSpecialCharsWithinTagAttributes {
+#
+# Within tags -- meaning between < and > -- encode [\ ` * _] so they
+# don't conflict with their use in Markdown for code, italics and strong.
+# We're replacing each such character with its corresponding MD5 checksum
+# value; this is likely overkill, but it should prevent us from colliding
+# with the escape values by accident.
+#
+	my $text = shift;
+	my $tokens ||= _TokenizeHTML($text);
+	$text = '';   # rebuild $text from the tokens
+
+	foreach my $cur_token (@$tokens) {
+		if ($cur_token->[0] eq "tag") {
+			$cur_token->[1] =~  s! \\ !$g_escape_table{'\\'}!gx;
+			$cur_token->[1] =~  s{ (?<=.)</?code>(?=.)  }{$g_escape_table{'`'}}gx;
+			$cur_token->[1] =~  s! \* !$g_escape_table{'*'}!gx;
+			$cur_token->[1] =~  s! _  !$g_escape_table{'_'}!gx;
+		}
+		$text .= $cur_token->[1];
+	}
+	return $text;
+}
+
+
+sub _DoAnchors {
+#
+# Turn Markdown link shortcuts into XHTML <a> tags.
+#
+	my $text = shift;
+
+	#
+	# First, handle reference-style links: [link text] [id]
+	#
+	$text =~ s{
+		(					# wrap whole match in $1
+		  \[
+		    ($g_nested_brackets)	# link text = $2
+		  \]
+		  [ ]?				# one optional space
+		  (?:\n[ ]*)?		# one optional newline followed by spaces
+		  \[
+		    (.*?)		# id = $3
+		  \]
+		)
+	}{
+		my $result;
+		my $whole_match = $1;
+		my $link_text   = $2;
+		my $link_id     = lc $3;
+		if ($link_id eq "") {
+			$link_id = lc $link_text;     # for shortcut links like [this][].
+		}
+		# Allow automatic cross-references to headers
+		my $label = Header2Label($link_id);
+		if (defined $g_urls{$link_id}) {
+			my $url = $g_urls{$link_id};
+			$url =~ s! \* !$g_escape_table{'*'}!gx;		# We've got to encode these to avoid
+			$url =~ s!  _ !$g_escape_table{'_'}!gx;		# conflicting with italics/bold.
+			$result = "<a href=\"$url\"";
+			if ( defined $g_titles{$link_id} ) {
+				my $title = $g_titles{$link_id};
+				$title =~ s! \* !$g_escape_table{'*'}!gx;
+				$title =~ s!  _ !$g_escape_table{'_'}!gx;
+				$result .=  " title=\"$title\"";
+			}
+			$result .= _DoAttributes($label);
+			$result .= ">$link_text</a>";
+		} elsif (defined $g_crossrefs{$label}) {
+			my $url = $g_crossrefs{$label};
+			$url =~ s! \* !$g_escape_table{'*'}!gx;		# We've got to encode these to avoid
+			$url =~ s!  _ !$g_escape_table{'_'}!gx;		# conflicting with italics/bold.
+			$result = "<a href=\"$url\"";
+			if ( defined $g_titles{$label} ) {
+				my $title = $g_titles{$label};
+				$title =~ s! \* !$g_escape_table{'*'}!gx;
+				$title =~ s!  _ !$g_escape_table{'_'}!gx;
+				$result .=  " title=\"$title\"";
+			}
+			$result .= _DoAttributes($label);
+			$result .= ">$link_text</a>";
+		} else {
+			$result = $whole_match;
+		}
+		$result;
+	}xsge;
+
+	#
+	# Next, inline-style links: [link text](url "optional title")
+	#
+	$text =~ s{
+		(				# wrap whole match in $1
+		  \[
+		    ($g_nested_brackets)	# link text = $2
+		  \]
+		  \(			# literal paren
+		  	[ \t]*
+			($g_nested_parens)		# href = $3
+		  	[ \t]*
+			(			# $4
+			  (['"])	# quote char = $5
+			  (.*?)		# Title = $6
+			  \5		# matching quote
+  		  	  [ \t]*	# ignore any spaces/tabs between closing quote and )
+			)?			# title is optional
+		  \)
+		)
+	}{
+		my $result;
+		my $whole_match = $1;
+		my $link_text   = $2;
+		my $url	  		= $3;
+		my $title		= $6;
+		$url =~ s! \* !$g_escape_table{'*'}!gx;		# We've got to encode these to avoid
+		$url =~ s!  _ !$g_escape_table{'_'}!gx;		# conflicting with italics/bold.
+		$url =~ s{^<(.*)>$}{$1};					# Remove <>'s surrounding URL, if present
+		$result = "<a href=\"$url\"";
+		if (defined $title) {
+			$title =~ s/"/&quot;/g;
+			$title =~ s! \* !$g_escape_table{'*'}!gx;
+			$title =~ s!  _ !$g_escape_table{'_'}!gx;
+			$result .=  " title=\"$title\"";
+		}
+		$result .= ">$link_text</a>";
+		$result;
+	}xsge;
+
+	#
+	# Last, handle reference-style shortcuts: [link text]
+	# These must come last in case you've also got [link test][1]
+	# or [link test](/foo)
+	#
+	$text =~ s{
+		(					# wrap whole match in $1
+		  \[
+		    ([^\[\]]+)		# link text = $2; can't contain '[' or ']'
+		  \]
+		)
+	}{
+		my $result;
+		my $whole_match = $1;
+		my $link_text   = $2;
+		(my $link_id = lc $2) =~ s{[ ]?\n}{ }g; # lower-case and turn embedded newlines into spaces
+		# Allow automatic cross-references to headers
+		my $label = Header2Label($link_id);
+		if (defined $g_urls{$link_id}) {
+			my $url = $g_urls{$link_id};
+			$url =~ s! \* !$g_escape_table{'*'}!gx;		# We've got to encode these to avoid
+			$url =~ s!  _ !$g_escape_table{'_'}!gx;		# conflicting with italics/bold.
+			$result = "<a href=\"$url\"";
+			if ( defined $g_titles{$link_id} ) {
+				my $title = $g_titles{$link_id};
+				$title =~ s! \* !$g_escape_table{'*'}!gx;
+				$title =~ s!  _ !$g_escape_table{'_'}!gx;
+				$result .=  " title=\"$title\"";
+			}
+			$result .= _DoAttributes($link_id);
+			$result .= ">$link_text</a>";
+		} elsif (defined $g_crossrefs{$label}) {
+			my $url = $g_crossrefs{$label};
+			$url =~ s! \* !$g_escape_table{'*'}!gx;		# We've got to encode these to avoid
+			$url =~ s!  _ !$g_escape_table{'_'}!gx;		# conflicting with italics/bold.
+			$result = "<a href=\"$url\"";
+			if ( defined $g_titles{$label} ) {
+				my $title = $g_titles{$label};
+				$title =~ s! \* !$g_escape_table{'*'}!gx;
+				$title =~ s!  _ !$g_escape_table{'_'}!gx;
+				$result .=  " title=\"$title\"";
+			}
+			$result .= _DoAttributes($label);
+			$result .= ">$link_text</a>";
+		} else {
+			$result = $whole_match;
+		}
+		$result;
+	}xsge;
+
+	return $text;
+}
+
+
+sub _DoImages {
+#
+# Turn Markdown image shortcuts into <img> tags.
+#
+	my $text = shift;
+
+	#
+	# First, handle reference-style labeled images: ![alt text][id]
+	#
+	$text =~ s{
+		(				# wrap whole match in $1
+		  !\[
+		    (.*?)		# alt text = $2
+		  \]
+		  [ ]?				# one optional space
+		  (?:\n[ ]*)?		# one optional newline followed by spaces
+		  \[
+		    (.*?)		# id = $3
+		  \]
+		)
+	}{
+		my $result;
+		my $whole_match = $1;
+		my $alt_text    = $2;
+		my $link_id     = lc $3;
+		if ($link_id eq "") {
+			$link_id = lc $alt_text;     # for shortcut links like ![this][].
+		}
+		$alt_text =~ s/"/&quot;/g;
+		if (defined $g_urls{$link_id}) {
+			my $url = $g_urls{$link_id};
+			$url =~ s! \* !$g_escape_table{'*'}!gx;		# We've got to encode these to avoid
+			$url =~ s!  _ !$g_escape_table{'_'}!gx;		# conflicting with italics/bold.
+
+			my $label = Header2Label($alt_text);
+			$g_crossrefs{$label} = "#$label";
+			if (! defined $g_titles{$link_id}) {
+				$g_titles{$link_id} = $alt_text;
+			}
+
+			$result = "<img id=\"$label\" src=\"$url\" alt=\"$alt_text\"";
+			if (defined $g_titles{$link_id}) {
+				my $title = $g_titles{$link_id};
+				$title =~ s! \* !$g_escape_table{'*'}!gx;
+				$title =~ s!  _ !$g_escape_table{'_'}!gx;
+				$result .=  " title=\"$title\"";
+			}
+			$result .= _DoAttributes($link_id);
+			$result .= $g_empty_element_suffix;
+		}
+		else {
+			# If there's no such link ID, leave intact:
+			$result = $whole_match;
+		}
+		$result;
+	}xsge;
+
+	#
+	# Next, handle inline images:  ![alt text](url "optional title")
+	# Don't forget: encode * and _
+
+	$text =~ s{
+		(				# wrap whole match in $1
+		  !\[
+		    (.*?)		# alt text = $2
+		  \]
+		  \s?			# One optional whitespace character
+		  \(			# literal paren
+		  	[ \t]*
+			($g_nested_parens)		# href = $3
+		  	[ \t]*
+			(			# $4
+			  (['"])	# quote char = $5
+			  (.*?)		# title = $6
+			  \5		# matching quote
+			  [ \t]*
+			)?			# title is optional
+		  \)
+		)
+	}{
+		my $result;
+		my $whole_match = $1;
+		my $alt_text    = $2;
+		my $url	  		= $3;
+		my $title		= (defined $6) ? $6 : '';
+		$alt_text =~ s/"/&quot;/g;
+		$title    =~ s/"/&quot;/g;
+		$url =~ s! \* !$g_escape_table{'*'}!gx;		# We've got to encode these to avoid
+		$url =~ s!  _ !$g_escape_table{'_'}!gx;		# conflicting with italics/bold.
+		$url =~ s{^<(.*)>$}{$1};					# Remove <>'s surrounding URL, if present
+		my $label = Header2Label($alt_text);
+		$g_crossrefs{$label} = "#$label";
+#		$g_titles{$label} = $alt_text;			# I think this line should not be here
+
+		$result = "<img id=\"$label\" src=\"$url\" alt=\"$alt_text\"";
+		if (defined $title) {
+			$title =~ s! \* !$g_escape_table{'*'}!gx;
+			$title =~ s!  _ !$g_escape_table{'_'}!gx;
+			$result .=  " title=\"$title\"";
+		}
+		$result .= $g_empty_element_suffix;
+		$result;
+	}xsge;
+
+	return $text;
+}
+
+
+sub _DoHeaders {
+	my $text = shift;
+	my $header = "";
+	my $label = "";
+	my $idString = "";
+
+	# Setext-style headers:
+	#	  Header 1
+	#	  ========
+	#
+	#	  Header 2
+	#	  --------
+	#
+	$text =~ s{ ^(.+?)(?:\s*(?<!\\)\[([^\[]*?)\])?[ \t]*\n=+[ \t]*\n+ }{
+		if (defined $2) {
+			$label = Header2Label($2);
+		} else {
+			$label = Header2Label($1);
+		}
+		$header = _RunSpanGamut($1);
+		$header =~ s/^\s*//s;
+
+		if ($label ne "") {
+			$g_crossrefs{$label} = "#$label";
+			$g_titles{$label} = _StripHTML($header);
+			$idString = " id=\"$label\"";
+		} else {
+			$idString = "";
+		}
+		my $h_level = $g_base_header_level;
+
+		"<h$h_level$idString>"  .  $header  .  "</h$h_level>\n\n";
+	}egmx;
+
+	$text =~ s{ ^(.+?)(?:\s*(?<!\\)\[([^\[]*?)\])?[ \t]*\n-+[ \t]*\n+ }{
+		if (defined $2) {
+			$label = Header2Label($2);
+		} else {
+			$label = Header2Label($1);
+		}
+		$header = _RunSpanGamut($1);
+		$header =~ s/^\s*//s;
+
+		if ($label ne "") {
+			$g_crossrefs{$label} = "#$label";
+			$g_titles{$label} = _StripHTML($header);
+			$idString = " id=\"$label\"";
+		} else {
+			$idString = "";
+		}
+
+		my $h_level = $g_base_header_level +1;
+
+		"<h$h_level$idString>"  .  $header  .  "</h$h_level>\n\n";
+	}egmx;
+
+
+	# atx-style headers:
+	#	# Header 1
+	#	## Header 2
+	#	## Header 2 with closing hashes ##
+	#	...
+	#	###### Header 6
+	#
+	$text =~ s{
+			^(\#{1,6})	# $1 = string of #'s
+			[ \t]*
+			(.+?)		# $2 = Header text
+			[ \t]*
+			(?:(?<!\\)\[([^\[]*?)\])?	# $3 = optional label for cross-reference
+			[ \t]*
+			\#*			# optional closing #'s (not counted)
+			\n+
+		}{
+			my $h_level = length($1) + $g_base_header_level - 1;
+			if (defined $3) {
+				$label = Header2Label($3);
+			} else {
+				$label = Header2Label($2);
+			}
+			$header = _RunSpanGamut($2);
+			$header =~ s/^\s*//s;
+
+			if ($label ne "") {
+				$g_crossrefs{$label} = "#$label";
+				$g_titles{$label} = _StripHTML($header);
+				$idString = " id=\"$label\"";
+			} else {
+				$idString = "";
+			}
+			"<h$h_level$idString>"  .  $header  .  "</h$h_level>\n\n";
+		}egmx;
+
+	return $text;
+}
+
+
+sub _DoLists {
+#
+# Form HTML ordered (numbered) and unordered (bulleted) lists.
+#
+	my $text = shift;
+	my $less_than_tab = $g_tab_width - 1;
+
+	# Re-usable patterns to match list item bullets and number markers:
+	my $marker_ul  = qr/[*+-]/;
+	my $marker_ol  = qr/\d+[.]/;
+	my $marker_any = qr/(?:$marker_ul|$marker_ol)/;
+
+	# Re-usable pattern to match any entirel ul or ol list:
+	my $whole_list = qr{
+		(								# $1 = whole list
+		  (								# $2
+			[ ]{0,$less_than_tab}
+			(${marker_any})				# $3 = first list item marker
+			[ \t]+
+		  )
+		  (?s:.+?)
+		  (								# $4
+			  \z
+			|
+			  \n{2,}
+			  (?=\S)
+			  (?!						# Negative lookahead for another list item marker
+				[ \t]*
+				${marker_any}[ \t]+
+			  )
+		  )
+		)
+	}mx;
+
+	# We use a different prefix before nested lists than top-level lists.
+	# See extended comment in _ProcessListItems().
+	#
+	# Note: There's a bit of duplication here. My original implementation
+	# created a scalar regex pattern as the conditional result of the test on
+	# $g_list_level, and then only ran the $text =~ s{...}{...}egmx
+	# substitution once, using the scalar as the pattern. This worked,
+	# everywhere except when running under MT on my hosting account at Pair
+	# Networks. There, this caused all rebuilds to be killed by the reaper (or
+	# perhaps they crashed, but that seems incredibly unlikely given that the
+	# same script on the same server ran fine *except* under MT. I've spent
+	# more time trying to figure out why this is happening than I'd like to
+	# admit. My only guess, backed up by the fact that this workaround works,
+	# is that Perl optimizes the substition when it can figure out that the
+	# pattern will never change, and when this optimization isn't on, we run
+	# afoul of the reaper. Thus, the slightly redundant code that uses two
+	# static s/// patterns rather than one conditional pattern.
+
+	if ($g_list_level) {
+		$text =~ s{
+				^
+				$whole_list
+			}{
+				my $list = $1;
+				my $list_type = ($3 =~ m/$marker_ul/) ? "ul" : "ol";
+				# Turn double returns into triple returns, so that we can make a
+				# paragraph for the last item in a list, if necessary:
+				$list =~ s/\n{2,}/\n\n\n/g;
+				my $result = _ProcessListItems($list, $marker_any);
+				# Trim any trailing whitespace, to put the closing `</$list_type>`
+				# up on the preceding line, to get it past the current stupid
+				# HTML block parser. This is a hack to work around the terrible
+				# hack that is the HTML block parser.
+				$result =~ s{\s+$}{};
+				$result = "<$list_type>" . $result . "</$list_type>\n";
+				$result;
+			}egmx;
+	}
+	else {
+		$text =~ s{
+				(?:(?<=\n\n)|\A\n?)
+				$whole_list
+			}{
+				my $list = $1;
+				my $list_type = ($3 =~ m/$marker_ul/) ? "ul" : "ol";
+				# Turn double returns into triple returns, so that we can make a
+				# paragraph for the last item in a list, if necessary:
+				$list =~ s/\n{2,}/\n\n\n/g;
+				my $result = _ProcessListItems($list, $marker_any);
+				$result = "<$list_type>\n" . $result . "</$list_type>\n";
+				$result;
+			}egmx;
+	}
+
+
+	return $text;
+}
+
+
+sub _ProcessListItems {
+#
+#	Process the contents of a single ordered or unordered list, splitting it
+#	into individual list items.
+#
+
+	my $list_str = shift;
+	my $marker_any = shift;
+
+	$g_list_level++;
+
+	# trim trailing blank lines:
+	$list_str =~ s/\n{2,}\z/\n/;
+
+
+	$list_str =~ s{
+		(\n)?							# leading line = $1
+		(^[ \t]*)						# leading whitespace = $2
+		($marker_any) [ \t]+			# list marker = $3
+		((?s:.+?)						# list item text   = $4
+		(\n{1,2}))
+		(?= \n* (\z | \2 ($marker_any) [ \t]+))
+	}{
+		my $item = $4;
+		my $leading_line = $1;
+		my $leading_space = $2;
+		if ($leading_line or ($item =~ m/\n{2,}/)) {
+			$item = _RunBlockGamut(_Outdent($item));
+		}
+		else {
+			# Recursion for sub-lists:
+			$item = _DoLists(_Outdent($item));
+			chomp $item;
+			$item = _RunSpanGamut($item);
+		}
+		"<li>" . $item . "</li>\n";
+	}egmx;
+
+	$g_list_level--;
+	return $list_str;
+}
+
+
+
+sub _DoCodeBlocks {
+#
+#	Process Markdown `<pre><code>` blocks.
+#
+
+	my $text = shift;
+
+	$text =~ s{
+			(?:\n\n|\A)
+			(	            # $1 = the code block -- one or more lines, starting with a space/tab
+			  (?:
+			    (?:[ ]{$g_tab_width} | \t)  # Lines must start with a tab or a tab-width of spaces
+			    .*\n+
+			  )+
+			)
+			((?=^[ ]{0,$g_tab_width}\S)|\Z)	# Lookahead for non-space at line-start, or end of doc
+		}{
+			my $codeblock = $1;
+			my $result; # return value
+			$codeblock = _EncodeCode(_Outdent($codeblock));
+			$codeblock = _Detab($codeblock);
+			$codeblock =~ s/\A\n+//; # trim leading newlines
+			$codeblock =~ s/\n+\z//; # trim trailing newlines
+			$result = "\n\n<pre><code>" . $codeblock . "</code></pre>\n\n";	# CHANGED: Removed newline for MMD
+			$result;
+		}egmx;
+
+	return $text;
+}
+
+
+sub _DoCodeSpans {
+
+	my $text = shift;
+
+	$text =~ s@
+			(?<!\\)		# Character before opening ` can't be a backslash
+			(`+)		# $1 = Opening run of `
+			(.+?)		# $2 = The code block
+			(?<!`)
+			\1			# Matching closer
+			(?!`)
+		@
+ 			my $c = "$2";
+ 			$c =~ s/^[ \t]*//g; # leading whitespace
+ 			$c =~ s/[ \t]*$//g; # trailing whitespace
+ 			$c = _EncodeCode($c);
+			"<code>$c</code>";
+		@egsx;
+
+	return $text;
+}
+
+
+sub _EncodeCode {
+#
+# Encode/escape certain characters inside Markdown code runs.
+# The point is that in code, these characters are literals,
+# and lose their special Markdown meanings.
+#
+    local $_ = shift;
+
+	# Encode all ampersands; HTML entities are not
+	# entities within a Markdown code span.
+	s/&/&amp;/g;
+
+	# Encode $'s, but only if we're running under Blosxom.
+	# (Blosxom interpolates Perl variables in article bodies.)
+	{
+		no warnings 'once';
+    	if (defined($blosxom::version)) {
+    		s/\$/&#036;/g;
+    	}
+    }
+
+
+	# Do the angle bracket song and dance:
+	s! <  !&lt;!gx;
+	s! >  !&gt;!gx;
+
+	# Now, escape characters that are magic in Markdown:
+	s! \* !$g_escape_table{'*'}!gx;
+	s! _  !$g_escape_table{'_'}!gx;
+	s! {  !$g_escape_table{'{'}!gx;
+	s! }  !$g_escape_table{'}'}!gx;
+	s! \[ !$g_escape_table{'['}!gx;
+	s! \] !$g_escape_table{']'}!gx;
+	s! \\ !$g_escape_table{'\\'}!gx;
+
+	return $_;
+}
+
+
+sub _DoItalicsAndBold {
+	my $text = shift;
+
+	# Cave in - `*` and `_` behave differently...  We'll see how it works out
+
+
+	# <strong> must go first:
+	$text =~ s{ (?<!\w) (\*\*|__) (?=\S) (.+?[*_]*) (?<=\S) \1 }
+		{<strong>$2</strong>}gsx;
+
+	$text =~ s{ (?<!\w) (\*|_) (?=\S) (.+?) (?<=\S) \1 }
+		{<em>$2</em>}gsx;
+
+	# And now, a second pass to catch nested strong and emphasis special cases
+	$text =~ s{ (?<!\w) (\*\*|__) (?=\S) (.+?[*_]*) (?<=\S) \1 }
+		{<strong>$2</strong>}gsx;
+
+	$text =~ s{ (?<!\w) (\*|_) (?=\S) (.+?) (?<=\S) \1 }
+		{<em>$2</em>}gsx;
+
+	# And now, allow `*` in the middle of words
+
+	# <strong> must go first:
+	$text =~ s{ (\*\*) (?=\S) (.+?[*]*) (?<=\S) \1 }
+		{<strong>$2</strong>}gsx;
+
+	$text =~ s{ (\*) (?=\S) (.+?) (?<=\S) \1 }
+		{<em>$2</em>}gsx;
+
+	return $text;
+}
+
+
+sub _DoBlockQuotes {
+	my $text = shift;
+
+	$text =~ s{
+		  (								# Wrap whole match in $1
+			(
+			  ^[ \t]*>[ \t]?			# '>' at the start of a line
+			    .+\n					# rest of the first line
+			  (.+\n)*					# subsequent consecutive lines
+			  \n*						# blanks
+			)+
+		  )
+		}{
+			my $bq = $1;
+			$bq =~ s/^[ \t]*>[ \t]?//gm;	# trim one level of quoting
+			$bq =~ s/^[ \t]+$//mg;			# trim whitespace-only lines
+			$bq = _RunBlockGamut($bq);		# recurse
+			$bq =~ s/^/  /g;
+			# These leading spaces screw with <pre> content, so we need to fix that:
+			$bq =~ s{
+					(\s*<pre>.+?</pre>)
+				}{
+					my $pre = $1;
+					$pre =~ s/^  //mg;
+					$pre;
+				}egsx;
+			"<blockquote>\n$bq\n</blockquote>\n\n";
+		}egmx;
+
+
+	return $text;
+}
+
+
+sub _FormParagraphs {
+#
+#	Params:
+#		$text - string to process with html <p> tags
+#
+	my $text = shift;
+
+	# Strip leading and trailing lines:
+	$text =~ s/\A\n+//;
+	$text =~ s/\n+\z//;
+
+	my @grafs = split(/\n{2,}/, $text);
+
+	#
+	# Wrap <p> tags.
+	#
+	foreach (@grafs) {
+		unless (defined( $g_html_blocks{$_} )) {
+			$_ = _RunSpanGamut($_);
+			s/^([ \t]*)/<p>/;
+			$_ .= "</p>";
+		}
+	}
+
+	#
+	# Unhashify HTML blocks
+	#
+# 	foreach my $graf (@grafs) {
+# 		my $block = $g_html_blocks{$graf};
+# 		if (defined $block) {
+# 			$graf = $block;
+# 		}
+# 	}
+
+	foreach my $graf (@grafs) {
+		# Modify elements of @grafs in-place...
+		my $block = $g_html_blocks{$graf};
+		if (defined $block) {
+			$graf = $block;
+			if ($block =~ m{
+							\A
+							(							# $1 = <div> tag
+							  <div  \s+
+							  [^>]*
+							  \b
+							  markdown\s*=\s*  (['"])	#	$2 = attr quote char
+							  1
+							  \2
+							  [^>]*
+							  >
+							)
+							(							# $3 = contents
+							.*
+							)
+							(</div>)					# $4 = closing tag
+							\z
+							}xms
+				) {
+				my ($div_open, $div_content, $div_close) = ($1, $3, $4);
+
+				# We can't call Markdown(), because that resets the hash;
+				# that initialization code should be pulled into its own sub, though.
+				$div_content = _HashHTMLBlocks($div_content);
+				$div_content = _StripLinkDefinitions($div_content);
+				$div_content = _RunBlockGamut($div_content);
+				$div_content = _UnescapeSpecialChars($div_content);
+
+				$div_open =~ s{\smarkdown\s*=\s*(['"]).+?\1}{}ms;
+
+				$graf = $div_open . "\n" . $div_content . "\n" . $div_close;
+			}
+		}
+	}
+
+
+	return join "\n\n", @grafs;
+}
+
+
+sub _EncodeAmpsAndAngles {
+# Smart processing for ampersands and angle brackets that need to be encoded.
+
+	my $text = shift;
+
+	# Ampersand-encoding based entirely on Nat Irons's Amputator MT plugin:
+	#   http://bumppo.net/projects/amputator/
+ 	$text =~ s/&(?!#?[xX]?(?:[0-9a-fA-F]+|\w+);)/&amp;/g;
+
+	# Encode naked <'s
+ 	$text =~ s{<(?![a-z/?\$!])}{&lt;}gi;
+
+	return $text;
+}
+
+
+sub _EncodeBackslashEscapes {
+#
+#   Parameter:  String.
+#   Returns:    The string, with after processing the following backslash
+#               escape sequences.
+#
+    local $_ = shift;
+
+    return $_;
+}
+
+
+sub _DoAutoLinks {
+	my $text = shift;
+
+	$text =~ s{<((https?|ftp|dict):[^'">\s]+)>}{<a href="$1">$1</a>}gi;
+
+	# Email addresses: <address@domain.foo>
+	$text =~ s{
+		<
+        (?:mailto:)?
+		(
+			[-.\w]+
+			\@
+			[-a-z0-9]+(\.[-a-z0-9]+)*\.[a-z]+
+		)
+		>
+	}{
+		_EncodeEmailAddress( _UnescapeSpecialChars($1) );
+	}egix;
+
+	return $text;
+}
+
+
+sub _EncodeEmailAddress {
+
+	my $addr = shift;
+
+	srand;
+	my @encode = (
+		sub { '&#' .                 ord(shift)   . ';' },
+		sub { '&#x' . sprintf( "%X", ord(shift) ) . ';' },
+		sub {                            shift          },
+	);
+
+	$addr = "mailto:" . $addr;
+
+	$addr =~ s{(.)}{
+		my $char = $1;
+		if ( $char eq '@' ) {
+			# this *must* be encoded. I insist.
+			$char = $encode[int rand 1]->($char);
+		} elsif ( $char ne ':' ) {
+			# leave ':' alone (to spot mailto: later)
+			my $r = rand;
+			# roughly 10% raw, 45% hex, 45% dec
+			$char = (
+				$r > .9   ?  $encode[2]->($char)  :
+				$r < .45  ?  $encode[1]->($char)  :
+							 $encode[0]->($char)
+			);
+		}
+		$char;
+	}gex;
+
+	$addr = qq{<a href="$addr">$addr</a>};
+	$addr =~ s{">.+?:}{">}; # strip the mailto: from the visible part
+
+	return $addr;
+}
+
+
+sub _UnescapeSpecialChars {
+#
+# Swap back in all the special characters we've hidden.
+#
+	my $text = shift;
+
+	while( my($char, $hash) = each(%g_escape_table) ) {
+		$text =~ s/$hash/$char/g;
+	}
+    return $text;
+}
+
+
+sub _TokenizeHTML {
+
+    my $str = shift;
+    my $pos = 0;
+    my $len = length $str;
+    my @tokens;
+
+    my $depth = 6;
+    my $nested_tags = join('|', ('(?:<[a-z/!$](?:[^<>]') x $depth) . (')*>)' x  $depth);
+    my $match = qr/(?s: <! ( -- .*? -- \s* )+ > ) |  # comment
+                   (?s: <\? .*? \?> ) |              # processing instruction
+                   $nested_tags/ix;                   # nested tags
+
+    while ($str =~ m/($match)/g) {
+        my $whole_tag = $1;
+        my $sec_start = pos $str;
+        my $tag_start = $sec_start - length $whole_tag;
+        if ($pos < $tag_start) {
+            push @tokens, ['text', substr($str, $pos, $tag_start - $pos)];
+        }
+        push @tokens, ['tag', $whole_tag];
+        $pos = pos $str;
+    }
+    push @tokens, ['text', substr($str, $pos, $len - $pos)] if $pos < $len;
+
+    return \@tokens;
+}
+
+
+sub _Outdent {
+#
+# Remove one level of line-leading tabs or spaces
+#
+	my $text = shift;
+
+	$text =~ s/^(\t|[ ]{1,$g_tab_width})//gm;
+	return $text;
+}
+
+
+sub _Detab {
+#
+# Cribbed from a post by Bart Lateur:
+# <http://www.nntp.perl.org/group/perl.macperl.anyperl/154>
+#
+	my $text = shift;
+
+	$text =~ s{(.*?)\t}{$1.(' ' x ($g_tab_width - length($1) % $g_tab_width))}ge;
+	return $text;
+}
+
+#
+# MultiMarkdown Routines
+#
+
+sub _ParseMetaData {
+	my $text = shift;
+	my $clean_text = "";
+
+	my ($inMetaData, $currentKey) = (1,'');
+
+	# If only metadata is "Format: complete" then skip
+
+	if ($text =~ s/^(Format):\s*complete\n(.*?)\n/$2\n/is) {
+		# If "Format: complete" was added automatically, don't force first
+		#	line of text to be metadata
+		$g_metadata{$1}= "complete";
+		$g_document_format = "complete";
+	}
+
+	foreach my $line ( split /\n/, $text ) {
+		$line =~ /^$/ and $inMetaData = 0;
+		if ($inMetaData) {
+			if ($line =~ /^([a-zA-Z0-9][0-9a-zA-Z _-]*?):\s*(.*)$/ ) {
+				$currentKey = $1;
+				my $meta = $2;
+				$currentKey =~ s/\s+/ /g;
+				$currentKey =~ s/\s$//;
+				$g_metadata{$currentKey} = $meta;
+				if (lc($currentKey) eq "format") {
+					$g_document_format
+				}
+				if (lc($currentKey) eq "based url") {
+					$g_base_url = $g_metadata{$currentKey};
+				}
+				if (lc($currentKey) eq "bibliography title") {
+					$g_bibliography_title = $g_metadata{$currentKey};
+					$g_bibliography_title =~ s/\s*$//;
+				}
+				if (lc($currentKey) eq "base header level") {
+					$g_base_header_level = $g_metadata{$currentKey};
+				}
+			} else {
+				if ($currentKey eq "") {
+					# No metadata present
+					$clean_text .= "$line\n";
+					$inMetaData = 0;
+					next;
+				}
+				if ($line =~ /^\s*(.+)$/ ) {
+					$g_metadata{$currentKey} .= "$g_metadata_newline{$currentKey}$1";
+				}
+			}
+		} else {
+			$clean_text .= "$line\n";
+		}
+	}
+
+	return $clean_text;
+}
+
+sub _UnescapeComments{
+	# Remove encoding inside comments
+	# Based on proposal by Toras Doran (author of Text::MultiMarkdown)
+
+	my $text = shift;
+	$text =~ s{
+		(?<=<!--) # Begin comment
+		(.*?)     # Anything inside
+		(?=-->)   # End comments
+	}{
+		my $t = $1;
+		$t =~ s/&amp;/&/g;
+		$t =~ s/&lt;/</g;
+		$t;
+	}egsx;
+
+	return $text;
+}
+
+1;
+
+__END__
