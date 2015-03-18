@@ -1,0 +1,4899 @@
+$:.unshift File.dirname(__FILE__) # For use/testing when no gem is installed
+
+# Require all of the Ruby files in the given directory.
+#
+# path - The String relative path from here to the directory.
+#
+# Returns nothing.
+def require_all(path)
+  glob = File.join(File.dirname(__FILE__), path, '*.rb')
+  Dir[glob].each do |f|
+    require f
+  end
+end
+
+# rubygems
+require 'rubygems'
+
+# stdlib
+require 'fileutils'
+require 'time'
+require 'English'
+require 'pathname'
+require 'logger'
+require 'set'
+
+# 3rd party
+require 'safe_yaml/load'
+require 'liquid'
+require 'kramdown'
+require 'colorator'
+
+SafeYAML::OPTIONS[:suppress_warnings] = true
+Liquid::Template.error_mode = :strict
+
+module Jekyll
+
+  # internal requires
+  autoload :Cleaner,             'jekyll/cleaner'
+  autoload :Collection,          'jekyll/collection'
+  autoload :Configuration,       'jekyll/configuration'
+  autoload :Convertible,         'jekyll/convertible'
+  autoload :Deprecator,          'jekyll/deprecator'
+  autoload :Document,            'jekyll/document'
+  autoload :Draft,               'jekyll/draft'
+  autoload :EntryFilter,         'jekyll/entry_filter'
+  autoload :Errors,              'jekyll/errors'
+  autoload :Excerpt,             'jekyll/excerpt'
+  autoload :External,            'jekyll/external'
+  autoload :Filters,             'jekyll/filters'
+  autoload :FrontmatterDefaults, 'jekyll/frontmatter_defaults'
+  autoload :Layout,              'jekyll/layout'
+  autoload :LayoutReader,        'jekyll/layout_reader'
+  autoload :LogAdapter,          'jekyll/log_adapter'
+  autoload :Page,                'jekyll/page'
+  autoload :PluginManager,       'jekyll/plugin_manager'
+  autoload :Post,                'jekyll/post'
+  autoload :Publisher,           'jekyll/publisher'
+  autoload :Regenerator,         'jekyll/regenerator'
+  autoload :RelatedPosts,        'jekyll/related_posts'
+  autoload :Renderer,            'jekyll/renderer'
+  autoload :Site,                'jekyll/site'
+  autoload :StaticFile,          'jekyll/static_file'
+  autoload :Stevenson,           'jekyll/stevenson'
+  autoload :URL,                 'jekyll/url'
+  autoload :Utils,               'jekyll/utils'
+  autoload :VERSION,             'jekyll/version'
+
+  # extensions
+  require 'jekyll/plugin'
+  require 'jekyll/converter'
+  require 'jekyll/generator'
+  require 'jekyll/command'
+  require 'jekyll/liquid_extensions'
+
+  class << self
+    # Public: Tells you which Jekyll environment you are building in so you can skip tasks
+    # if you need to.  This is useful when doing expensive compression tasks on css and
+    # images and allows you to skip that when working in development.
+
+    def env
+      ENV["JEKYLL_ENV"] || "development"
+    end
+
+    # Public: Generate a Jekyll configuration Hash by merging the default
+    # options with anything in _config.yml, and adding the given options on top.
+    #
+    # override - A Hash of config directives that override any options in both
+    #            the defaults and the config file. See Jekyll::Configuration::DEFAULTS for a
+    #            list of option names and their defaults.
+    #
+    # Returns the final configuration Hash.
+    def configuration(override = Hash.new)
+      config = Configuration[Configuration::DEFAULTS]
+      override = Configuration[override].stringify_keys
+      unless override.delete('skip_config_files')
+        config = config.read_config_files(config.config_files(override))
+      end
+
+      # Merge DEFAULTS < _config.yml < override
+      config = Utils.deep_merge_hashes(config, override).stringify_keys
+      set_timezone(config['timezone']) if config['timezone']
+
+      config
+    end
+
+    # Public: Set the TZ environment variable to use the timezone specified
+    #
+    # timezone - the IANA Time Zone
+    #
+    # Returns nothing
+    def set_timezone(timezone)
+      ENV['TZ'] = timezone
+    end
+
+    # Public: Fetch the logger instance for this Jekyll process.
+    #
+    # Returns the LogAdapter instance.
+    def logger
+      @logger ||= LogAdapter.new(Stevenson.new, (ENV["JEKYLL_LOG_LEVEL"] || :info).to_sym)
+    end
+
+    # Public: Set the log writer.
+    #         New log writer must respond to the same methods
+    #         as Ruby's interal Logger.
+    #
+    # writer - the new Logger-compatible log transport
+    #
+    # Returns the new logger.
+    def logger=(writer)
+      @logger = LogAdapter.new(writer)
+    end
+
+    # Public: An array of sites
+    #
+    # Returns the Jekyll sites created.
+    def sites
+      @sites ||= []
+    end
+
+    # Public: Ensures the questionable path is prefixed with the base directory
+    #         and prepends the questionable path with the base directory if false.
+    #
+    # base_directory - the directory with which to prefix the questionable path
+    # questionable_path - the path we're unsure about, and want prefixed
+    #
+    # Returns the sanitized path.
+    def sanitized_path(base_directory, questionable_path)
+      return base_directory if base_directory.eql?(questionable_path)
+
+      clean_path = File.expand_path(questionable_path, "/")
+      clean_path = clean_path.sub(/\A\w\:\//, '/')
+
+      unless clean_path.start_with?(base_directory.sub(/\A\w\:\//, '/'))
+        File.join(base_directory, clean_path)
+      else
+        clean_path
+      end
+    end
+
+    # Conditional optimizations
+    Jekyll::External.require_if_present('liquid-c')
+
+  end
+end
+
+require_all 'jekyll/commands'
+require_all 'jekyll/converters'
+require_all 'jekyll/converters/markdown'
+require_all 'jekyll/generators'
+require_all 'jekyll/tags'
+
+require 'jekyll-sass-converter'
+
+# encoding: UTF-8
+
+require 'set'
+
+# Convertible provides methods for converting a pagelike item
+# from a certain type of markup into actual content
+#
+# Requires
+#   self.site -> Jekyll::Site
+#   self.content
+#   self.content=
+#   self.data=
+#   self.ext=
+#   self.output=
+#   self.name
+#   self.path
+#   self.type -> :page, :post or :draft
+
+module Jekyll
+  module Convertible
+    # Returns the contents as a String.
+    def to_s
+      content || ''
+    end
+
+    # Whether the file is published or not, as indicated in YAML front-matter
+    def published?
+      !(data.key?('published') && data['published'] == false)
+    end
+
+    # Returns merged option hash for File.read of self.site (if exists)
+    # and a given param
+    def merged_file_read_opts(opts)
+      (site ? site.file_read_opts : {}).merge(opts)
+    end
+
+    # Read the YAML frontmatter.
+    #
+    # base - The String path to the dir containing the file.
+    # name - The String filename of the file.
+    # opts - optional parameter to File.read, default at site configs
+    #
+    # Returns nothing.
+    def read_yaml(base, name, opts = {})
+      begin
+        self.content = File.read(site.in_source_dir(base, name),
+                                 merged_file_read_opts(opts))
+        if content =~ /\A(---\s*\n.*?\n?)^((---|\.\.\.)\s*$\n?)/m
+          self.content = $POSTMATCH
+          self.data = SafeYAML.load($1)
+        end
+      rescue SyntaxError => e
+        Jekyll.logger.warn "YAML Exception reading #{File.join(base, name)}: #{e.message}"
+      rescue Exception => e
+        Jekyll.logger.warn "Error reading file #{File.join(base, name)}: #{e.message}"
+      end
+
+      self.data ||= {}
+    end
+
+    # Transform the contents based on the content type.
+    #
+    # Returns the transformed contents.
+    def transform
+      converters.reduce(content) do |output, converter|
+        begin
+          converter.convert output
+        rescue => e
+          Jekyll.logger.error "Conversion error:", "#{converter.class} encountered an error while converting '#{path}':"
+          Jekyll.logger.error("", e.to_s)
+          raise e
+        end
+      end
+    end
+
+    # Determine the extension depending on content_type.
+    #
+    # Returns the String extension for the output file.
+    #   e.g. ".html" for an HTML output file.
+    def output_ext
+      if converters.all? { |c| c.is_a?(Jekyll::Converters::Identity) }
+        ext
+      else
+        converters.map { |c|
+          c.output_ext(ext) unless c.is_a?(Jekyll::Converters::Identity)
+        }.compact.last
+      end
+    end
+
+    # Determine which converter to use based on this convertible's
+    # extension.
+    #
+    # Returns the Converter instance.
+    def converters
+      @converters ||= site.converters.select { |c| c.matches(ext) }.sort
+    end
+
+    # Render Liquid in the content
+    #
+    # content - the raw Liquid content to render
+    # payload - the payload for Liquid
+    # info    - the info for Liquid
+    #
+    # Returns the converted content
+    def render_liquid(content, payload, info, path = nil)
+      Liquid::Template.parse(content).render!(payload, info)
+    rescue Tags::IncludeTagError => e
+      Jekyll.logger.error "Liquid Exception:", "#{e.message} in #{e.path}, included in #{path || self.path}"
+      raise e
+    rescue Exception => e
+      Jekyll.logger.error "Liquid Exception:", "#{e.message} in #{path || self.path}"
+      raise e
+    end
+
+    # Convert this Convertible's data to a Hash suitable for use by Liquid.
+    #
+    # Returns the Hash representation of this Convertible.
+    def to_liquid(attrs = nil)
+      further_data = Hash[(attrs || self.class::ATTRIBUTES_FOR_LIQUID).map { |attribute|
+        [attribute, send(attribute)]
+      }]
+
+      defaults = site.frontmatter_defaults.all(relative_path, type)
+      Utils.deep_merge_hashes defaults, Utils.deep_merge_hashes(data, further_data)
+    end
+
+    # The type of a document,
+    #   i.e., its classname downcase'd and to_sym'd.
+    #
+    # Returns the type of self.
+    def type
+      if is_a?(Draft)
+        :drafts
+      elsif is_a?(Post)
+        :posts
+      elsif is_a?(Page)
+        :pages
+      end
+    end
+
+    # Determine whether the document is an asset file.
+    # Asset files include CoffeeScript files and Sass/SCSS files.
+    #
+    # Returns true if the extname belongs to the set of extensions
+    #   that asset files use.
+    def asset_file?
+      sass_file? || coffeescript_file?
+    end
+
+    # Determine whether the document is a Sass file.
+    #
+    # Returns true if extname == .sass or .scss, false otherwise.
+    def sass_file?
+      %w[.sass .scss].include?(ext)
+    end
+
+    # Determine whether the document is a CoffeeScript file.
+    #
+    # Returns true if extname == .coffee, false otherwise.
+    def coffeescript_file?
+      '.coffee'.eql?(ext)
+    end
+
+    # Determine whether the file should be rendered with Liquid.
+    #
+    # Always returns true.
+    def render_with_liquid?
+      true
+    end
+
+    # Determine whether the file should be placed into layouts.
+    #
+    # Returns false if the document is an asset file.
+    def place_in_layout?
+      !asset_file?
+    end
+
+    # Checks if the layout specified in the document actually exists
+    #
+    # layout - the layout to check
+    #
+    # Returns true if the layout is invalid, false if otherwise
+    def invalid_layout?(layout)
+      !data["layout"].nil? && layout.nil? && !(self.is_a? Jekyll::Excerpt)
+    end
+
+    # Recursively render layouts
+    #
+    # layouts - a list of the layouts
+    # payload - the payload for Liquid
+    # info    - the info for Liquid
+    #
+    # Returns nothing
+    def render_all_layouts(layouts, payload, info)
+      # recursively render layouts
+      layout = layouts[data["layout"]]
+
+      Jekyll.logger.warn("Build Warning:", "Layout '#{data["layout"]}' requested in #{path} does not exist.") if invalid_layout? layout
+
+      used = Set.new([layout])
+
+      while layout
+        payload = Utils.deep_merge_hashes(payload, {"content" => output, "page" => layout.data})
+
+        self.output = render_liquid(layout.content,
+                                         payload,
+                                         info,
+                                         File.join(site.config['layouts'], layout.name))
+
+        # Add layout to dependency tree
+        site.regenerator.add_dependency(
+          site.in_source_dir(path),
+          site.in_source_dir(layout.path)
+        )
+
+        if layout = layouts[layout.data["layout"]]
+          if used.include?(layout)
+            layout = nil # avoid recursive chain
+          else
+            used << layout
+          end
+        end
+      end
+    end
+
+    # Add any necessary layouts to this convertible document.
+    #
+    # payload - The site payload Hash.
+    # layouts - A Hash of {"name" => "layout"}.
+    #
+    # Returns nothing.
+    def do_layout(payload, layouts)
+      info = { :filters => [Jekyll::Filters], :registers => { :site => site, :page => payload['page'] } }
+
+      # render and transform content (this becomes the final content of the object)
+      payload["highlighter_prefix"] = converters.first.highlighter_prefix
+      payload["highlighter_suffix"] = converters.first.highlighter_suffix
+
+      self.content = render_liquid(content, payload, info) if render_with_liquid?
+      self.content = transform
+
+      # output keeps track of what will finally be written
+      self.output = content
+
+      render_all_layouts(layouts, payload, info) if place_in_layout?
+    end
+
+    # Write the generated page file to the destination directory.
+    #
+    # dest - The String path to the destination dir.
+    #
+    # Returns nothing.
+    def write(dest)
+      path = destination(dest)
+      FileUtils.mkdir_p(File.dirname(path))
+      File.open(path, 'wb') do |f|
+        f.write(output)
+      end
+    end
+
+    # Accessor for data properties by Liquid.
+    #
+    # property - The String name of the property to retrieve.
+    #
+    # Returns the String value or nil if the property isn't included.
+    def [](property)
+      if self.class::ATTRIBUTES_FOR_LIQUID.include?(property)
+        send(property)
+      else
+        data[property]
+      end
+    end
+  end
+end
+
+module Jekyll
+  class Post
+    include Comparable
+    include Convertible
+
+    # Valid post name regex.
+    MATCHER = /^(.+\/)*(\d+-\d+-\d+)-(.*)(\.[^.]+)$/
+
+    EXCERPT_ATTRIBUTES_FOR_LIQUID = %w[
+      title
+      url
+      dir
+      date
+      id
+      categories
+      next
+      previous
+      tags
+      path
+    ]
+
+    # Attributes for Liquid templates
+    ATTRIBUTES_FOR_LIQUID = EXCERPT_ATTRIBUTES_FOR_LIQUID + %w[
+      content
+      excerpt
+      excerpt_separator
+      draft?
+    ]
+
+    # Post name validator. Post filenames must be like:
+    # 2008-11-05-my-awesome-post.textile
+    #
+    # Returns true if valid, false if not.
+    def self.valid?(name)
+      name =~ MATCHER
+    end
+
+    attr_accessor :site
+    attr_accessor :data, :extracted_excerpt, :content, :output, :ext
+    attr_accessor :date, :slug, :tags, :categories
+
+    attr_reader :name
+
+    # Initialize this Post instance.
+    #
+    # site       - The Site.
+    # base       - The String path to the dir containing the post file.
+    # name       - The String filename of the post file.
+    #
+    # Returns the new Post.
+    def initialize(site, source, dir, name)
+      @site = site
+      @dir = dir
+      @base = containing_dir(dir)
+      @name = name
+
+      self.categories = dir.split('/').reject { |x| x.empty? }
+      process(name)
+      read_yaml(@base, name)
+
+      data.default_proc = proc do |hash, key|
+        site.frontmatter_defaults.find(relative_path, type, key)
+      end
+
+      if data.key?('date')
+        self.date = Utils.parse_date(data["date"].to_s, "Post '#{relative_path}' does not have a valid date in the YAML front matter.")
+      end
+
+      populate_categories
+      populate_tags
+    end
+
+    def published?
+      if data.key?('published') && data['published'] == false
+        false
+      else
+        true
+      end
+    end
+
+    def populate_categories
+      categories_from_data = Utils.pluralized_array_from_hash(data, 'category', 'categories')
+      self.categories = (
+        Array(categories) + categories_from_data
+      ).map { |c| c.to_s }.flatten.uniq
+    end
+
+    def populate_tags
+      self.tags = Utils.pluralized_array_from_hash(data, "tag", "tags").flatten
+    end
+
+    # Get the full path to the directory containing the post files
+    def containing_dir(dir)
+      site.in_source_dir(dir, '_posts')
+    end
+
+    # Read the YAML frontmatter.
+    #
+    # base - The String path to the dir containing the file.
+    # name - The String filename of the file.
+    #
+    # Returns nothing.
+    def read_yaml(base, name)
+      super(base, name)
+      self.extracted_excerpt = extract_excerpt
+    end
+
+    # The post excerpt. This is either a custom excerpt
+    # set in YAML front matter or the result of extract_excerpt.
+    #
+    # Returns excerpt string.
+    def excerpt
+      data.fetch('excerpt') { extracted_excerpt.to_s }
+    end
+
+    # Public: the Post title, from the YAML Front-Matter or from the slug
+    #
+    # Returns the post title
+    def title
+      data.fetch('title') { titleized_slug }
+    end
+
+    # Public: the Post excerpt_separator, from the YAML Front-Matter or site default
+    #         excerpt_separator value
+    #
+    # Returns the post excerpt_separator
+    def excerpt_separator
+      (data['excerpt_separator'] || site.config['excerpt_separator']).to_s
+    end
+
+    # Turns the post slug into a suitable title
+    def titleized_slug
+      slug.split('-').select {|w| w.capitalize! || w }.join(' ')
+    end
+
+    # Public: the path to the post relative to the site source,
+    #         from the YAML Front-Matter or from a combination of
+    #         the directory it's in, "_posts", and the name of the
+    #         post file
+    #
+    # Returns the path to the file relative to the site source
+    def path
+      data.fetch('path') { relative_path.sub(/\A\//, '') }
+    end
+
+    # The path to the post source file, relative to the site source
+    def relative_path
+      File.join(*[@dir, "_posts", @name].map(&:to_s).reject(&:empty?))
+    end
+
+    # Compares Post objects. First compares the Post date. If the dates are
+    # equal, it compares the Post slugs.
+    #
+    # other - The other Post we are comparing to.
+    #
+    # Returns -1, 0, 1
+    def <=>(other)
+      cmp = self.date <=> other.date
+      if 0 == cmp
+       cmp = self.slug <=> other.slug
+      end
+      return cmp
+    end
+
+    # Extract information from the post filename.
+    #
+    # name - The String filename of the post file.
+    #
+    # Returns nothing.
+    def process(name)
+      m, cats, date, slug, ext = *name.match(MATCHER)
+      self.date = Utils.parse_date(date, "Post '#{relative_path}' does not have a valid date in the filename.")
+      self.slug = slug
+      self.ext = ext
+    end
+
+    # The generated directory into which the post will be placed
+    # upon generation. This is derived from the permalink or, if
+    # permalink is absent, set to the default date
+    # e.g. "/2008/11/05/" if the permalink style is :date, otherwise nothing.
+    #
+    # Returns the String directory.
+    def dir
+      File.dirname(url)
+    end
+
+    # The full path and filename of the post. Defined in the YAML of the post
+    # body (optional).
+    #
+    # Returns the String permalink.
+    def permalink
+      data && data['permalink']
+    end
+
+    def template
+      case site.permalink_style
+      when :pretty
+        "/:categories/:year/:month/:day/:title/"
+      when :none
+        "/:categories/:title.html"
+      when :date
+        "/:categories/:year/:month/:day/:title.html"
+      when :ordinal
+        "/:categories/:year/:y_day/:title.html"
+      else
+        site.permalink_style.to_s
+      end
+    end
+
+    # The generated relative url of this post.
+    #
+    # Returns the String url.
+    def url
+      @url ||= URL.new({
+        :template => template,
+        :placeholders => url_placeholders,
+        :permalink => permalink
+      }).to_s
+    end
+
+    # Returns a hash of URL placeholder names (as symbols) mapping to the
+    # desired placeholder replacements. For details see "url.rb"
+    def url_placeholders
+      {
+        :year        => date.strftime("%Y"),
+        :month       => date.strftime("%m"),
+        :day         => date.strftime("%d"),
+        :title       => slug,
+        :i_day       => date.strftime("%-d"),
+        :i_month     => date.strftime("%-m"),
+        :categories  => (categories || []).map { |c| c.to_s.downcase }.uniq.join('/'),
+        :short_month => date.strftime("%b"),
+        :short_year  => date.strftime("%y"),
+        :y_day       => date.strftime("%j"),
+        :output_ext  => output_ext
+      }
+    end
+
+    # The UID for this post (useful in feeds).
+    # e.g. /2008/11/05/my-awesome-post
+    #
+    # Returns the String UID.
+    def id
+      File.join(dir, slug)
+    end
+
+    # Calculate related posts.
+    #
+    # Returns an Array of related Posts.
+    def related_posts(posts)
+      Jekyll::RelatedPosts.new(self).build
+    end
+
+    # Add any necessary layouts to this post.
+    #
+    # layouts      - A Hash of {"name" => "layout"}.
+    # site_payload - The site payload hash.
+    #
+    # Returns nothing.
+    def render(layouts, site_payload)
+      # construct payload
+      payload = Utils.deep_merge_hashes({
+        "site" => { "related_posts" => related_posts(site_payload["site"]["posts"]) },
+        "page" => to_liquid(self.class::EXCERPT_ATTRIBUTES_FOR_LIQUID)
+      }, site_payload)
+
+      if generate_excerpt?
+        extracted_excerpt.do_layout(payload, {})
+      end
+
+      do_layout(payload.merge({"page" => to_liquid}), layouts)
+    end
+
+    # Obtain destination path.
+    #
+    # dest - The String path to the destination dir.
+    #
+    # Returns destination file path String.
+    def destination(dest)
+      # The url needs to be unescaped in order to preserve the correct filename
+      path = site.in_dest_dir(dest, URL.unescape_path(url))
+      path = File.join(path, "index.html") if self.url.end_with?("/")
+      path << output_ext unless path.end_with?(output_ext)
+      path
+    end
+
+    # Returns the shorthand String identifier of this Post.
+    def inspect
+      "<Post: #{id}>"
+    end
+
+    def next
+      pos = site.posts.index {|post| post.equal?(self) }
+      if pos && pos < site.posts.length - 1
+        site.posts[pos + 1]
+      else
+        nil
+      end
+    end
+
+    def previous
+      pos = site.posts.index {|post| post.equal?(self) }
+      if pos && pos > 0
+        site.posts[pos - 1]
+      else
+        nil
+      end
+    end
+
+    # Returns if this Post is a Draft
+    def draft?
+      is_a?(Jekyll::Draft)
+    end
+
+    protected
+
+    def extract_excerpt
+      if generate_excerpt?
+        Jekyll::Excerpt.new(self)
+      else
+        ""
+      end
+    end
+
+    def generate_excerpt?
+      !excerpt_separator.empty?
+    end
+  end
+end
+
+require 'bootstrap-sass/version'
+module Bootstrap
+  class << self
+    # Inspired by Kaminari
+    def load!
+      register_compass_extension if compass?
+
+      if rails?
+        register_rails_engine
+      elsif sprockets?
+        register_sprockets
+      end
+
+      configure_sass
+    end
+
+    # Paths
+    def gem_path
+      @gem_path ||= File.expand_path '..', File.dirname(__FILE__)
+    end
+
+    def stylesheets_path
+      File.join assets_path, 'stylesheets'
+    end
+
+    def fonts_path
+      File.join assets_path, 'fonts'
+    end
+
+    def javascripts_path
+      File.join assets_path, 'javascripts'
+    end
+
+    def assets_path
+      @assets_path ||= File.join gem_path, 'assets'
+    end
+
+    # Environment detection helpers
+    def sprockets?
+      defined?(::Sprockets)
+    end
+
+    def compass?
+      defined?(::Compass)
+    end
+
+    def rails?
+      defined?(::Rails)
+    end
+
+    private
+
+    def configure_sass
+      require 'sass'
+
+      ::Sass.load_paths << stylesheets_path
+
+      # bootstrap requires minimum precision of 8, see https://github.com/twbs/bootstrap-sass/issues/409
+      ::Sass::Script::Number.precision = [8, ::Sass::Script::Number.precision].max
+    end
+
+    def register_compass_extension
+      ::Compass::Frameworks.register(
+          'bootstrap',
+          :version               => Bootstrap::VERSION,
+          :path                  => gem_path,
+          :stylesheets_directory => stylesheets_path,
+          :templates_directory   => File.join(gem_path, 'templates')
+      )
+    end
+
+    def register_rails_engine
+      require 'bootstrap-sass/engine'
+    end
+
+    def register_sprockets
+      Sprockets.append_path(stylesheets_path)
+      Sprockets.append_path(fonts_path)
+      Sprockets.append_path(javascripts_path)
+    end
+  end
+end
+
+Bootstrap.load!
+
+module Bootstrap
+  module Rails
+    class Engine < ::Rails::Engine
+      initializer 'bootstrap-sass.assets.precompile' do |app|
+        %w(stylesheets javascripts fonts images).each do |sub|
+          app.config.assets.paths << root.join('assets', sub).to_s
+        end
+        app.config.assets.precompile << %r(bootstrap/glyphicons-halflings-regular\.(?:eot|svg|ttf|woff2?)$)
+      end
+    end
+  end
+end
+
+module Bootstrap
+  VERSION       = '3.3.3'
+  BOOTSTRAP_SHA = 'bcf7dd38b5ab180256e2e4fb5da0369551b3f082'
+end
+
+require 'timeout'
+require 'nokogiri'
+require 'xpath'
+
+module Capybara
+  class CapybaraError < StandardError; end
+  class DriverNotFoundError < CapybaraError; end
+  class FrozenInTime < CapybaraError; end
+  class ElementNotFound < CapybaraError; end
+  class ModalNotFound < CapybaraError; end
+  class Ambiguous < ElementNotFound; end
+  class ExpectationNotMet < ElementNotFound; end
+  class FileNotFound < CapybaraError; end
+  class UnselectNotAllowed < CapybaraError; end
+  class NotSupportedByDriverError < CapybaraError; end
+  class InfiniteRedirectError < CapybaraError; end
+  class ScopeError < CapybaraError; end
+  class WindowError < CapybaraError; end
+  class ReadOnlyElementError < CapybaraError; end
+
+  class << self
+    attr_accessor :asset_host, :app_host, :run_server, :default_host, :always_include_port
+    attr_accessor :server_port, :exact, :match, :exact_options, :visible_text_only
+    attr_accessor :default_selector, :default_wait_time, :ignore_hidden_elements
+    attr_accessor :save_and_open_page_path, :automatic_reload, :raise_server_errors, :server_errors
+    attr_writer :default_driver, :current_driver, :javascript_driver, :session_name, :server_host
+    attr_accessor :app
+
+    ##
+    #
+    # Configure Capybara to suit your needs.
+    #
+    #     Capybara.configure do |config|
+    #       config.run_server = false
+    #       config.app_host   = 'http://www.google.com'
+    #     end
+    #
+    # === Configurable options
+    #
+    # [app_host = String]                 The default host to use when giving a relative URL to visit
+    # [always_include_port = Boolean]     Whether the Rack server's port should automatically be inserted into every visited URL (Default: false)
+    # [asset_host = String]               Where dynamic assets are hosted - will be prepended to relative asset locations if present (Default: nil)
+    # [run_server = Boolean]              Whether to start a Rack server for the given Rack app (Default: true)
+    # [raise_server_errors = Boolean]     Should errors raised in the server be raised in the tests? (Default: true)
+    # [server_errors = Array\<Class\>]    Error classes that should be raised in the tests if they are raised in the server and Capybara.raise_server_errors is true (Default: [StandardError])
+    # [default_selector = :css/:xpath]    Methods which take a selector use the given type by default (Default: :css)
+    # [default_wait_time = Integer]       The maximumnumber of seconds to wait for asynchronous processes to finish (Default: 2)
+    # [ignore_hidden_elements = Boolean]  Whether to ignore hidden elements on the page (Default: true)
+    # [automatic_reload = Boolean]        Whether to automatically reload elements as Capybara is waiting (Default: true)
+    # [save_and_open_page_path = String]  Where to put pages saved through save_and_open_page (Default: Dir.pwd)
+    #
+    # === DSL Options
+    #
+    # when using capybara/dsl, the following options are also available:
+    #
+    # [default_driver = Symbol]           The name of the driver to use by default. (Default: :rack_test)
+    # [javascript_driver = Symbol]        The name of a driver to use for JavaScript enabled tests. (Default: :selenium)
+    #
+    def configure
+      yield self
+    end
+
+    ##
+    #
+    # Register a new driver for Capybara.
+    #
+    #     Capybara.register_driver :rack_test do |app|
+    #       Capybara::RackTest::Driver.new(app)
+    #     end
+    #
+    # @param [Symbol] name                    The name of the new driver
+    # @yield [app]                            This block takes a rack app and returns a Capybara driver
+    # @yieldparam [<Rack>] app                The rack application that this driver runs agains. May be nil.
+    # @yieldreturn [Capybara::Driver::Base]   A Capybara driver instance
+    #
+    def register_driver(name, &block)
+      drivers[name] = block
+    end
+
+    ##
+    #
+    # Add a new selector to Capybara. Selectors can be used by various methods in Capybara
+    # to find certain elements on the page in a more convenient way. For example adding a
+    # selector to find certain table rows might look like this:
+    #
+    #     Capybara.add_selector(:row) do
+    #       xpath { |num| ".//tbody/tr[#{num}]" }
+    #     end
+    #
+    # This makes it possible to use this selector in a variety of ways:
+    #
+    #     find(:row, 3)
+    #     page.find('table#myTable').find(:row, 3).text
+    #     page.find('table#myTable').has_selector?(:row, 3)
+    #     within(:row, 3) { expect(page).to have_content('$100.000') }
+    #
+    # Here is another example:
+    #
+    #     Capybara.add_selector(:id) do
+    #       xpath { |id| XPath.descendant[XPath.attr(:id) == id.to_s] }
+    #     end
+    #
+    # Note that this particular selector already ships with Capybara.
+    #
+    # @param [Symbol] name    The name of the selector to add
+    # @yield                  A block executed in the context of the new {Capybara::Selector}
+    #
+    def add_selector(name, &block)
+      Capybara::Selector.add(name, &block)
+    end
+
+    def drivers
+      @drivers ||= {}
+    end
+
+    ##
+    #
+    # Register a proc that Capybara will call to run the Rack application.
+    #
+    #     Capybara.server do |app, port|
+    #       require 'rack/handler/mongrel'
+    #       Rack::Handler::Mongrel.run(app, :Port => port)
+    #     end
+    #
+    # By default, Capybara will try to run webrick.
+    #
+    # @yield [app, port]                      This block receives a rack app and port and should run a Rack handler
+    #
+    def server(&block)
+      if block_given?
+        @server = block
+      else
+        @server
+      end
+    end
+
+    ##
+    #
+    # Wraps the given string, which should contain an HTML document or fragment
+    # in a {Capybara::Node::Simple} which exposes all {Capybara::Node::Matchers},
+    # {Capybara::Node::Finders} and {Capybara::Node::DocumentMatchers}. This allows you to query
+    # any string containing HTML in the exact same way you would query the current document in a Capybara
+    # session. For example:
+    #
+    #     node = Capybara.string <<-HTML
+    #       <ul>
+    #         <li id="home">Home</li>
+    #         <li id="projects">Projects</li>
+    #       </ul>
+    #     HTML
+    #
+    #     node.find('#projects').text # => 'Projects'
+    #     node.has_selector?('li#home', :text => 'Home')
+    #     node.has_selector?('#projects')
+    #     node.find('ul').find('li:first-child').text # => 'Home'
+    #
+    # @param [String] html              An html fragment or document
+    # @return [Capybara::Node::Simple]   A node which has Capybara's finders and matchers
+    #
+    def string(html)
+      Capybara::Node::Simple.new(html)
+    end
+
+    ##
+    #
+    # Runs Capybara's default server for the given application and port
+    # under most circumstances you should not have to call this method
+    # manually.
+    #
+    # @param [Rack Application] app    The rack application to run
+    # @param [Fixnum] port              The port to run the application on
+    #
+    def run_default_server(app, port)
+      require 'rack/handler/webrick'
+      Rack::Handler::WEBrick.run(app, :Host => server_host, :Port => port, :AccessLog => [], :Logger => WEBrick::Log::new(nil, 0))
+    end
+
+    ##
+    #
+    # @return [Symbol]    The name of the driver to use by default
+    #
+    def default_driver
+      @default_driver || :rack_test
+    end
+
+    ##
+    #
+    # @return [Symbol]    The name of the driver currently in use
+    #
+    def current_driver
+      @current_driver || default_driver
+    end
+    alias_method :mode, :current_driver
+
+    ##
+    #
+    # @return [Symbol]    The name of the driver used when JavaScript is needed
+    #
+    def javascript_driver
+      @javascript_driver || :selenium
+    end
+
+    ##
+    #
+    # Use the default driver as the current driver
+    #
+    def use_default_driver
+      @current_driver = nil
+    end
+
+    ##
+    #
+    # Yield a block using a specific driver
+    #
+    def using_driver(driver)
+      previous_driver = Capybara.current_driver
+      Capybara.current_driver = driver
+      yield
+    ensure
+      @current_driver = previous_driver
+    end
+
+    ##
+    #
+    # @return [String]    The IP address bound by default server
+    #
+    def server_host
+      @server_host || '127.0.0.1'
+    end
+
+    ##
+    #
+    # Yield a block using a specific wait time
+    #
+    def using_wait_time(seconds)
+      previous_wait_time = Capybara.default_wait_time
+      Capybara.default_wait_time = seconds
+      yield
+    ensure
+      Capybara.default_wait_time = previous_wait_time
+    end
+
+    ##
+    #
+    # The current Capybara::Session based on what is set as Capybara.app and Capybara.current_driver
+    #
+    # @return [Capybara::Session]     The currently used session
+    #
+    def current_session
+      session_pool["#{current_driver}:#{session_name}:#{app.object_id}"] ||= Capybara::Session.new(current_driver, app)
+    end
+
+    ##
+    #
+    # Reset sessions, cleaning out the pool of sessions. This will remove any session information such
+    # as cookies.
+    #
+    def reset_sessions!
+      session_pool.each { |mode, session| session.reset! }
+    end
+    alias_method :reset!, :reset_sessions!
+
+    ##
+    #
+    # The current session name.
+    #
+    # @return [Symbol]    The name of the currently used session.
+    #
+    def session_name
+      @session_name ||= :default
+    end
+
+    ##
+    #
+    # Yield a block using a specific session name.
+    #
+    def using_session(name)
+      self.session_name = name
+      yield
+    ensure
+      self.session_name = :default
+    end
+
+    ##
+    #
+    # Parse raw html into a document using Nokogiri, and adjust textarea contents as defined by the spec.
+    #
+    # @param [String] html              The raw html
+    # @return [Nokogiri::HTML::Document]      HTML document
+    #
+    def HTML(html)
+      Nokogiri::HTML(html).tap do |document|
+        document.xpath('//textarea').each do |textarea|
+          textarea.content=textarea.content.sub(/\A\n/,'')
+        end
+      end
+    end
+
+    def included(base)
+      base.send(:include, Capybara::DSL)
+      warn "`include Capybara` is deprecated. Please use `include Capybara::DSL` instead."
+    end
+
+    def deprecate(method, alternate_method)
+      warn "DEPRECATED: ##{method} is deprecated, please use ##{alternate_method} instead"
+    end
+
+  private
+
+    def session_pool
+      @session_pool ||= {}
+    end
+  end
+
+  self.default_driver = nil
+  self.current_driver = nil
+
+  module Driver; end
+  module RackTest; end
+  module Selenium; end
+
+  require 'capybara/helpers'
+  require 'capybara/session'
+  require 'capybara/dsl'
+  require 'capybara/window'
+  require 'capybara/server'
+  require 'capybara/selector'
+  require 'capybara/result'
+  require 'capybara/version'
+
+  require 'capybara/queries/base_query'
+  require 'capybara/query'
+  require 'capybara/queries/text_query'
+  require 'capybara/queries/title_query'
+
+  require 'capybara/node/finders'
+  require 'capybara/node/matchers'
+  require 'capybara/node/actions'
+  require 'capybara/node/document_matchers'
+  require 'capybara/node/simple'
+  require 'capybara/node/base'
+  require 'capybara/node/element'
+  require 'capybara/node/document'
+
+  require 'capybara/driver/base'
+  require 'capybara/driver/node'
+
+  require 'capybara/rack_test/driver'
+  require 'capybara/rack_test/node'
+  require 'capybara/rack_test/form'
+  require 'capybara/rack_test/browser'
+  require 'capybara/rack_test/css_handlers.rb'
+
+  require 'capybara/selenium/node'
+  require 'capybara/selenium/driver'
+end
+
+Capybara.configure do |config|
+  config.always_include_port = false
+  config.run_server = true
+  config.server {|app, port| Capybara.run_default_server(app, port)}
+  config.default_selector = :css
+  config.default_wait_time = 2
+  config.ignore_hidden_elements = true
+  config.default_host = "http://www.example.com"
+  config.automatic_reload = true
+  config.match = :smart
+  config.exact = false
+  config.raise_server_errors = true
+  config.server_errors = [StandardError]
+  config.visible_text_only = false
+end
+
+Capybara.register_driver :rack_test do |app|
+  Capybara::RackTest::Driver.new(app)
+end
+
+Capybara.register_driver :selenium do |app|
+  Capybara::Selenium::Driver.new(app)
+end
+
+# encoding: UTF-8
+
+module Capybara
+
+  # @api private
+  module Helpers
+    extend self
+
+    ##
+    #
+    # Normalizes whitespace space by stripping leading and trailing
+    # whitespace and replacing sequences of whitespace characters
+    # with a single space.
+    #
+    # @param [String] text     Text to normalize
+    # @return [String]         Normalized text
+    #
+    def normalize_whitespace(text)
+      text.to_s.gsub(/[[:space:]]+/, ' ').strip
+    end
+
+    ##
+    #
+    # Escapes any characters that would have special meaning in a regexp
+    # if text is not a regexp
+    #
+    # @param [String] text Text to escape
+    # @return [String]     Escaped text
+    #
+    def to_regexp(text)
+      text.is_a?(Regexp) ? text : Regexp.new(Regexp.escape(normalize_whitespace(text)))
+    end
+
+    ##
+    #
+    # Injects a `<base>` tag into the given HTML code, pointing to
+    # `Capybara.asset_host`.
+    #
+    # @param [String] html     HTML code to inject into
+    # @return [String]         The modified HTML code
+    #
+    def inject_asset_host(html)
+      if Capybara.asset_host && Nokogiri::HTML(html).css("base").empty?
+        match = html.match(/<head[^<]*?>/)
+        html.clone.insert match.end(0), "<base href='#{Capybara.asset_host}' />"
+      else
+        html
+      end
+    end
+
+    ##
+    #
+    # Checks if the given count matches the given count options.
+    # Defaults to true if no options are specified. If multiple
+    # options are provided, it tests that all conditions are met;
+    # however, if :count is supplied, all other options are ignored.
+    #
+    # @param [Integer] count     The actual number. Should be coercible via Integer()
+    # @option [Range] between    Count must be within the given range
+    # @option [Integer] count    Count must be exactly this
+    # @option [Integer] maximum  Count must be smaller than or equal to this value
+    # @option [Integer] minimum  Count must be larger than or equal to this value
+    #
+    def matches_count?(count, options={})
+      return (Integer(options[:count]) == count)     if options[:count]
+      return false if options[:maximum] && (Integer(options[:maximum]) < count)
+      return false if options[:minimum] && (Integer(options[:minimum]) > count)
+      return false if options[:between] && !(options[:between] === count)
+      return true
+    end
+
+    ##
+    #
+    # Checks if a count of 0 is valid for the given options hash.
+    # Returns false if options hash does not specify any count options.
+    #
+    def expects_none?(options={})
+      if [:count, :maximum, :minimum, :between].any? { |k| options.has_key? k }
+        matches_count?(0,options)
+      else
+        false
+      end
+    end
+
+    ##
+    #
+    # Generates a failure message given a description of the query and count
+    # options.
+    #
+    # @param [String] description   Description of a query
+    # @option [Range] between       Count should have been within the given range
+    # @option [Integer] count       Count should have been exactly this
+    # @option [Integer] maximum     Count should have been smaller than or equal to this value
+    # @option [Integer] minimum     Count should have been larger than or equal to this value
+    #
+    def failure_message(description, options={})
+      message = "expected to find #{description}"
+      if options[:count]
+        message << " #{options[:count]} #{declension('time', 'times', options[:count])}"
+      elsif options[:between]
+        message << " between #{options[:between].first} and #{options[:between].last} times"
+      elsif options[:maximum]
+        message << " at most #{options[:maximum]} #{declension('time', 'times', options[:maximum])}"
+      elsif options[:minimum]
+        message << " at least #{options[:minimum]} #{declension('time', 'times', options[:minimum])}"
+      end
+      message
+    end
+
+    ##
+    #
+    # A poor man's `pluralize`. Given two declensions, one singular and one
+    # plural, as well as a count, this will pick the correct declension. This
+    # way we can generate grammatically correct error message.
+    #
+    # @param [String] singular     The singular form of the word
+    # @param [String] plural       The plural form of the word
+    # @param [Integer] count       The number of items
+    #
+    def declension(singular, plural, count)
+      if count == 1
+        singular
+      else
+        plural
+      end
+    end
+  end
+end
+
+require "uri"
+
+class Capybara::Selenium::Driver < Capybara::Driver::Base
+  DEFAULT_OPTIONS = {
+    :browser => :firefox
+  }
+  SPECIAL_OPTIONS = [:browser]
+
+  attr_reader :app, :options
+
+  def browser
+    unless @browser
+      @browser = Selenium::WebDriver.for(options[:browser], options.reject { |key,val| SPECIAL_OPTIONS.include?(key) })
+
+      main = Process.pid
+      at_exit do
+        # Store the exit status of the test run since it goes away after calling the at_exit proc...
+        @exit_status = $!.status if $!.is_a?(SystemExit)
+        quit if Process.pid == main
+        exit @exit_status if @exit_status # Force exit with stored status
+      end
+    end
+    @browser
+  end
+
+  def initialize(app, options={})
+    begin
+      require 'selenium-webdriver'
+    rescue LoadError => e
+      if e.message =~ /selenium-webdriver/
+        raise LoadError, "Capybara's selenium driver is unable to load `selenium-webdriver`, please install the gem and add `gem 'selenium-webdriver'` to your Gemfile if you are using bundler."
+      else
+        raise e
+      end
+    end
+
+    @app = app
+    @browser = nil
+    @exit_status = nil
+    @frame_handles = {}
+    @options = DEFAULT_OPTIONS.merge(options)
+  end
+
+  def visit(path)
+    browser.navigate.to(path)
+  end
+
+  def go_back
+    browser.navigate.back
+  end
+
+  def go_forward
+    browser.navigate.forward
+  end
+
+  def html
+    browser.page_source
+  end
+
+  def title
+    browser.title
+  end
+
+  def current_url
+    browser.current_url
+  end
+
+  def find_xpath(selector)
+    browser.find_elements(:xpath, selector).map { |node| Capybara::Selenium::Node.new(self, node) }
+  end
+
+  def find_css(selector)
+    browser.find_elements(:css, selector).map { |node| Capybara::Selenium::Node.new(self, node) }
+  end
+
+  def wait?; true; end
+  def needs_server?; true; end
+
+  def execute_script(script)
+    browser.execute_script script
+  end
+
+  def evaluate_script(script)
+    browser.execute_script "return #{script}"
+  end
+
+  def save_screenshot(path, options={})
+    browser.save_screenshot(path)
+  end
+
+  def reset!
+    # Use instance variable directly so we avoid starting the browser just to reset the session
+    if @browser
+      begin
+        begin @browser.manage.delete_all_cookies
+        rescue Selenium::WebDriver::Error::UnhandledError
+          # delete_all_cookies fails when we've previously gone
+          # to about:blank, so we rescue this error and do nothing
+          # instead.
+        end
+        @browser.navigate.to("about:blank")
+      rescue Selenium::WebDriver::Error::UnhandledAlertError
+        # This error is thrown if an unhandled alert is on the page
+        # Firefox appears to automatically dismiss this alert, chrome does not
+        # We'll try to accept it
+        begin
+          @browser.switch_to.alert.accept
+        rescue Selenium::WebDriver::Error::NoAlertPresentError
+          # The alert is now gone - nothing to do
+        end
+        # try cleaning up the browser again
+        retry
+      end
+    end
+  end
+
+  ##
+  #
+  # Webdriver supports frame name, id, index(zero-based) or {Capybara::Node::Element} to find iframe
+  #
+  # @overload within_frame(index)
+  #   @param [Integer] index                 index of a frame
+  # @overload within_frame(name_or_id)
+  #   @param [String] name_or_id             name or id of a frame
+  # @overload within_frame(element)
+  #   @param [Capybara::Node::Base] a_node   frame element
+  #
+  def within_frame(frame_handle)
+    frame_handle = frame_handle.native if frame_handle.is_a?(Capybara::Node::Base)
+    if !browser.switch_to.respond_to?(:parent_frame)
+      # Selenium Webdriver < 2.43 doesnt support moving back to the parent
+      @frame_handles[browser.window_handle] ||= []
+      @frame_handles[browser.window_handle] << frame_handle
+    end
+    browser.switch_to.frame(frame_handle)
+    yield
+  ensure
+    if browser.switch_to.respond_to?(:parent_frame)
+      browser.switch_to.parent_frame
+    else
+      # There doesnt appear to be any way in Selenium Webdriver < 2.43 to move back to a parent frame
+      # other than going back to the root and then reiterating down
+      @frame_handles[browser.window_handle].pop
+      browser.switch_to.default_content
+      @frame_handles[browser.window_handle].each { |fh| browser.switch_to.frame(fh) }
+    end
+  end
+
+  def current_window_handle
+    browser.window_handle
+  end
+
+  def window_size(handle)
+    within_given_window(handle) do
+      size = browser.manage.window.size
+      [size.width, size.height]
+    end
+  end
+
+  def resize_window_to(handle, width, height)
+    within_given_window(handle) do
+      browser.manage.window.resize_to(width, height)
+    end
+  end
+
+  def maximize_window(handle)
+    within_given_window(handle) do
+      browser.manage.window.maximize
+    end
+    sleep 0.1 # work around for https://code.google.com/p/selenium/issues/detail?id=7405
+  end
+
+  def close_window(handle)
+    within_given_window(handle) do
+      browser.close
+    end
+  end
+
+  def window_handles
+    browser.window_handles
+  end
+
+  def open_new_window
+    browser.execute_script('window.open();')
+  end
+
+  def switch_to_window(handle)
+    browser.switch_to.window handle
+  end
+
+  # @api private
+  def find_window(locator)
+    handles = browser.window_handles
+    return locator if handles.include? locator
+
+    original_handle = browser.window_handle
+    handles.each do |handle|
+      switch_to_window(handle)
+      if (locator == browser.execute_script("return window.name") ||
+          browser.title.include?(locator) ||
+          browser.current_url.include?(locator))
+        switch_to_window(original_handle)
+        return handle
+      end
+    end
+    raise Capybara::ElementNotFound, "Could not find a window identified by #{locator}"
+  end
+
+  def within_window(locator)
+    handle = find_window(locator)
+    browser.switch_to.window(handle) { yield }
+  end
+
+  def accept_modal(type, options={}, &blk)
+    yield if block_given?
+    modal = find_modal(options)
+    modal.send_keys options[:with] if options[:with]
+    message = modal.text
+    modal.accept
+    message
+  end
+
+  def dismiss_modal(type, options={}, &blk)
+    yield if block_given?
+    modal = find_modal(options)
+    message = modal.text
+    modal.dismiss
+    message
+  end
+
+  def quit
+    @browser.quit if @browser
+  rescue Errno::ECONNREFUSED
+    # Browser must have already gone
+  ensure
+    @browser = nil
+  end
+
+  def invalid_element_errors
+    [Selenium::WebDriver::Error::StaleElementReferenceError, Selenium::WebDriver::Error::UnhandledError, Selenium::WebDriver::Error::ElementNotVisibleError]
+  end
+
+  def no_such_window_error
+    Selenium::WebDriver::Error::NoSuchWindowError
+  end
+
+  def browser_initialized?
+    !@browser.nil?
+  end
+
+  private
+
+  def within_given_window(handle)
+    original_handle = self.current_window_handle
+    if handle == original_handle
+      yield
+    else
+      switch_to_window(handle)
+      result = yield
+      switch_to_window(original_handle)
+      result
+    end
+  end
+
+  def find_modal(options={})
+    # Selenium has its own built in wait (2 seconds)for a modal to show up, so this wait is really the minimum time
+    # Actual wait time may be longer than specified
+    wait = Selenium::WebDriver::Wait.new(
+      timeout: (options[:wait] || Capybara.default_wait_time),
+      ignore: Selenium::WebDriver::Error::NoAlertPresentError)
+    begin
+      wait.until do
+        alert = @browser.switch_to.alert
+        regexp = options[:text].is_a?(Regexp) ? options[:text] : Regexp.escape(options[:text].to_s)
+        alert.text.match(regexp) ? alert : nil
+      end
+    rescue Selenium::WebDriver::Error::TimeOutError
+      raise Capybara::ModalNotFound.new("Unable to find modal dialog#{" with #{options[:text]}" if options[:text]}")
+    end
+  end
+
+end
+
+require 'logger'
+require 'rack'
+require 'rack/mount'
+require 'rack/builder'
+require 'rack/accept'
+require 'rack/auth/basic'
+require 'rack/auth/digest/md5'
+require 'hashie'
+require 'set'
+require 'active_support/version'
+require 'active_support/core_ext/hash/indifferent_access'
+
+if ActiveSupport::VERSION::MAJOR >= 4
+  require 'active_support/core_ext/object/deep_dup'
+else
+  require_relative 'backports/active_support/deep_dup'
+end
+
+require 'active_support/ordered_hash'
+require 'active_support/core_ext/object/conversions'
+require 'active_support/core_ext/array/extract_options'
+require 'active_support/core_ext/hash/deep_merge'
+require 'grape/util/content_types'
+require 'multi_json'
+require 'multi_xml'
+require 'virtus'
+require 'i18n'
+require 'thread'
+
+I18n.load_path << File.expand_path('../grape/locale/en.yml', __FILE__)
+
+module Grape
+  autoload :API,                 'grape/api'
+  autoload :Endpoint,            'grape/endpoint'
+
+  autoload :Route,               'grape/route'
+  autoload :Namespace,           'grape/namespace'
+
+  autoload :Path,                'grape/path'
+
+  autoload :Cookies,             'grape/cookies'
+  autoload :Validations,         'grape/validations'
+  autoload :Request,             'grape/http/request'
+
+  module Exceptions
+    autoload :Base,                           'grape/exceptions/base'
+    autoload :Validation,                     'grape/exceptions/validation'
+    autoload :ValidationErrors,               'grape/exceptions/validation_errors'
+    autoload :MissingVendorOption,            'grape/exceptions/missing_vendor_option'
+    autoload :MissingMimeType,                'grape/exceptions/missing_mime_type'
+    autoload :MissingOption,                  'grape/exceptions/missing_option'
+    autoload :InvalidFormatter,               'grape/exceptions/invalid_formatter'
+    autoload :InvalidVersionerOption,         'grape/exceptions/invalid_versioner_option'
+    autoload :UnknownValidator,               'grape/exceptions/unknown_validator'
+    autoload :UnknownOptions,                 'grape/exceptions/unknown_options'
+    autoload :InvalidWithOptionForRepresent,  'grape/exceptions/invalid_with_option_for_represent'
+    autoload :IncompatibleOptionValues,       'grape/exceptions/incompatible_option_values'
+    autoload :MissingGroupTypeError,          'grape/exceptions/missing_group_type'
+    autoload :UnsupportedGroupTypeError,      'grape/exceptions/unsupported_group_type'
+    autoload :InvalidMessageBody,             'grape/exceptions/invalid_message_body'
+    autoload :InvalidAcceptHeader,            'grape/exceptions/invalid_accept_header'
+  end
+
+  module ErrorFormatter
+    autoload :Base,              'grape/error_formatter/base'
+    autoload :Json,              'grape/error_formatter/json'
+    autoload :Txt,               'grape/error_formatter/txt'
+    autoload :Xml,               'grape/error_formatter/xml'
+  end
+
+  module Formatter
+    autoload :Base,              'grape/formatter/base'
+    autoload :Json,              'grape/formatter/json'
+    autoload :SerializableHash,  'grape/formatter/serializable_hash'
+    autoload :Txt,               'grape/formatter/txt'
+    autoload :Xml,               'grape/formatter/xml'
+  end
+
+  module Parser
+    autoload :Base,              'grape/parser/base'
+    autoload :Json,              'grape/parser/json'
+    autoload :Xml,               'grape/parser/xml'
+  end
+
+  module Middleware
+    autoload :Base,              'grape/middleware/base'
+    autoload :Versioner,         'grape/middleware/versioner'
+    autoload :Formatter,         'grape/middleware/formatter'
+    autoload :Error,             'grape/middleware/error'
+
+    module Auth
+      autoload :Base,            'grape/middleware/auth/base'
+      autoload :DSL,             'grape/middleware/auth/dsl'
+      autoload :StrategyInfo,    'grape/middleware/auth/strategy_info'
+      autoload :Strategies,      'grape/middleware/auth/strategies'
+    end
+
+    module Versioner
+      autoload :Path,                 'grape/middleware/versioner/path'
+      autoload :Header,               'grape/middleware/versioner/header'
+      autoload :Param,                'grape/middleware/versioner/param'
+      autoload :AcceptVersionHeader,  'grape/middleware/versioner/accept_version_header'
+    end
+  end
+
+  module Util
+    autoload :InheritableValues, 'grape/util/inheritable_values'
+    autoload :StackableValues,   'grape/util/stackable_values'
+    autoload :InheritableSetting, 'grape/util/inheritable_setting'
+    autoload :StrictHashConfiguration, 'grape/util/strict_hash_configuration'
+  end
+
+  module DSL
+    autoload :API,               'grape/dsl/api'
+    autoload :Callbacks,         'grape/dsl/callbacks'
+    autoload :Settings,          'grape/dsl/settings'
+    autoload :Configuration,     'grape/dsl/configuration'
+    autoload :InsideRoute,       'grape/dsl/inside_route'
+    autoload :Helpers,           'grape/dsl/helpers'
+    autoload :Middleware,        'grape/dsl/middleware'
+    autoload :Parameters,        'grape/dsl/parameters'
+    autoload :RequestResponse,   'grape/dsl/request_response'
+    autoload :Routing,           'grape/dsl/routing'
+    autoload :Validations,       'grape/dsl/validations'
+  end
+
+  class API
+    autoload :Helpers,           'grape/api/helpers'
+  end
+end
+
+require 'grape/validations/validators/base'
+require 'grape/validations/attributes_iterator'
+require 'grape/validations/validators/allow_blank'
+require 'grape/validations/validators/at_least_one_of'
+require 'grape/validations/validators/coerce'
+require 'grape/validations/validators/default'
+require 'grape/validations/validators/exactly_one_of'
+require 'grape/validations/validators/mutual_exclusion'
+require 'grape/validations/validators/presence'
+require 'grape/validations/validators/regexp'
+require 'grape/validations/validators/values'
+require 'grape/validations/params_scope'
+require 'grape/validations/validators/all_or_none'
+
+require 'grape/version'
+
+module Grape
+  # The API class is the primary entry point for
+  # creating Grape APIs.Users should subclass this
+  # class in order to build an API.
+  class API
+    include Grape::DSL::API
+
+    class << self
+      attr_reader :instance
+      LOCK = Mutex.new
+
+      def reset!
+        @route_set = Rack::Mount::RouteSet.new
+        @endpoints = []
+        @routes = nil
+        reset_validations!
+      end
+
+      def compile
+        @instance ||= new
+      end
+
+      def change!
+        @instance = nil
+      end
+
+      def call(env)
+        LOCK.synchronize { compile } unless instance
+        call!(env)
+      end
+
+      def call!(env)
+        instance.call(env)
+      end
+
+      # Create a scope without affecting the URL.
+      #
+      # @param name [Symbol] Purely placebo, just allows to name the scope to make the code more readable.
+      def scope(name = nil, &block)
+        within_namespace do
+          nest(block)
+        end
+      end
+
+      def cascade(value = nil)
+        if value.nil?
+          inheritable_setting.namespace_inheritable.keys.include?(:cascade) ? !!namespace_inheritable(:cascade) : true
+        else
+          namespace_inheritable(:cascade, value)
+        end
+      end
+
+      protected
+
+      def prepare_routes
+        endpoints.map(&:routes).flatten
+      end
+
+      # Execute first the provided block, then each of the
+      # block passed in. Allows for simple 'before' setups
+      # of settings stack pushes.
+      def nest(*blocks, &block)
+        blocks.reject!(&:nil?)
+        if blocks.any?
+          instance_eval(&block) if block_given?
+          blocks.each { |b| instance_eval(&b) }
+          reset_validations!
+        else
+          instance_eval(&block)
+        end
+      end
+
+      def inherited(subclass)
+        subclass.reset!
+        subclass.logger = logger.clone
+      end
+
+      def inherit_settings(other_settings)
+        top_level_setting.inherit_from other_settings.point_in_time_copy
+
+        endpoints.each(&:reset_routes!)
+
+        @routes = nil
+      end
+    end
+
+    def initialize
+      @route_set = Rack::Mount::RouteSet.new
+      add_head_not_allowed_methods_and_options_methods
+      self.class.endpoints.each do |endpoint|
+        endpoint.mount_in(@route_set)
+      end
+
+      @route_set.freeze
+    end
+
+    def call(env)
+      status, headers, body = @route_set.call(env)
+      headers.delete('X-Cascade') unless cascade?
+      [status, headers, body]
+    end
+
+    # Some requests may return a HTTP 404 error if grape cannot find a matching
+    # route. In this case, Rack::Mount adds a X-Cascade header to the response
+    # and sets it to 'pass', indicating to grape's parents they should keep
+    # looking for a matching route on other resources.
+    #
+    # In some applications (e.g. mounting grape on rails), one might need to trap
+    # errors from reaching upstream. This is effectivelly done by unsetting
+    # X-Cascade. Default :cascade is true.
+    def cascade?
+      return !!self.class.namespace_inheritable(:cascade) if self.class.inheritable_setting.namespace_inheritable.keys.include?(:cascade)
+      return !!self.class.namespace_inheritable(:version_options)[:cascade] if self.class.namespace_inheritable(:version_options) && self.class.namespace_inheritable(:version_options).key?(:cascade)
+      true
+    end
+
+    reset!
+
+    private
+
+    # For every resource add a 'OPTIONS' route that returns an HTTP 204 response
+    # with a list of HTTP methods that can be called. Also add a route that
+    # will return an HTTP 405 response for any HTTP method that the resource
+    # cannot handle.
+    def add_head_not_allowed_methods_and_options_methods
+      methods_per_path = {}
+
+      self.class.endpoints.each do |endpoint|
+        routes = endpoint.routes
+        routes.each do |route|
+          methods_per_path[route.route_path] ||= []
+          methods_per_path[route.route_path] << route.route_method
+        end
+      end
+
+      # The paths we collected are prepared (cf. Path#prepare), so they
+      # contain already versioning information when using path versioning.
+      # Disable versioning so adding a route won't prepend versioning
+      # informations again.
+      without_root_prefix do
+        without_versioning do
+          methods_per_path.each do |path, methods|
+            allowed_methods = methods.dup
+            unless self.class.namespace_inheritable(:do_not_route_head)
+              allowed_methods |= ['HEAD'] if allowed_methods.include?('GET')
+            end
+
+            allow_header = (['OPTIONS'] | allowed_methods).join(', ')
+            unless self.class.namespace_inheritable(:do_not_route_options)
+              unless allowed_methods.include?('OPTIONS')
+                self.class.options(path, {}) do
+                  header 'Allow', allow_header
+                  status 204
+                  ''
+                end
+              end
+            end
+
+            not_allowed_methods = %w(GET PUT POST DELETE PATCH HEAD) - allowed_methods
+            not_allowed_methods << 'OPTIONS' if self.class.namespace_inheritable(:do_not_route_options)
+            self.class.route(not_allowed_methods, path) do
+              header 'Allow', allow_header
+              status 405
+              ''
+            end
+          end
+        end
+      end
+    end
+
+    def without_versioning(&block)
+      old_version = self.class.namespace_inheritable(:version)
+      old_version_options = self.class.namespace_inheritable(:version_options)
+
+      self.class.namespace_inheritable_to_nil(:version)
+      self.class.namespace_inheritable_to_nil(:version_options)
+
+      yield
+
+      self.class.namespace_inheritable(:version, old_version)
+      self.class.namespace_inheritable(:version_options, old_version_options)
+    end
+
+    def without_root_prefix(&block)
+      old_prefix = self.class.namespace_inheritable(:root_prefix)
+
+      self.class.namespace_inheritable_to_nil(:root_prefix)
+
+      yield
+
+      self.class.namespace_inheritable(:root_prefix, old_prefix)
+    end
+  end
+end
+
+require 'grape/middleware/base'
+
+module Grape
+  module Middleware
+    class Formatter < Base
+      def default_options
+        {
+          default_format: :txt,
+          formatters: {},
+          parsers: {}
+        }
+      end
+
+      def headers
+        env.dup.inject({}) do |h, (k, v)|
+          h[k.to_s.downcase[5..-1]] = v if k.to_s.downcase.start_with?('http_')
+          h
+        end
+      end
+
+      def before
+        negotiate_content_type
+        read_body_input
+      end
+
+      def after
+        status, headers, bodies = *@app_response
+        # allow content-type to be explicitly overwritten
+        api_format = mime_types[headers['Content-Type']] || env['api.format']
+        formatter = Grape::Formatter::Base.formatter_for api_format, options
+        begin
+          bodymap = bodies.collect do |body|
+            formatter.call body, env
+          end
+        rescue Grape::Exceptions::InvalidFormatter => e
+          throw :error, status: 500, message: e.message
+        end
+        headers['Content-Type'] = content_type_for(env['api.format']) unless headers['Content-Type']
+        Rack::Response.new(bodymap, status, headers).to_a
+      end
+
+      private
+
+      def request
+        @request ||= Rack::Request.new(env)
+      end
+
+      # store read input in env['api.request.input']
+      def read_body_input
+        if (request.post? || request.put? || request.patch? || request.delete?) &&
+           (!request.form_data? || !request.media_type) &&
+           (!request.parseable_data?) &&
+           (request.content_length.to_i > 0 || request.env['HTTP_TRANSFER_ENCODING'] == 'chunked')
+
+          if (input = env['rack.input'])
+            input.rewind
+            body = env['api.request.input'] = input.read
+            begin
+              read_rack_input(body) if body && body.length > 0
+            ensure
+              input.rewind
+            end
+          end
+        end
+      end
+
+      # store parsed input in env['api.request.body']
+      def read_rack_input(body)
+        fmt = mime_types[request.media_type] if request.media_type
+        fmt ||= options[:default_format]
+        if content_type_for(fmt)
+          parser = Grape::Parser::Base.parser_for fmt, options
+          if parser
+            begin
+              body = (env['api.request.body'] = parser.call(body, env))
+              if body.is_a?(Hash)
+                if env['rack.request.form_hash']
+                  env['rack.request.form_hash'] = env['rack.request.form_hash'].merge(body)
+                else
+                  env['rack.request.form_hash'] = body
+                end
+                env['rack.request.form_input'] = env['rack.input']
+              end
+            rescue Grape::Exceptions::Base => e
+              raise e
+            rescue StandardError => e
+              throw :error, status: 400, message: e.message
+            end
+          else
+            env['api.request.body'] = body
+          end
+        else
+          throw :error, status: 406, message: "The requested content-type '#{request.media_type}' is not supported."
+        end
+      end
+
+      def negotiate_content_type
+        fmt = format_from_extension || format_from_params || options[:format] || format_from_header || options[:default_format]
+        if content_type_for(fmt)
+          env['api.format'] = fmt
+        else
+          throw :error, status: 406, message: "The requested format '#{fmt}' is not supported."
+        end
+      end
+
+      def format_from_extension
+        parts = request.path.split('.')
+
+        if parts.size > 1
+          extension = parts.last
+          # avoid symbol memory leak on an unknown format
+          return extension.to_sym if content_type_for(extension)
+        end
+        nil
+      end
+
+      def format_from_params
+        fmt = Rack::Utils.parse_nested_query(env['QUERY_STRING'])['format']
+        # avoid symbol memory leak on an unknown format
+        return fmt.to_sym if content_type_for(fmt)
+        fmt
+      end
+
+      def format_from_header
+        mime_array.each do |t|
+          return mime_types[t] if mime_types.key?(t)
+        end
+        nil
+      end
+
+      def mime_array
+        accept = headers['accept']
+        return [] unless accept
+
+        accept_into_mime_and_quality = %r{
+          (
+            \w+/[\w+.-]+)     # eg application/vnd.example.myformat+xml
+          (?:
+           (?:;[^,]*?)?       # optionally multiple formats in a row
+           ;\s*q=([\d.]+)     # optional "quality" preference (eg q=0.5)
+          )?
+        }x
+
+        vendor_prefix_pattern = /vnd\.[^+]+\+/
+
+        accept.scan(accept_into_mime_and_quality)
+          .sort_by { |_, quality_preference| -quality_preference.to_f }
+          .map { |mime, _| mime.sub(vendor_prefix_pattern, '') }
+      end
+    end
+  end
+end
+
+module Grape
+  module Middleware
+    class Base
+      attr_reader :app, :env, :options
+
+      # @param [Rack Application] app The standard argument for a Rack middleware.
+      # @param [Hash] options A hash of options, simply stored for use by subclasses.
+      def initialize(app, options = {})
+        @app = app
+        @options = default_options.merge(options)
+      end
+
+      def default_options
+        {}
+      end
+
+      def call(env)
+        dup.call!(env)
+      end
+
+      def call!(env)
+        @env = env
+        before
+        @app_response = @app.call(@env)
+        after || @app_response
+      end
+
+      # @abstract
+      # Called before the application is called in the middleware lifecycle.
+      def before
+      end
+
+      # @abstract
+      # Called after the application is called in the middleware lifecycle.
+      # @return [Response, nil] a Rack SPEC response or nil to call the application afterwards.
+      def after
+      end
+
+      def response
+        Rack::Response.new(@app_response[2], @app_response[0], @app_response[1])
+      end
+
+      def content_type_for(format)
+        HashWithIndifferentAccess.new(content_types)[format]
+      end
+
+      def content_types
+        ContentTypes.content_types_for(options[:content_types])
+      end
+
+      def content_type
+        content_type_for(env['api.format'] || options[:format]) || 'text/html'
+      end
+
+      def mime_types
+        content_types.each_with_object({}) do |(k, v), types_without_params|
+          types_without_params[k] = v.split(';').first
+        end.invert
+      end
+    end
+  end
+end
+
+module CanCan
+
+  #   class Ability
+  #     include CanCan::Ability
+  #
+  #     def initialize(user)
+  #       if user.admin?
+  #         can :manage, :all
+  #       else
+  #         can :read, :all
+  #       end
+  #     end
+  #   end
+  #
+  module Ability
+    # Check if the user has permission to perform a given action on an object.
+    # This makes testing a user's abilities very easy.
+    #
+    #   def test "user can only destroy projects which he owns"
+    #     user = User.new
+    #     ability = Ability.new(user)
+    #     assert ability.can?(:destroy, Project.new(:user => user))
+    #     assert ability.cannot?(:destroy, Project.new)
+    #   end
+    #
+    # Also see the RSpec Matchers to aid in testing.
+    def can?(action, subject, *extra_args)
+      match = relevant_rules_for_match(action, subject).detect do |rule|
+        rule.matches_conditions?(action, subject, extra_args)
+      end
+      match ? match.base_behavior : false
+    end
+
+    # Convenience method which works the same as "can?" but returns the opposite value.
+    #
+    #   cannot? :destroy, @project
+    #
+    def cannot?(*args)
+      !can?(*args)
+    end
+
+    # If you pass no arguments to +can+, the action, class, and object will be passed to the block and the
+    # block will always be executed. This allows you to override the full behavior if the permissions are
+    # defined in an external source such as the database.
+    #
+    #   can do |action, object_class, object|
+    #     # check the database and return true/false
+    #   end
+    #
+    def can(action = nil, subject = nil, conditions = nil, &block)
+      rules << Rule.new(true, action, subject, conditions, block)
+    end
+
+    # Defines an ability which cannot be done. Accepts the same arguments as "can".
+    #   cannot :read, Product do |product|
+    #     product.invisible?
+    #   end
+    #
+    def cannot(action = nil, subject = nil, conditions = nil, &block)
+      rules << Rule.new(false, action, subject, conditions, block)
+    end
+
+    # Alias one or more actions into another one.
+    #
+    # This way one can use params[:action] in the controller to determine the permission.
+    def alias_action(*args)
+      target = args.pop[:to]
+      validate_target(target)
+      aliased_actions[target] ||= []
+      aliased_actions[target] += args
+    end
+
+    # User shouldn't specify targets with names of real actions or it will cause Seg fault
+    def validate_target(target)
+      raise Error, "You can't specify target (#{target}) as alias because it is real action name" if aliased_actions.values.flatten.include? target
+    end
+
+    # Returns a hash of aliased actions. The key is the target and the value is an array of actions aliasing the key.
+    def aliased_actions
+      @aliased_actions ||= default_alias_actions
+    end
+
+    # Removes previously aliased actions including the defaults.
+    def clear_aliased_actions
+      @aliased_actions = {}
+    end
+
+    def model_adapter(model_class, action)
+      adapter_class = ModelAdapters::AbstractAdapter.adapter_class(model_class)
+      adapter_class.new(model_class, relevant_rules_for_query(action, model_class))
+    end
+
+    # See ControllerAdditions#authorize! for documentation.
+    def authorize!(action, subject, *args)
+      message = nil
+      if args.last.kind_of?(Hash) && args.last.has_key?(:message)
+        message = args.pop[:message]
+      end
+      if cannot?(action, subject, *args)
+        message ||= unauthorized_message(action, subject)
+        raise AccessDenied.new(message, action, subject)
+      end
+      subject
+    end
+
+    def unauthorized_message(action, subject)
+      keys = unauthorized_message_keys(action, subject)
+      variables = {:action => action.to_s}
+      variables[:subject] = (subject.class == Class ? subject : subject.class).to_s.underscore.humanize.downcase
+      message = I18n.translate(nil, variables.merge(:scope => :unauthorized, :default => keys + [""]))
+      message.blank? ? nil : message
+    end
+
+    def attributes_for(action, subject)
+      attributes = {}
+      relevant_rules(action, subject).map do |rule|
+        attributes.merge!(rule.attributes_from_conditions) if rule.base_behavior
+      end
+      attributes
+    end
+
+    def has_block?(action, subject)
+      relevant_rules(action, subject).any?(&:only_block?)
+    end
+
+    def has_raw_sql?(action, subject)
+      relevant_rules(action, subject).any?(&:only_raw_sql?)
+    end
+
+    def merge(ability)
+      ability.send(:rules).each do |rule|
+        rules << rule.dup
+      end
+      self
+    end
+
+    private
+
+    def unauthorized_message_keys(action, subject)
+      subject = (subject.class == Class ? subject : subject.class).name.underscore unless subject.kind_of? Symbol
+      [subject, :all].map do |try_subject|
+        [aliases_for_action(action), :manage].flatten.map do |try_action|
+          :"#{try_action}.#{try_subject}"
+        end
+      end.flatten
+    end
+
+    # Accepts an array of actions and returns an array of actions which match.
+    # This should be called before "matches?" and other checking methods since they
+    # rely on the actions to be expanded.
+    def expand_actions(actions)
+      actions.map do |action|
+        aliased_actions[action] ? [action, *expand_actions(aliased_actions[action])] : action
+      end.flatten
+    end
+
+    # Given an action, it will try to find all of the actions which are aliased to it.
+    # This does the opposite kind of lookup as expand_actions.
+    def aliases_for_action(action)
+      results = [action]
+      aliased_actions.each do |aliased_action, actions|
+        results += aliases_for_action(aliased_action) if actions.include? action
+      end
+      results
+    end
+
+    def rules
+      @rules ||= []
+    end
+
+    # Returns an array of Rule instances which match the action and subject
+    # This does not take into consideration any hash conditions or block statements
+    def relevant_rules(action, subject)
+      rules.reverse.select do |rule|
+        rule.expanded_actions = expand_actions(rule.actions)
+        rule.relevant? action, subject
+      end
+    end
+
+    def relevant_rules_for_match(action, subject)
+      relevant_rules(action, subject).each do |rule|
+        if rule.only_raw_sql?
+          raise Error, "The can? and cannot? call cannot be used with a raw sql 'can' definition. The checking code cannot be determined for #{action.inspect} #{subject.inspect}"
+        end
+      end
+    end
+
+    def relevant_rules_for_query(action, subject)
+      relevant_rules(action, subject).each do |rule|
+        if rule.only_block?
+          raise Error, "The accessible_by call cannot be used with a block 'can' definition. The SQL cannot be determined for #{action.inspect} #{subject.inspect}"
+        end
+      end
+    end
+
+    def default_alias_actions
+      {
+        :read => [:index, :show],
+        :create => [:new],
+        :update => [:edit],
+      }
+    end
+  end
+end
+
+module CanCan
+  # This class is used internally and should only be called through Ability.
+  # it holds the information about a "can" call made on Ability and provides
+  # helpful methods to determine permission checking and conditions hash generation.
+  class Rule # :nodoc:
+    attr_reader :base_behavior, :subjects, :actions, :conditions
+    attr_writer :expanded_actions
+
+    # The first argument when initializing is the base_behavior which is a true/false
+    # value. True for "can" and false for "cannot". The next two arguments are the action
+    # and subject respectively (such as :read, @project). The third argument is a hash
+    # of conditions and the last one is the block passed to the "can" call.
+    def initialize(base_behavior, action, subject, conditions, block)
+      raise Error, "You are not able to supply a block with a hash of conditions in #{action} #{subject} ability. Use either one." if conditions.kind_of?(Hash) && !block.nil?
+      @match_all = action.nil? && subject.nil?
+      @base_behavior = base_behavior
+      @actions = [action].flatten
+      @subjects = [subject].flatten
+      @conditions = conditions || {}
+      @block = block
+    end
+
+    # Matches both the subject and action, not necessarily the conditions
+    def relevant?(action, subject)
+      subject = subject.values.first if subject.class == Hash
+      @match_all || (matches_action?(action) && matches_subject?(subject))
+    end
+
+    # Matches the block or conditions hash
+    def matches_conditions?(action, subject, extra_args)
+      if @match_all
+        call_block_with_all(action, subject, extra_args)
+      elsif @block && !subject_class?(subject)
+        @block.call(subject, *extra_args)
+      elsif @conditions.kind_of?(Hash) && subject.class == Hash
+        nested_subject_matches_conditions?(subject)
+      elsif @conditions.kind_of?(Hash) && !subject_class?(subject)
+        matches_conditions_hash?(subject)
+      else
+        # Don't stop at "cannot" definitions when there are conditions.
+        @conditions.empty? ? true : @base_behavior
+      end
+    end
+
+    def only_block?
+      conditions_empty? && !@block.nil?
+    end
+
+    def only_raw_sql?
+      @block.nil? && !conditions_empty? && !@conditions.kind_of?(Hash)
+    end
+
+    def conditions_empty?
+      @conditions == {} || @conditions.nil?
+    end
+
+    def unmergeable?
+      @conditions.respond_to?(:keys) && @conditions.present? &&
+        (!@conditions.keys.first.kind_of? Symbol)
+    end
+
+    def associations_hash(conditions = @conditions)
+      hash = {}
+      conditions.map do |name, value|
+        hash[name] = associations_hash(value) if value.kind_of? Hash
+      end if conditions.kind_of? Hash
+      hash
+    end
+
+    def attributes_from_conditions
+      attributes = {}
+      @conditions.each do |key, value|
+        attributes[key] = value unless [Array, Range, Hash].include? value.class
+      end if @conditions.kind_of? Hash
+      attributes
+    end
+
+    private
+
+    def subject_class?(subject)
+      klass = (subject.kind_of?(Hash) ? subject.values.first : subject).class
+      klass == Class || klass == Module
+    end
+
+    def matches_action?(action)
+      @expanded_actions.include?(:manage) || @expanded_actions.include?(action)
+    end
+
+    def matches_subject?(subject)
+      @subjects.include?(:all) || @subjects.include?(subject) || matches_subject_class?(subject)
+    end
+
+    def matches_subject_class?(subject)
+      @subjects.any? { |sub| sub.kind_of?(Module) && (subject.kind_of?(sub) || subject.class.to_s == sub.to_s || subject.kind_of?(Module) && subject.ancestors.include?(sub)) }
+    end
+
+    # Checks if the given subject matches the given conditions hash.
+    # This behavior can be overriden by a model adapter by defining two class methods:
+    # override_matching_for_conditions?(subject, conditions) and
+    # matches_conditions_hash?(subject, conditions)
+    def matches_conditions_hash?(subject, conditions = @conditions)
+      if conditions.empty?
+        true
+      else
+        if model_adapter(subject).override_conditions_hash_matching? subject, conditions
+          model_adapter(subject).matches_conditions_hash? subject, conditions
+        else
+          conditions.all? do |name, value|
+            if model_adapter(subject).override_condition_matching? subject, name, value
+              model_adapter(subject).matches_condition? subject, name, value
+            else
+              attribute = subject.send(name)
+              if value.kind_of?(Hash)
+                if attribute.kind_of? Array
+                  attribute.any? { |element| matches_conditions_hash? element, value }
+                else
+                  !attribute.nil? && matches_conditions_hash?(attribute, value)
+                end
+              elsif !value.is_a?(String) && value.kind_of?(Enumerable)
+                value.include? attribute
+              else
+                attribute == value
+              end
+            end
+          end
+        end
+      end
+    end
+
+    def nested_subject_matches_conditions?(subject_hash)
+      parent, child = subject_hash.first
+      matches_conditions_hash?(parent, @conditions[parent.class.name.downcase.to_sym] || {})
+    end
+
+    def call_block_with_all(action, subject, extra_args)
+      if subject.class == Class
+        @block.call(action, subject, nil, *extra_args)
+      else
+        @block.call(action, subject.class, subject, *extra_args)
+      end
+    end
+
+    def model_adapter(subject)
+      CanCan::ModelAdapters::AbstractAdapter.adapter_class(subject_class?(subject) ? subject : subject.class)
+    end
+  end
+end
+
+module CanCan
+  # Handle the load and authorization controller logic so we don't clutter up all controllers with non-interface methods.
+  # This class is used internally, so you do not need to call methods directly on it.
+  class ControllerResource # :nodoc:
+    def self.add_before_filter(controller_class, method, *args)
+      options = args.extract_options!
+      resource_name = args.first
+      before_filter_method = options.delete(:prepend) ? :prepend_before_filter : :before_filter
+      controller_class.send(before_filter_method, options.slice(:only, :except, :if, :unless)) do |controller|
+        controller.class.cancan_resource_class.new(controller, resource_name, options.except(:only, :except, :if, :unless)).send(method)
+      end
+    end
+
+    def initialize(controller, *args)
+      @controller = controller
+      @params = controller.params
+      @options = args.extract_options!
+      @name = args.first
+      raise CanCan::ImplementationRemoved, "The :nested option is no longer supported, instead use :through with separate load/authorize call." if @options[:nested]
+      raise CanCan::ImplementationRemoved, "The :name option is no longer supported, instead pass the name as the first argument." if @options[:name]
+      raise CanCan::ImplementationRemoved, "The :resource option has been renamed back to :class, use false if no class." if @options[:resource]
+    end
+
+    def load_and_authorize_resource
+      load_resource
+      authorize_resource
+    end
+
+    def load_resource
+      unless skip?(:load)
+        if load_instance?
+          self.resource_instance ||= load_resource_instance
+        elsif load_collection?
+          self.collection_instance ||= load_collection
+        end
+      end
+    end
+
+    def authorize_resource
+      unless skip?(:authorize)
+        @controller.authorize!(authorization_action, resource_instance || resource_class_with_parent)
+      end
+    end
+
+    def parent?
+      @options.has_key?(:parent) ? @options[:parent] : @name && @name != name_from_controller.to_sym
+    end
+
+    def skip?(behavior) # This could probably use some refactoring
+      options = @controller.class.cancan_skipper[behavior][@name]
+      if options.nil?
+        false
+      elsif options == {}
+        true
+      elsif options[:except] && ![options[:except]].flatten.include?(@params[:action].to_sym)
+        true
+      elsif [options[:only]].flatten.include?(@params[:action].to_sym)
+        true
+      end
+    end
+
+    protected
+
+    def load_resource_instance
+      if !parent? && new_actions.include?(@params[:action].to_sym)
+        build_resource
+      elsif id_param || @options[:singleton]
+        find_resource
+      end
+    end
+
+    def load_instance?
+      parent? || member_action?
+    end
+
+    def load_collection?
+      resource_base.respond_to?(:accessible_by) && !current_ability.has_block?(authorization_action, resource_class)
+    end
+
+    def load_collection
+      resource_base.accessible_by(current_ability, authorization_action)
+    end
+
+    def build_resource
+      resource = resource_base.new(resource_params || {})
+      assign_attributes(resource)
+    end
+
+    def assign_attributes(resource)
+      resource.send("#{parent_name}=", parent_resource) if @options[:singleton] && parent_resource
+      initial_attributes.each do |attr_name, value|
+        resource.send("#{attr_name}=", value)
+      end
+      resource
+    end
+
+    def initial_attributes
+      current_ability.attributes_for(@params[:action].to_sym, resource_class).delete_if do |key, value|
+        resource_params && resource_params.include?(key)
+      end
+    end
+
+    def find_resource
+      if @options[:singleton] && parent_resource.respond_to?(name)
+        parent_resource.send(name)
+      else
+        if @options[:find_by]
+          if resource_base.respond_to? "find_by_#{@options[:find_by]}!"
+            resource_base.send("find_by_#{@options[:find_by]}!", id_param)
+          elsif resource_base.respond_to? "find_by"
+            resource_base.send("find_by", { @options[:find_by].to_sym => id_param })
+          else
+            resource_base.send(@options[:find_by], id_param)
+          end
+        else
+          adapter.find(resource_base, id_param)
+        end
+      end
+    end
+
+    def adapter
+      ModelAdapters::AbstractAdapter.adapter_class(resource_class)
+    end
+
+    def authorization_action
+      parent? ? :show : @params[:action].to_sym
+    end
+
+    def id_param
+      if @options[:id_param]
+        @params[@options[:id_param]]
+      else
+        @params[parent? ? :"#{name}_id" : :id]
+      end.to_s
+    end
+
+    def member_action?
+      new_actions.include?(@params[:action].to_sym) || @options[:singleton] || ( (@params[:id] || @params[@options[:id_param]]) && !collection_actions.include?(@params[:action].to_sym))
+    end
+
+    # Returns the class used for this resource. This can be overriden by the :class option.
+    # If +false+ is passed in it will use the resource name as a symbol in which case it should
+    # only be used for authorization, not loading since there's no class to load through.
+    def resource_class
+      case @options[:class]
+      when false  then name.to_sym
+      when nil    then namespaced_name.to_s.camelize.constantize
+      when String then @options[:class].constantize
+      else @options[:class]
+      end
+    end
+
+    def resource_class_with_parent
+      parent_resource ? {parent_resource => resource_class} : resource_class
+    end
+
+    def resource_instance=(instance)
+      @controller.instance_variable_set("@#{instance_name}", instance)
+    end
+
+    def resource_instance
+      @controller.instance_variable_get("@#{instance_name}") if load_instance?
+    end
+
+    def collection_instance=(instance)
+      @controller.instance_variable_set("@#{instance_name.to_s.pluralize}", instance)
+    end
+
+    def collection_instance
+      @controller.instance_variable_get("@#{instance_name.to_s.pluralize}")
+    end
+
+    # The object that methods (such as "find", "new" or "build") are called on.
+    # If the :through option is passed it will go through an association on that instance.
+    # If the :shallow option is passed it will use the resource_class if there's no parent
+    # If the :singleton option is passed it won't use the association because it needs to be handled later.
+    def resource_base
+      if @options[:through]
+        if parent_resource
+          @options[:singleton] ? resource_class : parent_resource.send(@options[:through_association] || name.to_s.pluralize)
+        elsif @options[:shallow]
+          resource_class
+        else
+          raise AccessDenied.new(nil, authorization_action, resource_class) # maybe this should be a record not found error instead?
+        end
+      else
+        resource_class
+      end
+    end
+
+    def parent_name
+      @options[:through] && [@options[:through]].flatten.detect { |i| fetch_parent(i) }
+    end
+
+    # The object to load this resource through.
+    def parent_resource
+      parent_name && fetch_parent(parent_name)
+    end
+
+    def fetch_parent(name)
+      if @controller.instance_variable_defined? "@#{name}"
+        @controller.instance_variable_get("@#{name}")
+      elsif @controller.respond_to?(name, true)
+        @controller.send(name)
+      end
+    end
+
+    def current_ability
+      @controller.send(:current_ability)
+    end
+
+    def name
+      @name || name_from_controller
+    end
+
+    def resource_params
+      if @options[:class]
+        params_key = extract_key(@options[:class])
+        return @params[params_key] if @params[params_key]
+      end
+
+      resource_params_by_namespaced_name
+    end
+
+    def resource_params_by_namespaced_name
+      @params[extract_key(namespaced_name)]
+    end
+
+    def namespace
+      @params[:controller].split(/::|\//)[0..-2]
+    end
+
+    def namespaced_name
+      [namespace, name.camelize].join('::').singularize.camelize.constantize
+    rescue NameError
+      name
+    end
+
+    def name_from_controller
+      @params[:controller].sub("Controller", "").underscore.split('/').last.singularize
+    end
+
+    def instance_name
+      @options[:instance_name] || name
+    end
+
+    def collection_actions
+      [:index] + [@options[:collection]].flatten
+    end
+
+    def new_actions
+      [:new, :create] + [@options[:new]].flatten
+    end
+
+    private
+
+    def extract_key(value)
+       value.to_s.underscore.gsub('/', '_')
+    end
+  end
+end
+
+# For instrumenting
+require 'active_support/notifications'
+
+# Using Thor's indifferent hash access
+require 'thor'
+
+# Core Pathname library used for traversal
+require 'pathname'
+
+# Template and Mime detection
+require 'tilt'
+require 'rack/mime'
+
+module Middleman
+  module Util
+    class << self
+      # Whether the source file is binary.
+      #
+      # @param [String] filename The file to check.
+      # @return [Boolean]
+      def binary?(filename)
+        ext = File.extname(filename)
+
+        # We hardcode detecting of gzipped SVG files
+        return true if ext == '.svgz'
+
+        return false if Tilt.registered?(ext.sub('.', ''))
+
+        dot_ext = (ext.to_s[0] == '.') ? ext.dup : ".#{ext}"
+
+        if mime = ::Rack::Mime.mime_type(dot_ext, nil)
+          !nonbinary_mime?(mime)
+        else
+          file_contents_include_binary_bytes?(filename)
+        end
+      end
+
+      # Facade for ActiveSupport/Notification
+      def instrument(name, payload={}, &block)
+        suffixed_name = (name =~ /\.middleman$/) ? name.dup : "#{name}.middleman"
+        ::ActiveSupport::Notifications.instrument(suffixed_name, payload, &block)
+      end
+
+      # Recursively convert a normal Hash into a HashWithIndifferentAccess
+      #
+      # @private
+      # @param [Hash] data Normal hash
+      # @return [Thor::CoreExt::HashWithIndifferentAccess]
+      def recursively_enhance(data)
+        if data.is_a? Hash
+          data = ::Thor::CoreExt::HashWithIndifferentAccess.new(data)
+          data.each do |key, val|
+            data[key] = recursively_enhance(val)
+          end
+          data
+        elsif data.is_a? Array
+          data.each_with_index do |val, i|
+            data[i] = recursively_enhance(val)
+          end
+          data
+        else
+          data
+        end
+      end
+
+      # Normalize a path to not include a leading slash
+      # @param [String] path
+      # @return [String]
+      def normalize_path(path)
+        # The tr call works around a bug in Ruby's Unicode handling
+        URI.decode(path).sub(%r{^/}, '').tr('', '')
+      end
+
+      # This is a separate method from normalize_path in case we
+      # change how we normalize paths
+      def strip_leading_slash(path)
+        path.sub(%r{^/}, '')
+      end
+
+      # Extract the text of a Rack response as a string.
+      # Useful for extensions implemented as Rack middleware.
+      # @param response The response from #call
+      # @return [String] The whole response as a string.
+      def extract_response_text(response)
+        # The rack spec states all response bodies must respond to each
+        result = ''
+        response.each do |part, _|
+          result << part
+        end
+        result
+      end
+
+      # Takes a matcher, which can be a literal string
+      # or a string containing glob expressions, or a
+      # regexp, or a proc, or anything else that responds
+      # to #match or #call, and returns whether or not the
+      # given path matches that matcher.
+      #
+      # @param matcher A matcher string/regexp/proc/etc
+      # @param path A path as a string
+      # @return [Boolean] Whether the path matches the matcher
+      def path_match(matcher, path)
+        case
+        when matcher.is_a?(String)
+          path.match(matcher)
+        when matcher.respond_to?(:match)
+          matcher.match(path)
+        when matcher.respond_to?(:call)
+          matcher.call(path)
+        else
+          File.fnmatch(matcher.to_s, path)
+        end
+      end
+
+      # Get a recusive list of files inside a path.
+      # Works with symlinks.
+      #
+      # @param path Some path string or Pathname
+      # @param ignore A proc/block that returns true if a given path should be ignored - if a path
+      #               is ignored, nothing below it will be searched either.
+      # @return [Array<Pathname>] An array of Pathnames for each file (no directories)
+      def all_files_under(path, &ignore)
+        path = Pathname(path)
+
+        return [] if ignore && ignore.call(path)
+
+        if path.directory?
+          path.children.flat_map do |child|
+            all_files_under(child, &ignore)
+          end.compact
+        elsif path.file?
+          [path]
+        else
+          []
+        end
+      end
+
+      # Given a source path (referenced either absolutely or relatively)
+      # or a Resource, this will produce the nice URL configured for that
+      # path, respecting :relative_links, directory indexes, etc.
+      def url_for(app, path_or_resource, options={})
+        # Handle Resources and other things which define their own url method
+        url = if path_or_resource.respond_to?(:url)
+          path_or_resource.url
+        else
+          path_or_resource.dup
+        end
+
+        # Try to parse URL
+        begin
+          uri = URI(url)
+        rescue URI::InvalidURIError
+          # Nothing we can do with it, it's not really a URI
+          return url
+        end
+
+        relative = options[:relative]
+        raise "Can't use the relative option with an external URL" if relative && uri.host
+
+        # Allow people to turn on relative paths for all links with
+        # set :relative_links, true
+        # but still override on a case by case basis with the :relative parameter.
+        effective_relative = relative || false
+        effective_relative = true if relative.nil? && app.config[:relative_links]
+
+        # Try to find a sitemap resource corresponding to the desired path
+        this_resource = options[:current_resource]
+
+        if path_or_resource.is_a?(::Middleman::Sitemap::Resource)
+          resource = path_or_resource
+          resource_url = url
+        elsif this_resource && uri.path && !uri.host
+          # Handle relative urls
+          url_path = Pathname(uri.path)
+          current_source_dir = Pathname('/' + this_resource.path).dirname
+          url_path = current_source_dir.join(url_path) if url_path.relative?
+          resource = app.sitemap.find_resource_by_path(url_path.to_s)
+          resource_url = resource.url if resource
+        elsif options[:find_resource] && uri.path && !uri.host
+          resource = app.sitemap.find_resource_by_path(uri.path)
+          resource_url = resource.url if resource
+        end
+
+        if resource
+          uri.path = URI.encode(relative_path_from_resource(this_resource, resource_url, effective_relative))
+        else
+          # If they explicitly asked for relative links but we can't find a resource...
+          raise "No resource exists at #{url}" if relative
+        end
+
+        # Support a :query option that can be a string or hash
+        if query = options[:query]
+          uri.query = query.respond_to?(:to_param) ? query.to_param : query.to_s
+        end
+
+        # Support a :fragment or :anchor option just like Padrino
+        fragment = options[:anchor] || options[:fragment]
+        uri.fragment = fragment.to_s if fragment
+
+        # Finally make the URL back into a string
+        uri.to_s
+      end
+
+      # Expand a path to include the index file if it's a directory
+      #
+      # @param [String] path Request path/
+      # @param [Middleman::Application] app The requesting app.
+      # @return [String] Path with index file if necessary.
+      def full_path(path, app)
+        resource = app.sitemap.find_resource_by_destination_path(path)
+
+        unless resource
+          # Try it with /index.html at the end
+          indexed_path = File.join(path.sub(%r{/$}, ''), app.config[:index_file])
+          resource = app.sitemap.find_resource_by_destination_path(indexed_path)
+        end
+
+        if resource
+          '/' + resource.destination_path
+        else
+          '/' + normalize_path(path)
+        end
+      end
+
+      private
+
+      # Is mime type known to be non-binary?
+      #
+      # @param [String] mime The mimetype to check.
+      # @return [Boolean]
+      def nonbinary_mime?(mime)
+        case
+        when mime.start_with?('text/')
+          true
+        when mime.include?('xml')
+          true
+        when mime.include?('json')
+          true
+        when mime.include?('javascript')
+          true
+        else
+          false
+        end
+      end
+
+      # Read a few bytes from the file and see if they are binary.
+      #
+      # @param [String] filename The file to check.
+      # @return [Boolean]
+      def file_contents_include_binary_bytes?(filename)
+        binary_bytes = [0, 1, 2, 3, 4, 5, 6, 11, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25, 26, 28, 29, 30, 31]
+        s = File.read(filename, 4096) || ''
+        s.each_byte do |c|
+          return true if binary_bytes.include?(c)
+        end
+
+        false
+      end
+
+      # Get a relative path to a resource.
+      #
+      # @param [Middleman::Sitemap::Resource] curr_resource The resource.
+      # @param [String] resource_url The target url.
+      # @param [Boolean] relative If the path should be relative.
+      # @return [String]
+      def relative_path_from_resource(curr_resource, resource_url, relative)
+        # Switch to the relative path between resource and the given resource
+        # if we've been asked to.
+        if relative && curr_resource
+          # Output urls relative to the destination path, not the source path
+          current_dir = Pathname('/' + curr_resource.destination_path).dirname
+          relative_path = Pathname(resource_url).relative_path_from(current_dir).to_s
+
+          # Put back the trailing slash to avoid unnecessary Apache redirects
+          if resource_url.end_with?('/') && !relative_path.end_with?('/')
+            relative_path << '/'
+          end
+
+          relative_path
+        else
+          resource_url
+        end
+      end
+    end
+  end
+end
+
+# Require thor since that's what the who CLI is built around
+require 'thor'
+require 'thor/group'
+
+# CLI Module
+module Middleman
+  module Cli
+    # The base task from which everything else etends
+    class Base < Thor
+      class << self
+        def start(*args)
+          # Change flag to a module
+          ARGV.unshift('help') if ARGV.delete('--help')
+
+          # Default command is server
+          if ARGV[0] != 'help' && (ARGV.length < 1 || ARGV.first.include?('-'))
+            ARGV.unshift('server')
+          end
+
+          super
+        end
+      end
+
+      desc 'version', 'Show version'
+      def version
+        say "Middleman #{Middleman::VERSION}"
+      end
+
+      # Override the Thor help method to find help for subtasks
+      # @param [Symbol, String, nil] meth
+      # @param [Boolean] subcommand
+      # @return [void]
+      # rubocop:disable UnusedMethodArgument
+      def help(meth=nil, subcommand=false)
+        if meth && !self.respond_to?(meth)
+          klass, task = Thor::Util.find_class_and_task_by_namespace("#{meth}:#{meth}")
+          klass.start(['-h', task].compact, shell: shell)
+        else
+          list = []
+          Thor::Util.thor_classes_in(Middleman::Cli).each do |thor_class|
+            list += thor_class.printable_tasks(false)
+          end
+          list.sort! { |a, b| a[0] <=> b[0] }
+
+          shell.say 'Tasks:'
+          shell.print_table(list, ident: 2, truncate: true)
+          shell.say
+        end
+      end
+
+      # Intercept missing methods and search subtasks for them
+      # @param [Symbol] meth
+      def method_missing(meth, *args)
+        meth = meth.to_s
+        meth = self.class.map[meth] if self.class.map.key?(meth)
+
+        klass, task = Thor::Util.find_class_and_task_by_namespace("#{meth}:#{meth}")
+
+        if klass.nil?
+          tasks_dir = File.join(Dir.pwd, 'tasks')
+
+          if File.exist?(tasks_dir)
+            Dir[File.join(tasks_dir, '**/*_task.rb')].each { |f| require f }
+            klass, task = Thor::Util.find_class_and_task_by_namespace("#{meth}:#{meth}")
+          end
+        end
+
+        if klass.nil?
+          raise Thor::Error, "There's no '#{meth}' command for Middleman. Try 'middleman help' for a list of commands."
+        else
+          args.unshift(task) if task
+          klass.start(args, shell: shell)
+        end
+      end
+    end
+  end
+end
+
+# Require the Middleman version
+require 'middleman-core/version'
+
+# Include the core CLI items
+require 'middleman-core/cli/init'
+require 'middleman-core/cli/bundler'
+require 'middleman-core/cli/extension'
+require 'middleman-core/cli/server'
+require 'middleman-core/cli/build'
+require 'middleman-core/cli/console'
+
+module Middleman
+  module CoreExtensions
+    # The data extension parses YAML and JSON files in the data/ directory
+    # and makes them available to config.rb, templates and extensions
+    module Data
+      # Extension registered
+      class << self
+        # @private
+        def registered(app)
+          # Data formats
+          require 'yaml'
+          require 'active_support/json'
+
+          app.config.define_setting :data_dir, 'data', 'The directory data files are stored in'
+          app.send :include, InstanceMethods
+        end
+        alias_method :included, :registered
+      end
+
+      # Instance methods
+      module InstanceMethods
+        # Setup data files before anything else so they are available when
+        # parsing config.rb
+        def initialize
+          files.changed DataStore.matcher do |file|
+            data.touch_file(file) if file.start_with?("#{config[:data_dir]}/")
+          end
+
+          files.deleted DataStore.matcher do |file|
+            data.remove_file(file) if file.start_with?("#{config[:data_dir]}/")
+          end
+
+          super
+        end
+
+        # The data object
+        #
+        # @return [DataStore]
+        def data
+          @_data ||= DataStore.new(self)
+        end
+      end
+
+      # The core logic behind the data extension.
+      class DataStore
+        # Static methods
+        class << self
+          # The regex which tells Middleman which files are for data
+          #
+          # @return [Regexp]
+          def matcher
+            %r{[\w-]+\.(yml|yaml|json)$}
+          end
+        end
+
+        # Store static data hash
+        #
+        # @param [Symbol] name Name of the data, used for namespacing
+        # @param [Hash] content The content for this data
+        # @return [Hash]
+        def store(name=nil, content=nil)
+          @_local_sources ||= {}
+          @_local_sources[name.to_s] = content unless name.nil? || content.nil?
+          @_local_sources
+        end
+
+        # Store callback-based data
+        #
+        # @param [Symbol] name Name of the data, used for namespacing
+        # @param [Proc] proc The callback which will return data
+        # @return [Hash]
+        def callbacks(name=nil, proc=nil)
+          @_callback_sources ||= {}
+          @_callback_sources[name.to_s] = proc unless name.nil? || proc.nil?
+          @_callback_sources
+        end
+
+        # Setup data store
+        #
+        # @param [Middleman::Application] app The current instance of Middleman
+        def initialize(app)
+          @app = app
+          @local_data = {}
+        end
+
+        # Update the internal cache for a given file path
+        #
+        # @param [String] file The file to be re-parsed
+        # @return [void]
+        def touch_file(file)
+          root = Pathname(@app.root)
+          full_path = root + file
+          extension = File.extname(file)
+          basename  = File.basename(file, extension)
+
+          data_path = full_path.relative_path_from(root + @app.config[:data_dir])
+
+          if %w(.yaml .yml).include?(extension)
+            data = YAML.load_file(full_path)
+          elsif extension == '.json'
+            data = ActiveSupport::JSON.decode(full_path.read)
+          else
+            return
+          end
+
+          data_branch = @local_data
+
+          path = data_path.to_s.split(File::SEPARATOR)[0..-2]
+          path.each do |dir|
+            data_branch[dir] ||= ::Middleman::Util.recursively_enhance({})
+            data_branch = data_branch[dir]
+          end
+
+          data_branch[basename] = ::Middleman::Util.recursively_enhance(data)
+        end
+
+        # Remove a given file from the internal cache
+        #
+        # @param [String] file The file to be cleared
+        # @return [void]
+        def remove_file(file)
+          root = Pathname(@app.root)
+          full_path = root + file
+          extension = File.extname(file)
+          basename  = File.basename(file, extension)
+
+          data_path = full_path.relative_path_from(root + @app.config[:data_dir])
+
+          data_branch = @local_data
+
+          path = data_path.to_s.split(File::SEPARATOR)[0..-2]
+          path.each do |dir|
+            data_branch = data_branch[dir]
+          end
+
+          data_branch.delete(basename) if data_branch.key?(basename)
+        end
+
+        # Get a hash from either internal static data or a callback
+        #
+        # @param [String, Symbol] path The name of the data namespace
+        # @return [Hash, nil]
+        def data_for_path(path)
+          response = nil
+
+          if store.key?(path.to_s)
+            response = store[path.to_s]
+          elsif callbacks.key?(path.to_s)
+            response = callbacks[path.to_s].call
+          end
+
+          response
+        end
+
+        # "Magically" find namespaces of data if they exist
+        #
+        # @param [String] path The namespace to search for
+        # @return [Hash, nil]
+        def method_missing(path)
+          if @local_data.key?(path.to_s)
+            return @local_data[path.to_s]
+          else
+            result = data_for_path(path)
+            return ::Middleman::Util.recursively_enhance(result) if result
+          end
+
+          super
+        end
+
+        # Needed so that method_missing makes sense
+        def respond_to?(method, include_private=false)
+          super || key?(method)
+        end
+
+        # Make DataStore act like a hash. Return requested data, or
+        # nil if data does not exist
+        #
+        # @param [String, Symbol] key The name of the data namespace
+        # @return [Hash, nil]
+        def [](key)
+          __send__(key) if key?(key)
+        end
+
+        def key?(key)
+          @local_data.key?(key.to_s) || data_for_path(key)
+        end
+
+        alias_method :has_key?, :key?
+
+        # Convert all the data into a static hash
+        #
+        # @return [Hash]
+        def to_h
+          data = {}
+
+          store.each do |k, _|
+            data[k] = data_for_path(k)
+          end
+
+          callbacks.each do |k, _|
+            data[k] = data_for_path(k)
+          end
+
+          (@local_data || {}).each do |k, v|
+            data[k] = v
+          end
+
+          data
+        end
+      end
+    end
+  end
+end
+
+require 'pathname'
+require 'set'
+
+# API for watching file change events
+module Middleman
+  module CoreExtensions
+    module FileWatcher
+      IGNORE_LIST = [
+        /^bin(\/|$)/,
+        /^\.bundle(\/|$)/,
+        /^vendor(\/|$)/,
+        /^node_modules(\/|$)/,
+        /^\.sass-cache(\/|$)/,
+        /^\.cache(\/|$)/,
+        /^\.git(\/|$)/,
+        /^\.gitignore$/,
+        /\.DS_Store/,
+        /^\.rbenv-.*$/,
+        /^Gemfile$/,
+        /^Gemfile\.lock$/,
+        /~$/,
+        /(^|\/)\.?#/,
+        /^tmp\//
+      ]
+
+      # Setup extension
+      class << self
+        # Once registered
+        def registered(app)
+          app.send :include, InstanceMethods
+
+          app.config.define_setting :file_watcher_ignore, IGNORE_LIST, 'Regexes for paths that should be ignored when they change.'
+
+          # Before parsing config, load the data/ directory
+          app.before_configuration do
+            files.reload_path(config[:data_dir])
+          end
+
+          app.after_configuration do
+            config[:file_watcher_ignore] << %r{^#{config[:build_dir]}(\/|$)}
+          end
+
+          # After config, load everything else
+          app.ready do
+            files.reload_path('.')
+          end
+        end
+        alias_method :included, :registered
+      end
+
+      # Instance methods
+      module InstanceMethods
+        # Access the file api
+        # @return [Middleman::CoreExtensions::FileWatcher::API]
+        def files
+          @_files_api ||= API.new(self)
+        end
+      end
+
+      # Core File Change API class
+      class API
+        attr_reader :app
+        attr_reader :known_paths
+        delegate :logger, to: :app
+
+        # Initialize api and internal path cache
+        def initialize(app)
+          @app = app
+          @known_paths = Set.new
+
+          @_changed = []
+          @_deleted = []
+        end
+
+        # Add callback to be run on file change
+        #
+        # @param [nil,Regexp] matcher A Regexp to match the change path against
+        # @return [Array<Proc>]
+        def changed(matcher=nil, &block)
+          @_changed << [block, matcher] if block_given?
+          @_changed
+        end
+
+        # Add callback to be run on file deletion
+        #
+        # @param [nil,Regexp] matcher A Regexp to match the deleted path against
+        # @return [Array<Proc>]
+        def deleted(matcher=nil, &block)
+          @_deleted << [block, matcher] if block_given?
+          @_deleted
+        end
+
+        # Notify callbacks that a file changed
+        #
+        # @param [Pathname] path The file that changed
+        # @return [void]
+        def did_change(path)
+          path = Pathname(path)
+          logger.debug "== File Change: #{path}"
+          @known_paths << path
+          run_callbacks(path, :changed)
+        end
+
+        # Notify callbacks that a file was deleted
+        #
+        # @param [Pathname] path The file that was deleted
+        # @return [void]
+        def did_delete(path)
+          path = Pathname(path)
+          logger.debug "== File Deletion: #{path}"
+          @known_paths.delete(path)
+          run_callbacks(path, :deleted)
+        end
+
+        # Manually trigger update events
+        #
+        # @param [Pathname] path The path to reload
+        # @param [Boolean] only_new Whether we only look for new files
+        # @return [void]
+        def reload_path(path, only_new=false)
+          # chdir into the root directory so Pathname can work with relative paths
+          Dir.chdir @app.root_path do
+            path = Pathname(path)
+            return unless path.exist?
+
+            glob = (path + '**').to_s
+            subset = @known_paths.select { |p| p.fnmatch(glob) }
+
+            ::Middleman::Util.all_files_under(path, &method(:ignored?)).each do |filepath|
+              next if only_new && subset.include?(filepath)
+
+              subset.delete(filepath)
+              did_change(filepath)
+            end
+
+            subset.each(&method(:did_delete)) unless only_new
+          end
+        end
+
+        # Like reload_path, but only triggers events on new files
+        #
+        # @param [Pathname] path The path to reload
+        # @return [void]
+        def find_new_files(path)
+          reload_path(path, true)
+        end
+
+        def exists?(path)
+          p = Pathname(path)
+          p = p.relative_path_from(Pathname(@app.root)) unless p.relative?
+          @known_paths.include?(p)
+        end
+
+        # Whether this path is ignored
+        # @param [Pathname] path
+        # @return [Boolean]
+        def ignored?(path)
+          path = path.to_s
+          app.config[:file_watcher_ignore].any? { |r| path =~ r }
+        end
+
+        protected
+
+        # Notify callbacks for a file given an array of callbacks
+        #
+        # @param [Pathname] path The file that was changed
+        # @param [Symbol] callbacks_name The name of the callbacks method
+        # @return [void]
+        def run_callbacks(path, callbacks_name)
+          path = path.to_s
+          send(callbacks_name).each do |callback, matcher|
+            next unless matcher.nil? || path.match(matcher)
+            @app.instance_exec(path, &callback)
+          end
+        end
+      end
+    end
+  end
+end
+
+# This extension Gzips assets and pages when building.
+# Gzipped assets and pages can be served directly by Apache or
+# Nginx with the proper configuration, and pre-zipping means that we
+# can use a more agressive compression level at no CPU cost per request.
+#
+# Use Nginx's gzip_static directive, or AddEncoding and mod_rewrite in Apache
+# to serve your Gzipped files whenever the normal (non-.gz) filename is requested.
+#
+# Pass the :exts options to customize which file extensions get zipped (defaults
+# to .html, .htm, .js and .css.
+#
+class Middleman::Extensions::Gzip < ::Middleman::Extension
+  option :exts, %w(.js .css .html .htm), 'File extensions to Gzip when building.'
+  option :ignore, [], 'Patterns to avoid gzipping'
+
+  def initialize(app, options_hash={})
+    super
+
+    require 'zlib'
+    require 'stringio'
+    require 'find'
+    require 'thread'
+  end
+
+  def after_build(builder)
+    num_threads = 4
+    paths = ::Middleman::Util.all_files_under(app.build_dir)
+    total_savings = 0
+
+    # Fill a queue with inputs
+    in_queue = Queue.new
+    paths.each do |path|
+      in_queue << path if should_gzip?(path)
+    end
+    num_paths = in_queue.size
+
+    # Farm out gzip tasks to threads and put the results in in_queue
+    out_queue = Queue.new
+    num_threads.times.each do
+      Thread.new do
+        while path = in_queue.pop
+          out_queue << gzip_file(path.to_s)
+        end
+      end
+    end
+
+    # Insert a nil for each thread to stop it
+    num_threads.times do
+      in_queue << nil
+    end
+
+    old_locale = I18n.locale
+    I18n.locale = :en # use the english localizations for printing out file sizes to make sure the localizations exist
+
+    num_paths.times do
+      output_filename, old_size, new_size = out_queue.pop
+
+      next unless output_filename
+
+      total_savings += (old_size - new_size)
+      size_change_word = (old_size - new_size) > 0 ? 'smaller' : 'larger'
+      builder.say_status :gzip, "#{output_filename} (#{app.number_to_human_size((old_size - new_size).abs)} #{size_change_word})"
+    end
+
+    builder.say_status :gzip, "Total gzip savings: #{app.number_to_human_size(total_savings)}", :blue
+    I18n.locale = old_locale
+  end
+
+  def gzip_file(path)
+    input_file = File.open(path, 'rb').read
+    output_filename = path + '.gz'
+    input_file_time = File.mtime(path)
+
+    # Check if the right file's already there
+    if File.exist?(output_filename) && File.mtime(output_filename) == input_file_time
+      return [nil, nil, nil]
+    end
+
+    File.open(output_filename, 'wb') do |f|
+      gz = Zlib::GzipWriter.new(f, Zlib::BEST_COMPRESSION)
+      gz.mtime = input_file_time.to_i
+      gz.write input_file
+      gz.close
+    end
+
+    # Make the file times match, both for Nginx's gzip_static extension
+    # and so we can ID existing files. Also, so even if the GZ files are
+    # wiped out by build --clean and recreated, we won't rsync them over
+    # again because they'll end up with the same mtime.
+    File.utime(File.atime(output_filename), input_file_time, output_filename)
+
+    old_size = File.size(path)
+    new_size = File.size(output_filename)
+
+    [output_filename, old_size, new_size]
+  end
+
+  private
+
+  # Whether a path should be gzipped
+  # @param [Pathname] path A destination path
+  # @return [Boolean]
+  def should_gzip?(path)
+    options.exts.include?(path.extname) && options.ignore.none? { |ignore| Middleman::Util.path_match(ignore, path.to_s) }
+  end
+end
+
+require 'set'
+
+module Liquid
+
+  # A drop in liquid is a class which allows you to export DOM like things to liquid.
+  # Methods of drops are callable.
+  # The main use for liquid drops is to implement lazy loaded objects.
+  # If you would like to make data available to the web designers which you don't want loaded unless needed then
+  # a drop is a great way to do that.
+  #
+  # Example:
+  #
+  #   class ProductDrop < Liquid::Drop
+  #     def top_sales
+  #       Shop.current.products.find(:all, :order => 'sales', :limit => 10 )
+  #     end
+  #   end
+  #
+  #   tmpl = Liquid::Template.parse( ' {% for product in product.top_sales %} {{ product.name }} {%endfor%} '  )
+  #   tmpl.render('product' => ProductDrop.new ) # will invoke top_sales query.
+  #
+  # Your drop can either implement the methods sans any parameters or implement the before_method(name) method which is a
+  # catch all.
+  class Drop
+    attr_writer :context
+
+    EMPTY_STRING = ''.freeze
+
+    # Catch all for the method
+    def before_method(method)
+      nil
+    end
+
+    # called by liquid to invoke a drop
+    def invoke_drop(method_or_key)
+      if method_or_key && method_or_key != EMPTY_STRING && self.class.invokable?(method_or_key)
+        send(method_or_key)
+      else
+        before_method(method_or_key)
+      end
+    end
+
+    def has_key?(name)
+      true
+    end
+
+    def inspect
+      self.class.to_s
+    end
+
+    def to_liquid
+      self
+    end
+
+    def to_s
+      self.class.name
+    end
+
+    alias :[] :invoke_drop
+
+    private
+
+    # Check for method existence without invoking respond_to?, which creates symbols
+    def self.invokable?(method_name)
+      unless @invokable_methods
+        blacklist = Liquid::Drop.public_instance_methods + [:each]
+        if include?(Enumerable)
+          blacklist += Enumerable.public_instance_methods
+          blacklist -= [:sort, :count, :first, :min, :max, :include?]
+        end
+        whitelist = [:to_liquid] + (public_instance_methods - blacklist)
+        @invokable_methods = Set.new(whitelist.map(&:to_s))
+      end
+      @invokable_methods.include?(method_name.to_s)
+    end
+  end
+end
+
+module Liquid
+  class Block < Tag
+    def initialize(tag_name, markup, options)
+      super
+      @blank = true
+    end
+
+    def parse(tokens)
+      @body = BlockBody.new
+      while more = parse_body(@body, tokens)
+      end
+    end
+
+    def render(context)
+      @body.render(context)
+    end
+
+    def blank?
+      @blank
+    end
+
+    def nodelist
+      @body.nodelist
+    end
+
+    # warnings of this block and all sub-tags
+    def warnings
+      all_warnings = []
+      all_warnings.concat(@warnings) if @warnings
+
+      (nodelist || []).each do |node|
+        all_warnings.concat(node.warnings || []) if node.respond_to?(:warnings)
+      end
+
+      all_warnings
+    end
+
+    def unknown_tag(tag, params, tokens)
+      case tag
+      when 'else'.freeze
+        raise SyntaxError.new(options[:locale].t("errors.syntax.unexpected_else".freeze,
+                                                 :block_name => block_name))
+      when 'end'.freeze
+        raise SyntaxError.new(options[:locale].t("errors.syntax.invalid_delimiter".freeze,
+                                                 :block_name => block_name,
+                                                 :block_delimiter => block_delimiter))
+      else
+        raise SyntaxError.new(options[:locale].t("errors.syntax.unknown_tag".freeze, :tag => tag))
+      end
+    end
+
+    def block_name
+      @tag_name
+    end
+
+    def block_delimiter
+      @block_delimiter ||= "end#{block_name}"
+    end
+
+    protected
+
+    def parse_body(body, tokens)
+      body.parse(tokens, options) do |end_tag_name, end_tag_params|
+        @blank &&= body.blank?
+
+        return false if end_tag_name == block_delimiter
+        unless end_tag_name
+          raise SyntaxError.new(@options[:locale].t("errors.syntax.tag_never_closed".freeze, :block_name => block_name))
+        end
+
+        # this tag is not registered with the system
+        # pass it to the current block for special handling or error reporting
+        unknown_tag(end_tag_name, end_tag_params, tokens)
+      end
+
+      true
+    end
+  end
+end
+
+module Liquid
+
+  # Context keeps the variable stack and resolves variables, as well as keywords
+  #
+  #   context['variable'] = 'testing'
+  #   context['variable'] #=> 'testing'
+  #   context['true']     #=> true
+  #   context['10.2232']  #=> 10.2232
+  #
+  #   context.stack do
+  #      context['bob'] = 'bobsen'
+  #   end
+  #
+  #   context['bob']  #=> nil  class Context
+  class Context
+    attr_reader :scopes, :errors, :registers, :environments, :resource_limits
+    attr_accessor :exception_handler
+
+    def initialize(environments = {}, outer_scope = {}, registers = {}, rethrow_errors = false, resource_limits = nil)
+      @environments     = [environments].flatten
+      @scopes           = [(outer_scope || {})]
+      @registers        = registers
+      @errors           = []
+      @resource_limits  = resource_limits || ResourceLimits.new(Template.default_resource_limits)
+      squash_instance_assigns_with_environments
+
+      @this_stack_used = false
+
+      if rethrow_errors
+        self.exception_handler = ->(e) { true }
+      end
+
+      @interrupts = []
+      @filters = []
+    end
+
+    def strainer
+      @strainer ||= Strainer.create(self, @filters)
+    end
+
+    # Adds filters to this context.
+    #
+    # Note that this does not register the filters with the main Template object. see <tt>Template.register_filter</tt>
+    # for that
+    def add_filters(filters)
+      filters = [filters].flatten.compact
+      @filters += filters
+      @strainer = nil
+    end
+
+    # are there any not handled interrupts?
+    def has_interrupt?
+      !@interrupts.empty?
+    end
+
+    # push an interrupt to the stack. this interrupt is considered not handled.
+    def push_interrupt(e)
+      @interrupts.push(e)
+    end
+
+    # pop an interrupt from the stack
+    def pop_interrupt
+      @interrupts.pop
+    end
+
+
+    def handle_error(e, token=nil)
+      if e.is_a?(Liquid::Error)
+        e.set_line_number_from_token(token)
+      end
+
+      errors.push(e)
+      raise if exception_handler && exception_handler.call(e)
+      Liquid::Error.render(e)
+    end
+
+    def invoke(method, *args)
+      strainer.invoke(method, *args).to_liquid
+    end
+
+    # Push new local scope on the stack. use <tt>Context#stack</tt> instead
+    def push(new_scope={})
+      @scopes.unshift(new_scope)
+      raise StackLevelError, "Nesting too deep".freeze if @scopes.length > 100
+    end
+
+    # Merge a hash of variables in the current local scope
+    def merge(new_scopes)
+      @scopes[0].merge!(new_scopes)
+    end
+
+    # Pop from the stack. use <tt>Context#stack</tt> instead
+    def pop
+      raise ContextError if @scopes.size == 1
+      @scopes.shift
+    end
+
+    # Pushes a new local scope on the stack, pops it at the end of the block
+    #
+    # Example:
+    #   context.stack do
+    #      context['var'] = 'hi'
+    #   end
+    #
+    #   context['var]  #=> nil
+    def stack(new_scope=nil)
+      old_stack_used = @this_stack_used
+      if new_scope
+        push(new_scope)
+        @this_stack_used = true
+      else
+        @this_stack_used = false
+      end
+
+      yield
+    ensure
+      pop if @this_stack_used
+      @this_stack_used = old_stack_used
+    end
+
+    def clear_instance_assigns
+      @scopes[0] = {}
+    end
+
+    # Only allow String, Numeric, Hash, Array, Proc, Boolean or <tt>Liquid::Drop</tt>
+    def []=(key, value)
+      unless @this_stack_used
+        @this_stack_used = true
+        push({})
+      end
+      @scopes[0][key] = value
+    end
+
+    # Look up variable, either resolve directly after considering the name. We can directly handle
+    # Strings, digits, floats and booleans (true,false).
+    # If no match is made we lookup the variable in the current scope and
+    # later move up to the parent blocks to see if we can resolve the variable somewhere up the tree.
+    # Some special keywords return symbols. Those symbols are to be called on the rhs object in expressions
+    #
+    # Example:
+    #   products == empty #=> products.empty?
+    def [](expression)
+      evaluate(Expression.parse(expression))
+    end
+
+    def has_key?(key)
+      self[key] != nil
+    end
+
+    def evaluate(object)
+      object.respond_to?(:evaluate) ? object.evaluate(self) : object
+    end
+
+    # Fetches an object starting at the local scope and then moving up the hierachy
+    def find_variable(key)
+
+      # This was changed from find() to find_index() because this is a very hot
+      # path and find_index() is optimized in MRI to reduce object allocation
+      index = @scopes.find_index { |s| s.has_key?(key) }
+      scope = @scopes[index] if index
+
+      variable = nil
+
+      if scope.nil?
+        @environments.each do |e|
+          variable = lookup_and_evaluate(e, key)
+          unless variable.nil?
+            scope = e
+            break
+          end
+        end
+      end
+
+      scope     ||= @environments.last || @scopes.last
+      variable  ||= lookup_and_evaluate(scope, key)
+
+      variable = variable.to_liquid
+      variable.context = self if variable.respond_to?(:context=)
+
+      return variable
+    end
+
+    def lookup_and_evaluate(obj, key)
+      if (value = obj[key]).is_a?(Proc) && obj.respond_to?(:[]=)
+        obj[key] = (value.arity == 0) ? value.call : value.call(self)
+      else
+        value
+      end
+    end
+
+    private
+      def squash_instance_assigns_with_environments
+        @scopes.last.each_key do |k|
+          @environments.each do |env|
+            if env.has_key?(k)
+              scopes.last[k] = lookup_and_evaluate(env, k)
+              break
+            end
+          end
+        end
+      end # squash_instance_assigns_with_environments
+  end # Context
+end # Liquid
+
+module Liquid
+  class BlockBody
+    FullToken = /\A#{TagStart}\s*(\w+)\s*(.*)?#{TagEnd}\z/om
+    ContentOfVariable = /\A#{VariableStart}(.*)#{VariableEnd}\z/om
+    TAGSTART = "{%".freeze
+    VARSTART = "{{".freeze
+
+    attr_reader :nodelist
+
+    def initialize
+      @nodelist = []
+      @blank = true
+    end
+
+    def parse(tokens, options)
+      while token = tokens.shift
+        begin
+          unless token.empty?
+            case
+            when token.start_with?(TAGSTART)
+              if token =~ FullToken
+                tag_name = $1
+                markup = $2
+                # fetch the tag from registered blocks
+                if tag = Template.tags[tag_name]
+                  markup = token.child(markup) if token.is_a?(Token)
+                  new_tag = tag.parse(tag_name, markup, tokens, options)
+                  new_tag.line_number = token.line_number if token.is_a?(Token)
+                  @blank &&= new_tag.blank?
+                  @nodelist << new_tag
+                else
+                  # end parsing if we reach an unknown tag and let the caller decide
+                  # determine how to proceed
+                  return yield tag_name, markup
+                end
+              else
+                raise_missing_tag_terminator(token, options)
+              end
+            when token.start_with?(VARSTART)
+              new_var = create_variable(token, options)
+              new_var.line_number = token.line_number if token.is_a?(Token)
+              @nodelist << new_var
+              @blank = false
+            else
+              @nodelist << token
+              @blank &&= !!(token =~ /\A\s*\z/)
+            end
+          end
+        rescue SyntaxError => e
+          e.set_line_number_from_token(token)
+          raise
+        end
+      end
+
+      yield nil, nil
+    end
+
+    def blank?
+      @blank
+    end
+
+    def warnings
+      all_warnings = []
+      nodelist.each do |node|
+        all_warnings.concat(node.warnings || []) if node.respond_to?(:warnings)
+      end
+      all_warnings
+    end
+
+    def render(context)
+      output = []
+      context.resource_limits.render_score += @nodelist.length
+
+      @nodelist.each do |token|
+        # Break out if we have any unhanded interrupts.
+        break if context.has_interrupt?
+
+        begin
+          # If we get an Interrupt that means the block must stop processing. An
+          # Interrupt is any command that stops block execution such as {% break %}
+          # or {% continue %}
+          if token.is_a?(Continue) or token.is_a?(Break)
+            context.push_interrupt(token.interrupt)
+            break
+          end
+
+          token_output = render_token(token, context)
+
+          unless token.is_a?(Block) && token.blank?
+            output << token_output
+          end
+        rescue MemoryError => e
+          raise e
+        rescue ::StandardError => e
+          output << context.handle_error(e, token)
+        end
+      end
+
+      output.join
+    end
+
+    private
+
+    def render_token(token, context)
+      token_output = (token.respond_to?(:render) ? token.render(context) : token)
+      token_str = token_output.is_a?(Array) ? token_output.join : token_output.to_s
+
+      context.resource_limits.render_length += token_str.length
+      if context.resource_limits.reached?
+        raise MemoryError.new("Memory limits exceeded".freeze)
+      end
+      token_str
+    end
+
+    def create_variable(token, options)
+      token.scan(ContentOfVariable) do |content|
+        markup = token.is_a?(Token) ? token.child(content.first) : content.first
+        return Variable.new(markup, options)
+      end
+      raise_missing_variable_terminator(token, options)
+    end
+
+    def raise_missing_tag_terminator(token, options)
+      raise SyntaxError.new(options[:locale].t("errors.syntax.tag_termination".freeze, :token => token, :tag_end => TagEnd.inspect))
+    end
+
+    def raise_missing_variable_terminator(token, options)
+      raise SyntaxError.new(options[:locale].t("errors.syntax.variable_termination".freeze, :token => token, :tag_end => VariableEnd.inspect))
+    end
+  end
+end
+
+module Rails
+  module Generators
+   class DecoratorGenerator < NamedBase
+      source_root File.expand_path("../templates", __FILE__)
+      check_class_collision suffix: "Decorator"
+
+      class_option :parent, type: :string, desc: "The parent class for the generated decorator"
+
+      def create_decorator_file
+        template 'decorator.rb', File.join('app/decorators', class_path, "#{file_name}_decorator.rb")
+      end
+
+      hook_for :test_framework
+
+      private
+
+      def parent_class_name
+        options.fetch("parent") do
+          begin
+            require 'application_decorator'
+            ApplicationDecorator
+          rescue LoadError
+            "Draper::Decorator"
+          end
+        end
+      end
+
+      # Rails 3.0.X compatibility, stolen from https://github.com/jnunemaker/mongomapper/pull/385/files#L1R32
+      unless methods.include?(:module_namespacing)
+        def module_namespacing
+          yield if block_given?
+        end
+      end
+    end
+  end
+end
+
+module Draper
+  module AutomaticDelegation
+    extend ActiveSupport::Concern
+
+    # Delegates missing instance methods to the source object.
+    def method_missing(method, *args, &block)
+      return super unless delegatable?(method)
+
+      self.class.delegate method
+      send(method, *args, &block)
+    end
+
+    # Checks if the decorator responds to an instance method, or is able to
+    # proxy it to the source object.
+    def respond_to_missing?(method, include_private = false)
+      super || delegatable?(method)
+    end
+
+    # @private
+    def delegatable?(method)
+      object.respond_to?(method)
+    end
+
+    module ClassMethods
+      # Proxies missing class methods to the source class.
+      def method_missing(method, *args, &block)
+        return super unless delegatable?(method)
+
+        object_class.send(method, *args, &block)
+      end
+
+      # Checks if the decorator responds to a class method, or is able to proxy
+      # it to the source class.
+      def respond_to_missing?(method, include_private = false)
+        super || delegatable?(method)
+      end
+
+      # @private
+      def delegatable?(method)
+        object_class? && object_class.respond_to?(method)
+      end
+
+      # @private
+      # Avoids reloading the model class when ActiveSupport clears autoloaded
+      # dependencies in development mode.
+      def before_remove_const
+      end
+    end
+
+    included do
+      private :delegatable?
+      private_class_method :delegatable?
+    end
+
+  end
+end
+
+module Draper
+  class Factory
+    # Creates a decorator factory.
+    #
+    # @option options [Decorator, CollectionDecorator] :with (nil)
+    #   decorator class to use. If nil, it is inferred from the object
+    #   passed to {#decorate}.
+    # @option options [Hash, #call] context
+    #   extra data to be stored in created decorators. If a proc is given, it
+    #   will be called each time {#decorate} is called and its return value
+    #   will be used as the context.
+    def initialize(options = {})
+      options.assert_valid_keys(:with, :context)
+      @decorator_class = options.delete(:with)
+      @default_options = options
+    end
+
+    # Decorates an object, inferring whether to create a singular or collection
+    # decorator from the type of object passed.
+    #
+    # @param [Object] object
+    #   object to decorate.
+    # @option options [Hash] context
+    #   extra data to be stored in the decorator. Overrides any context passed
+    #   to the constructor.
+    # @option options [Object, Array] context_args (nil)
+    #   argument(s) to be passed to the context proc.
+    # @return [Decorator, CollectionDecorator] the decorated object.
+    def decorate(object, options = {})
+      return nil if object.nil?
+      Worker.new(decorator_class, object).call(options.reverse_merge(default_options))
+    end
+
+    private
+
+    attr_reader :decorator_class, :default_options
+
+    # @private
+    class Worker
+      def initialize(decorator_class, object)
+        @decorator_class = decorator_class
+        @object = object
+      end
+
+      def call(options)
+        update_context options
+        decorator.call(object, options)
+      end
+
+      def decorator
+        return decorator_method(decorator_class) if decorator_class
+        return object_decorator if decoratable?
+        return decorator_method(Draper::CollectionDecorator) if collection?
+        raise Draper::UninferrableDecoratorError.new(object.class)
+      end
+
+      private
+
+      attr_reader :decorator_class, :object
+
+      def object_decorator
+        if collection?
+          ->(object, options) { object.decorator_class.decorate_collection(object, options.reverse_merge(with: nil))}
+        else
+          ->(object, options) { object.decorate(options) }
+        end
+      end
+
+      def decorator_method(klass)
+        if collection? && klass.respond_to?(:decorate_collection)
+          klass.method(:decorate_collection)
+        else
+          klass.method(:decorate)
+        end
+      end
+
+      def collection?
+        object.respond_to?(:first)
+      end
+
+      def decoratable?
+        object.respond_to?(:decorate)
+      end
+
+      def update_context(options)
+        args = options.delete(:context_args)
+        options[:context] = options[:context].call(*Array.wrap(args)) if options[:context].respond_to?(:call)
+      end
+    end
+  end
+end
+
+require 'rails/railtie'
+
+module ActiveModel
+  class Railtie < Rails::Railtie
+    generators do |app|
+      app ||= Rails.application # Rails 3.0.x does not yield `app`
+
+      Rails::Generators.configure! app.config.generators
+      require_relative '../generators/controller_override'
+    end
+  end
+end
+
+module Draper
+  class Railtie < Rails::Railtie
+
+    config.after_initialize do |app|
+      app.config.paths.add 'app/decorators', eager_load: true
+
+      if Rails.env.test?
+        require 'draper/test_case'
+        require 'draper/test/rspec_integration' if defined?(RSpec) and RSpec.respond_to?(:configure)
+      end
+    end
+
+    initializer "draper.setup_action_controller" do |app|
+      ActiveSupport.on_load :action_controller do
+        Draper.setup_action_controller self
+      end
+    end
+
+    initializer "draper.setup_action_mailer" do |app|
+      ActiveSupport.on_load :action_mailer do
+        Draper.setup_action_mailer self
+      end
+    end
+
+    initializer "draper.setup_orm" do |app|
+      [:active_record, :mongoid].each do |orm|
+        ActiveSupport.on_load orm do
+          Draper.setup_orm self
+        end
+      end
+    end
+
+    initializer "draper.setup_active_model_serializers" do |app|
+      ActiveSupport.on_load :active_model_serializers do
+        Draper::CollectionDecorator.send :include, ActiveModel::ArraySerializerSupport
+      end
+    end
+
+    initializer "draper.minitest-rails_integration" do |app|
+      ActiveSupport.on_load :minitest do
+        require "draper/test/minitest_integration"
+      end
+    end
+
+    console do
+      require 'action_controller/test_case'
+      ApplicationController.new.view_context
+      Draper::ViewContext.build
+    end
+
+    rake_tasks do
+      Dir[File.join(File.dirname(__FILE__),'tasks/*.rake')].each { |f| load f }
+    end
+  end
+end
+
+module Draper
+  # Provides the {#helpers} method used in {Decorator} and {CollectionDecorator}
+  # to call the Rails helpers.
+  module ViewHelpers
+    extend ActiveSupport::Concern
+
+    module ClassMethods
+
+      # Access the helpers proxy to call built-in and user-defined
+      # Rails helpers from a class context.
+      #
+      # @return [HelperProxy] the helpers proxy
+      def helpers
+        Draper::ViewContext.current
+      end
+      alias_method :h, :helpers
+
+    end
+
+    # Access the helpers proxy to call built-in and user-defined
+    # Rails helpers. Aliased to `h` for convenience.
+    #
+    # @return [HelperProxy] the helpers proxy
+    def helpers
+      Draper::ViewContext.current
+    end
+    alias_method :h, :helpers
+
+    # Alias for `helpers.localize`, since localize is something that's used
+    # quite often. Further aliased to `l` for convenience.
+    def localize(*args)
+      helpers.localize(*args)
+    end
+    alias_method :l, :localize
+
+  end
+end
+
+require "active_support/core_ext/module/delegation"
+require 'set'
+require 'uniform_notifier'
+require 'bullet/ext/object'
+require 'bullet/ext/string'
+require 'bullet/dependency'
+
+module Bullet
+  extend Dependency
+
+  autoload :ActiveRecord, "bullet/#{active_record_version}" if active_record?
+  autoload :Mongoid, "bullet/#{mongoid_version}" if mongoid?
+  autoload :Rack, 'bullet/rack'
+  autoload :Notification, 'bullet/notification'
+  autoload :Detector, 'bullet/detector'
+  autoload :Registry, 'bullet/registry'
+  autoload :NotificationCollector, 'bullet/notification_collector'
+
+  if defined? Rails::Railtie
+    class BulletRailtie < Rails::Railtie
+      initializer "bullet.configure_rails_initialization" do |app|
+        app.middleware.use Bullet::Rack
+      end
+    end
+  end
+
+  class << self
+    attr_writer :enable, :n_plus_one_query_enable, :unused_eager_loading_enable, :counter_cache_enable, :stacktrace_includes
+    attr_reader :notification_collector, :whitelist
+    attr_accessor :add_footer, :orm_pathches_applied
+
+    delegate :alert=, :console=, :growl=, :rails_logger=, :xmpp=, :airbrake=, :bugsnag=, :to => UniformNotifier
+
+    def raise=(should_raise)
+      UniformNotifier.raise=(should_raise ? Notification::UnoptimizedQueryError : false)
+    end
+
+    DETECTORS = [ Bullet::Detector::NPlusOneQuery,
+                  Bullet::Detector::UnusedEagerLoading,
+                  Bullet::Detector::CounterCache ]
+
+    def enable=(enable)
+      @enable = @n_plus_one_query_enable = @unused_eager_loading_enable = @counter_cache_enable = enable
+      if enable?
+        reset_whitelist
+        unless orm_pathches_applied
+          self.orm_pathches_applied = true
+          Bullet::Mongoid.enable if mongoid?
+          Bullet::ActiveRecord.enable if active_record?
+        end
+      end
+    end
+
+    def enable?
+      !!@enable
+    end
+
+    def n_plus_one_query_enable?
+      self.enable? && !!@n_plus_one_query_enable
+    end
+
+    def unused_eager_loading_enable?
+      self.enable? && !!@unused_eager_loading_enable
+    end
+
+    def counter_cache_enable?
+      self.enable? && !!@counter_cache_enable
+    end
+
+    def stacktrace_includes
+      @stacktrace_includes || []
+    end
+
+    def add_whitelist(options)
+      @whitelist[options[:type]][options[:class_name].classify] ||= []
+      @whitelist[options[:type]][options[:class_name].classify] << options[:association].to_sym
+    end
+
+    def get_whitelist_associations(type, class_name)
+      Array(@whitelist[type][class_name])
+    end
+
+    def reset_whitelist
+      @whitelist = {:n_plus_one_query => {}, :unused_eager_loading => {}, :counter_cache => {}}
+    end
+
+    def bullet_logger=(active)
+      if active
+        require 'fileutils'
+        root_path = "#{rails? ? Rails.root.to_s : Dir.pwd}"
+        FileUtils.mkdir_p(root_path + '/log')
+        bullet_log_file = File.open("#{root_path}/log/bullet.log", 'a+')
+        bullet_log_file.sync = true
+        UniformNotifier.customized_logger = bullet_log_file
+      end
+    end
+
+    def debug(title, message)
+      puts "[Bullet][#{title}] #{message}" if ENV['BULLET_DEBUG'] == 'true'
+    end
+
+    def start_request
+      Thread.current[:bullet_start] = true
+      Thread.current[:bullet_notification_collector] = Bullet::NotificationCollector.new
+
+      Thread.current[:bullet_object_associations] = Bullet::Registry::Base.new
+      Thread.current[:bullet_call_object_associations] = Bullet::Registry::Base.new
+      Thread.current[:bullet_possible_objects] = Bullet::Registry::Object.new
+      Thread.current[:bullet_impossible_objects] = Bullet::Registry::Object.new
+      Thread.current[:bullet_inversed_objects] = Bullet::Registry::Base.new
+      Thread.current[:bullet_eager_loadings] = Bullet::Registry::Association.new
+
+      Thread.current[:bullet_counter_possible_objects] ||= Bullet::Registry::Object.new
+      Thread.current[:bullet_counter_impossible_objects] ||= Bullet::Registry::Object.new
+    end
+
+    def end_request
+      Thread.current[:bullet_start] = nil
+      Thread.current[:bullet_notification_collector] = nil
+
+      Thread.current[:bullet_object_associations] = nil
+      Thread.current[:bullet_call_object_associations] = nil
+      Thread.current[:bullet_possible_objects] = nil
+      Thread.current[:bullet_impossible_objects] = nil
+      Thread.current[:bullet_inversed_objects] = nil
+      Thread.current[:bullet_eager_loadings] = nil
+
+      Thread.current[:bullet_counter_possible_objects] = nil
+      Thread.current[:bullet_counter_impossible_objects] = nil
+    end
+
+    def start?
+      Thread.current[:bullet_start]
+    end
+
+    def notification_collector
+      Thread.current[:bullet_notification_collector]
+    end
+
+    def notification?
+      return unless start?
+      Bullet::Detector::UnusedEagerLoading.check_unused_preload_associations
+      notification_collector.notifications_present?
+    end
+
+    def gather_inline_notifications
+      responses = []
+      for_each_active_notifier_with_notification do |notification|
+        responses << notification.notify_inline
+      end
+      responses.join( "\n" )
+    end
+
+    def perform_out_of_channel_notifications(env = {})
+      for_each_active_notifier_with_notification do |notification|
+        notification.url = env['REQUEST_URI']
+        notification.notify_out_of_channel
+      end
+    end
+
+    def footer_info
+      info = []
+      for_each_active_notifier_with_notification do |notification|
+        info << notification.short_notice
+      end
+      info
+    end
+
+    def warnings
+      notification_collector.collection.inject({}) do |warnings, notification|
+        warning_type = notification.class.to_s.split(':').last.tableize
+        warnings[warning_type] ||= []
+        warnings[warning_type] << notification
+        warnings
+      end
+    end
+
+    def profile
+      Bullet.start_request if Bullet.enable?
+
+      yield
+
+      if Bullet.enable? && Bullet.notification?
+        Bullet.perform_out_of_channel_notifications
+      end
+      Bullet.end_request if Bullet.enable?
+    end
+
+    private
+      def for_each_active_notifier_with_notification
+        UniformNotifier.active_notifiers.each do |notifier|
+          notification_collector.collection.each do |notification|
+            notification.notifier = notifier
+            yield notification
+          end
+        end
+      end
+  end
+end
+
+module Bullet
+  module Dependency
+    def mongoid?
+      @mongoid ||= defined? ::Mongoid
+    end
+
+    def active_record?
+      @active_record ||= defined? ::ActiveRecord
+    end
+
+    def rails?
+      @rails ||= defined? ::Rails
+    end
+
+    def active_record_version
+      @active_record_version ||= begin
+                                   if active_record30?
+                                     'active_record3'
+                                   elsif active_record31? || active_record32?
+                                     'active_record3x'
+                                   elsif active_record40?
+                                     'active_record4'
+                                   elsif active_record41?
+                                     'active_record41'
+                                   elsif active_record42?
+                                     'active_record42'
+                                   end
+                                 end
+    end
+
+    def mongoid_version
+      @mongoid_version ||= begin
+                             if mongoid2x?
+                               'mongoid2x'
+                             elsif mongoid3x?
+                               'mongoid3x'
+                             elsif mongoid4x?
+                               'mongoid4x'
+                             end
+                           end
+    end
+
+    def active_record3?
+      active_record? && ::ActiveRecord::VERSION::MAJOR == 3
+    end
+
+    def active_record4?
+      active_record
+    end
+
+    def active_record41?
+      active_record4?
+    end
+
+    def active_record42?
+      active_record4? && ::ActiveRecord::VERSION::MINOR == 2
+    end
+
+    def mongoid2x?
+      mongoid? && ::Mongoid::VERSION =~ /\A2\.[4-8]/
+    end
+
+    def mongoid3x?
+      mongoid? && ::Mongoid::VERSION =~ /\A3/
+    end
+
+    def mongoid4x?
+      mongoid? && ::Mongoid::VERSION =~ /\A4/
+    end
+  end
+end
+
+module Bullet
+  module Detector
+    class CounterCache < Base
+      class <<self
+        def add_counter_cache(object, associations)
+          return unless Bullet.start?
+          return unless Bullet.counter_cache_enable?
+          return unless object.primary_key_value
+
+          Bullet.debug("Detector::CounterCache#add_counter_cache", "object: #{object.bullet_key}, associations: #{associations}")
+          if conditions_met?(object.bullet_key, associations)
+            create_notification object.class.to_s, associations
+          end
+        end
+
+        def add_possible_objects(object_or_objects)
+          return unless Bullet.start?
+          return unless Bullet.counter_cache_enable?
+          objects = Array(object_or_objects)
+          return if objects.map(&:primary_key_value).compact.empty?
+
+          Bullet.debug("Detector::CounterCache#add_possible_objects", "objects: #{objects.map(&:bullet_key).join(', ')}")
+          objects.each { |object| possible_objects.add object.bullet_key }
+        end
+
+        def add_impossible_object(object)
+          return unless Bullet.start?
+          return unless Bullet.counter_cache_enable?
+          return unless object.primary_key_value
+
+          Bullet.debug("Detector::CounterCache#add_impossible_object", "object: #{object.bullet_key}")
+          impossible_objects.add object.bullet_key
+        end
+
+        private
+          def create_notification(klazz, associations)
+            notify_associations = Array(associations) - Bullet.get_whitelist_associations(:counter_cache, klazz)
+
+            if notify_associations.present?
+              notice = Bullet::Notification::CounterCache.new klazz, notify_associations
+              Bullet.notification_collector.add notice
+            end
+          end
+
+          def possible_objects
+            Thread.current[:bullet_counter_possible_objects]
+          end
+
+          def impossible_objects
+            Thread.current[:bullet_counter_impossible_objects]
+          end
+
+          def conditions_met?(bullet_key, associations)
+            possible_objects.include?(bullet_key) && !impossible_objects.include?(bullet_key)
+          end
+      end
+    end
+  end
+end
+
+module Bullet
+  module Detector
+    class Association < Base
+      class <<self
+        def add_object_associations(object, associations)
+          return unless Bullet.start?
+          return if !Bullet.n_plus_one_query_enable? && !Bullet.unused_eager_loading_enable?
+          return unless object.primary_key_value
+
+          Bullet.debug("Detector::Association#add_object_associations", "object: #{object.bullet_key}, associations: #{associations}")
+          object_associations.add(object.bullet_key, associations)
+        end
+
+        def add_call_object_associations(object, associations)
+          return unless Bullet.start?
+          return if !Bullet.n_plus_one_query_enable? && !Bullet.unused_eager_loading_enable?
+          return unless object.primary_key_value
+
+          Bullet.debug("Detector::Association#add_call_object_associations", "object: #{object.bullet_key}, associations: #{associations}")
+          call_object_associations.add(object.bullet_key, associations)
+        end
+
+        private
+          # object_associations keep the object relationships
+          def object_associations
+            Thread.current[:bullet_object_associations]
+          end
+
+          # call_object_associations keep the object relationships
+          def call_object_associations
+            Thread.current[:bullet_call_object_associations]
+          end
+
+          # possible_objects keep the class to object relationships
+          def possible_objects
+            Thread.current[:bullet_possible_objects]
+          end
+
+          # impossible_objects keep the class to objects relationships
+          def impossible_objects
+            Thread.current[:bullet_impossible_objects]
+          end
+
+          # inversed_objects keeps object relationships
+          def inversed_objects
+            Thread.current[:bullet_inversed_objects]
+          end
+
+          # e.g. { ["Post:1", "Post:2"] => [:comments, :user] }
+          def eager_loadings
+            Thread.current[:bullet_eager_loadings]
+          end
+      end
+    end
+  end
+end

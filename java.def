@@ -1,0 +1,4529 @@
+package org.webbitserver.helpers;
+
+import org.webbitserver.handler.FileEntry;
+
+import java.io.File;
+import java.io.IOException;
+import java.net.URISyntaxException;
+import java.net.URL;
+import java.security.CodeSource;
+import java.util.ArrayList;
+import java.util.List;
+import java.util.zip.ZipEntry;
+import java.util.zip.ZipInputStream;
+
+public class ClassloaderResourceHelper {
+
+    /**
+     * Lists all files and directories relative to the classpath entry (jar or folder)
+     *
+     * @param clazz        Any class within the classpath entry to be listed.
+     * @param subdirectory Subdirectory to list.  Must be an absolute path, relative to the top level of the classpath entry.
+     * @return List of files directly in subdirectory, under the classpath entry containing clazz.
+     * @throws IOException
+     */
+    public static Iterable<FileEntry> listFilesRelativeToClass(Class<?> clazz, String subdirectory) throws IOException {
+        ArrayList<FileEntry> list = new ArrayList<FileEntry>();
+        CodeSource src = clazz.getProtectionDomain().getCodeSource();
+        if (src == null) {
+            return list;
+        }
+        URL classpathEntry = src.getLocation();
+        try {
+            // Check if we're loaded from a folder
+            File file = new File(new File(classpathEntry.toURI()), subdirectory);
+            if (file.isDirectory()) {
+                return fileEntriesFor(file.listFiles());
+            }
+        } catch (URISyntaxException e) {
+            // Should never happen, because we know classpathentry is valid
+            throw new RuntimeException(e);
+        }
+
+        // We're not in a folder, so we must be in a jar or similar
+        subdirectory = subdirectory.replace(File.separatorChar, '/');
+        if (!subdirectory.endsWith("/")) {
+            subdirectory = subdirectory + "/";
+        }
+
+        ZipInputStream jarStream = new ZipInputStream(classpathEntry.openStream());
+        ZipEntry zipEntry;
+        while ((zipEntry = jarStream.getNextEntry()) != null) {
+            if (isChild(subdirectory, zipEntry.getName())) {
+                String basename = zipEntry.getName().substring(subdirectory.length());
+                int indexOfSlash = basename.indexOf('/');
+                if (indexOfSlash < 0 || indexOfSlash == basename.length() - 1) {
+                    list.add(new FileEntry(basename));
+                }
+            }
+        }
+        return list;
+    }
+
+    private static boolean isChild(String parent, String name) {
+        return name.startsWith(parent);
+    }
+
+    public static Iterable<FileEntry> fileEntriesFor(File[] files) {
+        List<FileEntry> fileEntries = new ArrayList<FileEntry>(files.length);
+        for (File file : files) {
+            String filename = file.getName();
+            if (file.isDirectory()) {
+                filename += "/";
+            }
+            fileEntries.add(new FileEntry(filename));
+        }
+        return fileEntries;
+    }
+}
+
+package org.webbitserver.helpers;
+
+import java.io.ByteArrayOutputStream;
+import java.io.IOException;
+import java.io.Reader;
+import java.io.StringReader;
+
+/**
+ * Encodes binary data to plain text as Base64.
+ *
+ * This code originally came from the XStream http://xstream.codehaus.org project by Joe Walnes. Relicensed to Webbit.
+ */
+public class Base64 {
+
+    private static final char[] SIXTY_FOUR_CHARS = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/".toCharArray();
+    private static final int[] REVERSE_MAPPING = new int[123];
+
+    static {
+        for (int i = 0; i < SIXTY_FOUR_CHARS.length; i++) REVERSE_MAPPING[SIXTY_FOUR_CHARS[i]] = i + 1;
+    }
+
+    public static String encode(byte[] input) {
+        StringBuilder result = new StringBuilder();
+        int outputCharCount = 0;
+        for (int i = 0; i < input.length; i += 3) {
+            int remaining = Math.min(3, input.length - i);
+            int oneBigNumber = (input[i] & 0xff) << 16 | (remaining <= 1 ? 0 : input[i + 1] & 0xff) << 8 | (remaining <= 2 ? 0 : input[i + 2] & 0xff);
+            for (int j = 0; j < 4; j++)
+                result.append(remaining + 1 > j ? SIXTY_FOUR_CHARS[0x3f & oneBigNumber >> 6 * (3 - j)] : '=');
+            if ((outputCharCount += 4) % 76 == 0) result.append('\n');
+        }
+        return result.toString();
+    }
+
+    public static byte[] decode(String input) {
+        try {
+            ByteArrayOutputStream out = new ByteArrayOutputStream();
+            StringReader in = new StringReader(input);
+            for (int i = 0; i < input.length(); i += 4) {
+                int a[] = {mapCharToInt(in), mapCharToInt(in), mapCharToInt(in), mapCharToInt(in)};
+                int oneBigNumber = (a[0] & 0x3f) << 18 | (a[1] & 0x3f) << 12 | (a[2] & 0x3f) << 6 | (a[3] & 0x3f);
+                for (int j = 0; j < 3; j++) {
+                    if (a[j + 1] >= 0) {
+                        out.write(0xff & oneBigNumber >> 8 * (2 - j));
+                    }
+                }
+            }
+            return out.toByteArray();
+        } catch (IOException e) {
+            throw new Error(e + ": " + e.getMessage());
+        }
+    }
+
+    private static int mapCharToInt(Reader input) throws IOException {
+        int c;
+        while ((c = input.read()) != -1) {
+            int result = REVERSE_MAPPING[c];
+            if (result != 0) return result - 1;
+            if (c == '=') return -1;
+        }
+        return -1;
+    }
+}
+
+package org.webbitserver.helpers;
+
+import java.util.concurrent.Executors;
+import java.util.concurrent.ThreadFactory;
+import java.util.concurrent.atomic.AtomicInteger;
+
+/**
+ * Wraps a ThreadFactory and assigns a name to each newly created thread, that includes two
+ * counters: one to indicate which ThreadFactory instance this is, and another for the thread
+ * created by the factory.
+ */
+public class NamingThreadFactory implements ThreadFactory {
+    private static final AtomicInteger factoryCount = new AtomicInteger();
+    private final AtomicInteger threadCount = new AtomicInteger();
+
+    private final ThreadFactory factory;
+    private final String prefix;
+
+    public NamingThreadFactory(ThreadFactory factory, String prefix) {
+        this.factory = factory;
+        this.prefix = prefix;
+        factoryCount.incrementAndGet();
+    }
+
+    public NamingThreadFactory(String prefix) {
+        this(Executors.defaultThreadFactory(), prefix);
+    }
+
+    @Override
+    public Thread newThread(Runnable r) {
+        threadCount.incrementAndGet();
+        Thread thread = factory.newThread(r);
+        thread.setName(threadName());
+        return thread;
+    }
+
+    /**
+     * Override this method to customize thread name.
+     */
+    protected String threadName() {
+        return String.format("%s-%d-%d-thread", prefix, factoryCount.intValue(), threadCount.intValue());
+    }
+}
+
+package org.webbitserver.helpers;
+
+import org.webbitserver.WebbitException;
+
+import javax.net.ssl.KeyManagerFactory;
+import javax.net.ssl.SSLContext;
+import javax.net.ssl.TrustManager;
+import javax.net.ssl.TrustManagerFactory;
+import java.io.InputStream;
+import java.security.KeyStore;
+import java.security.Security;
+
+public class SslFactory {
+    private static final String PROTOCOL = "TLS";
+    private final KeyStore ks;
+
+    public SslFactory(InputStream keyStore, String storePass) {
+        try {
+            // Create and load keystore file
+            ks = KeyStore.getInstance(KeyStore.getDefaultType());
+            ks.load(keyStore, storePass.toCharArray());
+        } catch (Exception e) {
+            throw new WebbitException(e);
+        }
+    }
+
+    public SSLContext getServerContext(String keyPass) throws WebbitException {
+        try {
+            // Set up key manager factory to use our key store
+            String algorithm = Security.getProperty("ssl.KeyManagerFactory.algorithm");
+            if (algorithm == null) algorithm = "SunX509";
+            KeyManagerFactory kmf = KeyManagerFactory.getInstance(algorithm);
+            kmf.init(ks, keyPass.toCharArray());
+
+            // Initialize the SSLContext to work with our key managers.
+            SSLContext sslContext = SSLContext.getInstance(PROTOCOL);
+            sslContext.init(kmf.getKeyManagers(), null, null);
+            return sslContext;
+        } catch (Exception e) {
+            throw new WebbitException(e);
+        }
+    }
+
+    public SSLContext getClientContext() throws WebbitException {
+        try {
+            SSLContext sslContext = SSLContext.getInstance(PROTOCOL);
+            TrustManagerFactory tmf = TrustManagerFactory.getInstance("SunX509", "SunJSSE");
+            tmf.init(ks);
+            TrustManager[] trustManagers = tmf.getTrustManagers();
+            sslContext.init(null, trustManagers, null);
+            return sslContext;
+        } catch (Exception e) {
+            throw new WebbitException(e);
+        }
+    }
+}
+
+package org.webbitserver.helpers;
+
+public class XssCharacterEscaper {
+    /**
+     * Replaces characters in input which may open up cross-site scripting (XSS) attacks with XSS-safe equivalents.
+     *
+     * Follows escaping rules from
+     * <a href="https://www.owasp.org/index.php/XSS_(Cross_Site_Scripting)_Prevention_Cheat_Sheet#RULE_.231_-_HTML_Escape_Before_Inserting_Untrusted_Data_into_HTML_Element_Content">the OWASP</a>.
+     *
+     * @param input String to sanitize.
+     * @return XSS-safe version of input.
+     */
+    public static String escape(String input) {
+        StringBuilder builder = new StringBuilder(input.length());
+        for (int i = 0; i < input.length(); ++i) {
+            char original = input.charAt(i);
+            switch (original) {
+                case '&':
+                    builder.append("&amp;");
+                    break;
+                case '<':
+                    builder.append("&lt;");
+                    break;
+                case '>':
+                    builder.append("&gt;");
+                    break;
+                case '"':
+                    builder.append("&quot;");
+                    break;
+                case '\'':
+                    builder.append("&#x27;");
+                    break;
+                case '/':
+                    builder.append("&#x2F;");
+                    break;
+                default:
+                    builder.append(original);
+                    break;
+            }
+        }
+        return builder.toString();
+    }
+}
+
+package org.webbitserver.handler;
+
+import org.webbitserver.HttpControl;
+import org.webbitserver.HttpRequest;
+import org.webbitserver.HttpResponse;
+import org.webbitserver.helpers.ClassloaderResourceHelper;
+
+import java.io.File;
+import java.io.FileInputStream;
+import java.io.IOException;
+import java.util.concurrent.Executor;
+import java.text.SimpleDateFormat;
+import java.util.Date;
+import java.util.TimeZone;
+import java.util.Locale;
+
+import static java.util.concurrent.Executors.newFixedThreadPool;
+
+public class StaticFileHandler extends AbstractResourceHandler {
+
+    private final File dir;
+
+    private final long maxAge;
+
+    public StaticFileHandler(File dir, Executor ioThread, TemplateEngine templateEngine) {
+        super(ioThread, templateEngine);
+        this.dir = dir;
+        this.maxAge = 0;
+    }
+
+    public StaticFileHandler(File dir, Executor ioThread) {
+        this(dir, ioThread, new StaticFile());
+    }
+
+    public StaticFileHandler(String dir, Executor ioThread, TemplateEngine templateEngine) {
+        this(new File(dir), ioThread, templateEngine);
+    }
+
+    public StaticFileHandler(String dir, Executor ioThread) {
+        this(dir, ioThread, new StaticFile());
+    }
+
+    public StaticFileHandler(File dir, TemplateEngine templateEngine) {
+        this(dir, newFixedThreadPool(4), templateEngine);
+    }
+
+    public StaticFileHandler(File dir) {
+        this(dir, new StaticFile());
+    }
+
+    public StaticFileHandler(String dir, TemplateEngine templateEngine) {
+        this(new File(dir), templateEngine);
+    }
+
+    public StaticFileHandler(String dir) {
+        this(new File(dir));
+    }
+
+    //cache control-aware
+
+    public StaticFileHandler(File dir, Executor ioThread, TemplateEngine templateEngine, long maxAge) {
+        super(ioThread, templateEngine);
+        this.dir = dir;
+        this.maxAge = maxAge;
+    }
+
+    public StaticFileHandler(File dir, Executor ioThread, long maxAge) {
+        this(dir, ioThread, new StaticFile(), maxAge);
+    }
+
+    public StaticFileHandler(String dir, long maxAge) {
+        this(new File(dir), maxAge);
+    }
+
+    public StaticFileHandler(File dir, long maxAge) {
+        this(dir, newFixedThreadPool(4), new StaticFile(), maxAge);
+    }
+
+    @Override
+    protected FileWorker createIOWorker(HttpRequest request,
+                                        HttpResponse response,
+                                        HttpControl control) {
+        return new FileWorker(request, response, control, maxAge);
+    }
+
+    protected class FileWorker extends IOWorker {
+
+        private File file;
+
+        private final HttpResponse response;
+
+        private final HttpRequest request;
+
+        private final long maxAge;
+
+        private String mimeType(String uri) {
+            String ext = uri.lastIndexOf(".") != -1 ? uri.substring(uri.lastIndexOf(".")) : null;
+            String currentMimeType = mimeTypes.get(ext);
+            if (currentMimeType == null) currentMimeType = "text/plain";
+            return currentMimeType;
+        }
+        //based on: http://m2tec.be/blog/2010/02/03/java-md5-hex-0093
+        private  String MD5(String md5) {
+            try {
+                java.security.MessageDigest md = java.security.MessageDigest.getInstance("MD5");
+                byte[] array = md.digest(md5.getBytes("UTF-8"));
+                StringBuffer sb = new StringBuffer();
+                for (int i = 0; i < array.length; ++i) {
+                    sb.append(Integer.toHexString((array[i] & 0xFF) | 0x100).substring(1, 3));
+                }
+                return sb.toString();
+            } catch (Exception e) {
+                return null;
+            }
+        }
+
+        private String toHeader(Date date) {
+            SimpleDateFormat httpDateFormat = new SimpleDateFormat("EEE, dd MMM yyyy HH:mm:ss z", Locale.US);
+            httpDateFormat.setTimeZone(TimeZone.getTimeZone("GMT"));
+            return httpDateFormat.format(date);
+        }
+
+        private Date fromHeader(String date) {
+            SimpleDateFormat httpDateFormat = new SimpleDateFormat("EEE, dd MMM yyyy HH:mm:ss z", Locale.US);
+            httpDateFormat.setTimeZone(TimeZone.getTimeZone("GMT"));
+            try {
+                return httpDateFormat.parse(date);
+            } catch (Exception ex) {
+                return new Date();
+            }
+        }
+
+        protected FileWorker(HttpRequest request, HttpResponse response, HttpControl control, long maxAge) {
+            super(request.uri(), request, response, control);
+            this.maxAge = maxAge;
+            this.response = response;
+            this.request = request;
+        }
+
+        @Override
+        protected boolean exists() throws IOException {
+            file = resolveFile(path);
+            return file != null && file.exists();
+        }
+
+        @Override
+        protected boolean isDirectory() throws IOException {
+            return file.isDirectory();
+        }
+
+        @Override
+        protected byte[] fileBytes() throws IOException {
+            byte[] raw = file.isFile() ? read(file) : null;
+            //add cache control headers if needed
+            if (raw != null) {
+                Date lastModified = new Date(file.lastModified());
+                String hashtext = MD5(Long.toString(lastModified.getTime()));
+                if (hashtext != null) response.header("ETag", "\"" + hashtext + "\"");
+
+                response.header("Last-Modified", toHeader(lastModified));
+                //is there an incoming If-Modified-Since?
+                if (request.header("If-Modified-Since") != null) {
+                    if (fromHeader(request.header("If-Modified-Since")).getTime() >= lastModified.getTime() ) {
+                        response.status(304);
+                        return new byte[]{};
+                    }
+                }
+                //is setting cache control necessary?
+                if (maxAge != 0) {
+                    response.header("Expires", toHeader( new Date(new Date().getTime() + maxAge * 1000)));
+                    response.header("Cache-Control", "max-age=" + maxAge+", public");
+                }
+            }
+            return raw;
+        }
+
+        @Override
+        protected byte[] welcomeBytes() throws IOException {
+            File welcome = new File(file, welcomeFileName);
+            return welcome.isFile() ? read(welcome) : null;
+        }
+
+        @Override
+        protected byte[] directoryListingBytes() throws IOException {
+            if (!isDirectory()) {
+                return null;
+            }
+            Iterable<FileEntry> files = ClassloaderResourceHelper.fileEntriesFor(file.listFiles());
+            return directoryListingFormatter.formatFileListAsHtml(files);
+        }
+
+        private byte[] read(File file) throws IOException {
+            return read((int) file.length(), new FileInputStream(file));
+        }
+
+        protected File resolveFile(String path) throws IOException {
+            // Find file, relative to root
+            File result = new File(dir, path).getCanonicalFile();
+
+            // For security, check file really does exist under root.
+            String fullPath = result.getPath();
+            if (!fullPath.startsWith(dir.getCanonicalPath() + File.separator) && !fullPath.equals(dir.getCanonicalPath())) {
+                // Prevent paths like http://foo/../../etc/passwd
+                return null;
+            }
+            return result;
+        }
+    }
+}
+
+package org.webbitserver.handler;
+
+import org.webbitserver.HttpControl;
+import org.webbitserver.HttpHandler;
+import org.webbitserver.HttpRequest;
+import org.webbitserver.HttpResponse;
+
+import java.util.Timer;
+import java.util.TimerTask;
+import java.util.concurrent.Executor;
+
+/**
+ * Wraps a standard HttpHandler, and will introduce an artificial delay. Useful for testing
+ * how things will behave when they are slow.
+ */
+public class DelayedHttpHandler implements HttpHandler {
+
+    private final Executor executor;
+    private Timer timer;
+    private final long delayInMillis;
+    private final HttpHandler handler;
+
+    public DelayedHttpHandler(Executor executor, long delayInMillis, HttpHandler handler) {
+        this.delayInMillis = delayInMillis;
+        this.handler = handler;
+        timer = new Timer();
+        this.executor = executor;
+    }
+
+    @Override
+    public void handleHttpRequest(final HttpRequest request, final HttpResponse response, final HttpControl control) throws Exception {
+        timer.schedule(new TimerTask() {
+            @Override
+            public void run() {
+                executor.execute(new Runnable() {
+                    @Override
+                    public void run() {
+                        try {
+                            handler.handleHttpRequest(request, response, control);
+                        } catch (Exception e) {
+                            // TODO
+                            e.printStackTrace();
+                        }
+                    }
+                });
+            }
+        }, delayInMillis);
+    }
+}
+
+package org.webbitserver.handler.authentication;
+
+import org.webbitserver.HttpControl;
+import org.webbitserver.HttpHandler;
+import org.webbitserver.HttpRequest;
+import org.webbitserver.HttpResponse;
+import org.webbitserver.helpers.Base64;
+
+/**
+ * Adds HTTP Basic authentication to a page. Users should provide an implementation of UsernamePasswordAuthenticator
+ * to check the supplied credentials.
+ * <p/>
+ * See samples.authentication.SimplePasswordsExample in the src/tests directory for a really basic usage. To implement
+ * a custom authenticator that performs background IO, see samples.authentication.AsyncPasswordsExample.
+ *
+ * @see PasswordAuthenticator
+ * @see InMemoryPasswords
+ */
+public class BasicAuthenticationHandler implements HttpHandler {
+
+    public static final String USERNAME = "user";
+
+    private static final String BASIC_PREFIX = "Basic ";
+
+    private final String realm;
+    private final PasswordAuthenticator authenticator;
+
+    public BasicAuthenticationHandler(PasswordAuthenticator authenticator) {
+        this(authenticator, "Secure Area");
+    }
+
+    public BasicAuthenticationHandler(PasswordAuthenticator authenticator, String realm) {
+        this.realm = realm;
+        this.authenticator = authenticator;
+    }
+
+    @Override
+    public void handleHttpRequest(final HttpRequest request, final HttpResponse response, final HttpControl control) throws Exception {
+        String authHeader = request.header("Authorization");
+        if (authHeader == null) {
+            needAuthentication(response);
+        } else {
+            if (authHeader.startsWith(BASIC_PREFIX)) {
+                String decoded = new String(Base64.decode(authHeader.substring(BASIC_PREFIX.length())));
+                final String[] pair = decoded.split(":", 2);
+                if (pair.length == 2) {
+                    final String username = pair[0];
+                    final String password = pair[1];
+                    PasswordAuthenticator.ResultCallback callback = new PasswordAuthenticator.ResultCallback() {
+                        @Override
+                        public void success() {
+                            request.data(USERNAME, username);
+                            control.nextHandler();
+                        }
+
+                        @Override
+                        public void failure() {
+                            needAuthentication(response);
+                        }
+                    };
+
+                    authenticator.authenticate(request, username, password, callback, control);
+                } else {
+                    needAuthentication(response);
+                }
+            }
+        }
+    }
+
+    private void needAuthentication(HttpResponse response) {
+        response.status(401)
+                .header("WWW-Authenticate", "Basic realm=\"" + realm + "\"")
+                .content("Need authentication")
+                .end();
+    }
+
+}
+
+package com.iluwatar;
+
+import java.util.Stack;
+
+/**
+ *
+ * Interpreter pattern breaks sentences into expressions (Expression) that can
+ * be evaluated and as a whole form the result.
+ *
+ */
+public class App {
+
+	/**
+	 *
+	 * Expressions can be evaluated using prefix, infix or postfix notations
+	 * This sample uses postfix, where operator comes after the operands
+	 *
+	 */
+	public static void main(String[] args) {
+		String tokenString = "4 3 2 - 1 + *";
+		Stack<Expression> stack = new Stack<>();
+
+		String[] tokenList = tokenString.split(" ");
+		for (String s : tokenList) {
+			if (isOperator(s)) {
+				Expression rightExpression = stack.pop();
+				Expression leftExpression = stack.pop();
+				System.out
+						.println(String.format(
+								"popped from stack left: %d right: %d",
+								leftExpression.interpret(),
+								rightExpression.interpret()));
+				Expression operator = getOperatorInstance(s, leftExpression,
+						rightExpression);
+				System.out.println(String.format("operator: %s", operator));
+				int result = operator.interpret();
+				NumberExpression resultExpression = new NumberExpression(result);
+				stack.push(resultExpression);
+				System.out.println(String.format("push result to stack: %d",
+						resultExpression.interpret()));
+			} else {
+				Expression i = new NumberExpression(s);
+				stack.push(i);
+				System.out.println(String.format("push to stack: %d",
+						i.interpret()));
+			}
+		}
+		System.out
+				.println(String.format("result: %d", stack.pop().interpret()));
+	}
+
+	public static boolean isOperator(String s) {
+		return s.equals("+") || s.equals("-") || s.equals("*");
+	}
+
+	public static Expression getOperatorInstance(String s, Expression left,
+			Expression right) {
+		switch (s) {
+		case "+":
+			return new PlusExpression(left, right);
+		case "-":
+			return new MinusExpression(left, right);
+		case "*":
+			return new MultiplyExpression(left, right);
+		}
+		return null;
+	}
+}
+
+package com.iluwatar;
+
+import java.util.ArrayList;
+
+
+/**
+ * Servant offers some functionality to a group of classes without defining that functionality in each of them.
+ * A Servant is a class whose instance provides methods that take care of a desired service,
+ * while objects for which the servant does something, are taken as parameters.
+ *
+ */
+public class App {
+    static Servant jenkins = new Servant("Jenkins");
+    static Servant travis = new Servant("Travis");
+
+    public static void main(String[] args) {
+        scenario(jenkins, 1);
+        scenario(travis, 0);
+    }
+
+    /*
+     * Can add a List with enum Actions for variable scenarios
+     * */
+    public static void scenario(Servant servant, int compliment) {
+        King k = new King();
+        Queen q = new Queen();
+
+        ArrayList<Royalty> guests = new ArrayList<>();
+        guests.add(k);
+        guests.add(q);
+
+        //feed
+        servant.feed(k);
+        servant.feed(q);
+        //serve drinks
+        servant.giveWine(k);
+        servant.giveWine(q);
+        //compliment
+        servant.GiveCompliments(guests.get(compliment));
+
+        //outcome of the night
+        for (Royalty r : guests)
+            r.changeMood();
+
+        //check your luck
+        if (servant.checkIfYouWillBeHanged(guests))
+            System.out.println(servant.name + " will live another day");
+        else
+            System.out.println("Poor " + servant.name + ". His days are numbered");
+    }
+}
+
+package com.iluwatar;
+
+/**
+ * The service locator module.
+ * Will fetch service from cache, otherwise creates a fresh service and update cache
+ *
+ * @author saifasif
+ */
+public class ServiceLocator {
+
+    private static ServiceCache serviceCache = new ServiceCache();
+
+    /**
+     * Fetch the service with the name param from the cache first,
+     * if no service is found, lookup the service from the {@link InitContext} and
+     * then add the newly created service into the cache map for future requests.
+     *
+     * @param serviceJndiName a string
+     * @return {@link Service}
+     */
+    public static Service getService(String serviceJndiName) {
+        Service serviceObj = serviceCache.getService(serviceJndiName);
+        if (serviceObj != null) {
+            return serviceObj;
+        } else {
+            /*
+             * If we are unable to retrive anything from cache, then
+			 * lookup the service and add it in the cache map
+			 */
+            InitContext ctx = new InitContext();
+            serviceObj = (Service) ctx.lookup(serviceJndiName);
+            serviceCache.addService(serviceObj);
+            return serviceObj;
+        }
+    }
+}
+
+package nokogiri;
+
+import static nokogiri.internals.NokogiriHelpers.getNokogiriClass;
+
+import java.util.HashMap;
+
+import org.jruby.Ruby;
+import org.jruby.RubyClass;
+import org.jruby.RubyObject;
+import org.jruby.anno.JRubyClass;
+import org.jruby.anno.JRubyMethod;
+import org.jruby.runtime.ThreadContext;
+import org.jruby.runtime.builtin.IRubyObject;
+
+/**
+ * Stub class to satisfy unit tests.  I'm not sure where this class is
+ * meant to be used. As coded it won't really interact with any other
+ * classes and will have no effect on character encodings reported by
+ * documents being parsed.
+ *
+ * @author Patrick Mahoney <pat@polycrstal.org>
+ */
+@JRubyClass(name="Nokogiri::EncodingHandler")
+public class EncodingHandler extends RubyObject {
+    protected static HashMap<String,String> map = new HashMap<String,String>();
+    static {
+        addInitial();
+    }
+
+    protected String name;
+
+    protected static void addInitial() {
+        map.put("UTF-8", "UTF-8");
+    }
+
+    public EncodingHandler(Ruby ruby, RubyClass klass, String value) {
+        super(ruby, klass);
+        name = value;
+    }
+
+    @JRubyMethod(name="[]", meta=true)
+    public static IRubyObject get(ThreadContext context,
+                                  IRubyObject _klass,
+                                  IRubyObject keyObj) {
+        Ruby ruby = context.getRuntime();
+        String key = keyObj.toString();
+        String value = map.get(key);
+        if (value == null)
+            return ruby.getNil();
+
+        return new EncodingHandler(
+            ruby,
+            getNokogiriClass(ruby, "Nokogiri::EncodingHandler"),
+            value);
+    }
+
+    @JRubyMethod(meta=true)
+    public static IRubyObject delete(ThreadContext context,
+                                     IRubyObject _klass,
+                                     IRubyObject keyObj) {
+        String key = keyObj.toString();
+        String value = map.remove(key);
+        if (value == null)
+            return context.getRuntime().getNil();
+        return context.getRuntime().newString(value);
+    }
+
+    @JRubyMethod(name="clear_aliases!", meta=true)
+    public static IRubyObject clear_aliases(ThreadContext context,
+                                            IRubyObject _klass) {
+        map.clear();
+        addInitial();
+        return context.getRuntime().getNil();
+    }
+
+    @JRubyMethod(meta=true)
+    public static IRubyObject alias(ThreadContext context,
+                                    IRubyObject _klass,
+                                    IRubyObject orig,
+                                    IRubyObject alias) {
+        String value = map.get(orig.toString());
+        if (value != null)
+            map.put(alias.toString(), value);
+
+        return context.getRuntime().getNil();
+    }
+
+    @JRubyMethod
+    public IRubyObject name(ThreadContext context) {
+        return context.getRuntime().newString(name);
+    }
+}
+
+package nokogiri;
+
+import static nokogiri.internals.NokogiriHelpers.getLocalPart;
+import static nokogiri.internals.NokogiriHelpers.getNokogiriClass;
+import static nokogiri.internals.NokogiriHelpers.getPrefix;
+
+import org.jruby.Ruby;
+import org.jruby.RubyArray;
+import org.jruby.RubyClass;
+import org.jruby.anno.JRubyClass;
+import org.jruby.anno.JRubyMethod;
+import org.jruby.runtime.ThreadContext;
+import org.jruby.runtime.builtin.IRubyObject;
+import org.w3c.dom.Node;
+
+/**
+ * DTD element declaration.
+ *
+ * @author Patrick Mahoney <pat@polycrystal.org>
+ * @author Yoko Harada <yokolet@gmail.com>
+ */
+@JRubyClass(name="Nokogiri::XML::ElementDecl", parent="Nokogiri::XML::Node")
+public class XmlElementDecl extends XmlNode {
+    RubyArray attrDecls;
+    IRubyObject contentModel;
+
+    public XmlElementDecl(Ruby ruby, RubyClass klazz) {
+        super(ruby, klazz);
+    }
+
+    public void setNode(ThreadContext context, Node node) {
+        super.setNode(context, node);
+        attrDecls = RubyArray.newArray(context.getRuntime());
+        contentModel = context.getRuntime().getNil();
+    }
+
+    /**
+     * Initialize based on an elementDecl node from a NekoDTD parsed
+     * DTD.
+     */
+    public XmlElementDecl(Ruby ruby, RubyClass klass, Node elemDeclNode) {
+        super(ruby, klass, elemDeclNode);
+        attrDecls = RubyArray.newArray(ruby);
+        contentModel = ruby.getNil();
+    }
+
+    public static IRubyObject create(ThreadContext context, Node elemDeclNode) {
+        XmlElementDecl self =
+            new XmlElementDecl(context.getRuntime(),
+                               getNokogiriClass(context.getRuntime(), "Nokogiri::XML::ElementDecl"),
+                               elemDeclNode);
+        return self;
+    }
+
+    public IRubyObject element_name(ThreadContext context) {
+        return getAttribute(context, "ename");
+    }
+
+    public void setContentModel(IRubyObject cm) {
+        contentModel = cm;
+    }
+
+    @Override
+    @JRubyMethod
+    public IRubyObject content(ThreadContext context) {
+        return contentModel;
+    }
+
+    public boolean isEmpty() {
+        return "EMPTY".equals(getAttribute("model"));
+    }
+
+    @JRubyMethod
+    public IRubyObject prefix(ThreadContext context) {
+        String enamePrefix = getPrefix(getAttribute("ename"));
+        if (enamePrefix == null)
+            return context.getRuntime().getNil();
+        else
+            return context.getRuntime().newString(enamePrefix);
+    }
+
+    /**
+     * Returns the local part of the element name.
+     */
+    @Override
+    @JRubyMethod
+    public IRubyObject node_name(ThreadContext context) {
+        String ename = getLocalPart(getAttribute("ename"));
+        return context.getRuntime().newString(ename);
+    }
+
+    @Override
+    @JRubyMethod(name = "node_name=")
+    public IRubyObject node_name_set(ThreadContext context, IRubyObject name) {
+        throw context.getRuntime()
+            .newRuntimeError("cannot change name of DTD decl");
+    }
+
+    @Override
+    @JRubyMethod
+    public IRubyObject attribute_nodes(ThreadContext context) {
+        return attrDecls;
+    }
+
+    @Override
+    @JRubyMethod
+    public IRubyObject attribute(ThreadContext context, IRubyObject name) {
+        throw context.getRuntime()
+            .newRuntimeError("attribute by name not implemented");
+    }
+
+    public void appendAttrDecl(XmlAttributeDecl decl) {
+        attrDecls.append(decl);
+    }
+
+    @JRubyMethod
+    public IRubyObject element_type(ThreadContext context) {
+        return context.getRuntime().newFixnum(node.getNodeType());
+    }
+}
+
+package nokogiri;
+
+import static nokogiri.internals.NokogiriHelpers.getNokogiriClass;
+import static nokogiri.internals.NokogiriHelpers.stringOrBlank;
+
+import java.io.IOException;
+import java.io.InputStream;
+import java.util.LinkedList;
+import java.util.List;
+import java.util.Stack;
+
+import nokogiri.internals.NokogiriEntityResolver;
+import nokogiri.internals.ParserContext;
+import nokogiri.internals.ParserContext.Options;
+import nokogiri.internals.ReaderNode;
+import nokogiri.internals.ReaderNode.ClosingNode;
+import nokogiri.internals.ReaderNode.ElementNode;
+import nokogiri.internals.ReaderNode.TextNode;
+import nokogiri.internals.UncloseableInputStream;
+
+import org.apache.xerces.impl.Constants;
+import org.apache.xerces.impl.xs.opti.DefaultXMLDocumentHandler;
+import org.apache.xerces.parsers.StandardParserConfiguration;
+import org.apache.xerces.util.EntityResolver2Wrapper;
+import org.apache.xerces.xni.Augmentations;
+import org.apache.xerces.xni.NamespaceContext;
+import org.apache.xerces.xni.QName;
+import org.apache.xerces.xni.XMLAttributes;
+import org.apache.xerces.xni.XMLLocator;
+import org.apache.xerces.xni.XMLResourceIdentifier;
+import org.apache.xerces.xni.XMLString;
+import org.apache.xerces.xni.XNIException;
+import org.apache.xerces.xni.parser.XMLErrorHandler;
+import org.apache.xerces.xni.parser.XMLInputSource;
+import org.apache.xerces.xni.parser.XMLParseException;
+import org.apache.xerces.xni.parser.XMLPullParserConfiguration;
+import org.jruby.Ruby;
+import org.jruby.RubyArray;
+import org.jruby.RubyBoolean;
+import org.jruby.RubyClass;
+import org.jruby.RubyFixnum;
+import org.jruby.RubyObject;
+import org.jruby.anno.JRubyClass;
+import org.jruby.anno.JRubyMethod;
+import org.jruby.exceptions.RaiseException;
+import org.jruby.runtime.Block;
+import org.jruby.runtime.ThreadContext;
+import org.jruby.runtime.builtin.IRubyObject;
+import org.jruby.util.IOInputStream;
+import org.xml.sax.InputSource;
+
+/**
+ * Class for Nokogiri:XML::Reader
+ *
+ * @author sergio
+ * @author Yoko Harada <yokolet@gmail.com>
+ */
+@JRubyClass(name="Nokogiri::XML::Reader")
+public class XmlReader extends RubyObject {
+
+    private static final int XML_TEXTREADER_MODE_INITIAL = 0;
+    private static final int XML_TEXTREADER_MODE_INTERACTIVE = 1;
+    private static final int XML_TEXTREADER_MODE_ERROR = 2;
+    private static final int XML_TEXTREADER_MODE_EOF = 3;
+    private static final int XML_TEXTREADER_MODE_CLOSED = 4;
+    private static final int XML_TEXTREADER_MODE_READING = 5;
+
+    List<ReaderNode> nodeQueue;
+    private int state;
+    private int position = 0;
+    private XMLPullParserConfiguration config;
+    private boolean continueParsing = true;
+
+    public XmlReader(Ruby runtime, RubyClass klazz) {
+        super(runtime, klazz);
+    }
+
+    /**
+     * Create and return a copy of this object.
+     *
+     * @return a clone of this object
+     */
+    @Override
+    public Object clone() throws CloneNotSupportedException {
+        return super.clone();
+    }
+
+    public void init(Ruby runtime) {
+        nodeQueue = new LinkedList<ReaderNode>();
+        nodeQueue.add(new ReaderNode.EmptyNode(runtime));
+    }
+
+    private void setInput(ThreadContext context, InputStream in, IRubyObject url, Options options){
+        this.setState(XML_TEXTREADER_MODE_READING);
+        config = this.createReader(context.getRuntime(), options);
+        InputSource inputSource = new InputSource();
+        ParserContext.setUrl(context, inputSource, url);
+        XMLInputSource xmlInputSource = new XMLInputSource(inputSource.getPublicId(),
+            inputSource.getSystemId(), null, in, null);
+        try {
+          config.setInputSource(xmlInputSource);
+        } catch (IOException e) {
+          throw context.getRuntime().newRuntimeError(e.getMessage());
+        }
+        this.setState(XML_TEXTREADER_MODE_CLOSED);
+    }
+
+    private void setState(int state) { this.state = state; }
+
+    @JRubyMethod
+    public IRubyObject attribute(ThreadContext context, IRubyObject name) {
+        return currentNode().getAttributeByName(name);
+    }
+
+    @JRubyMethod
+    public IRubyObject attribute_at(ThreadContext context, IRubyObject index) {
+        return currentNode().getAttributeByIndex(index);
+    }
+
+    @JRubyMethod
+    public IRubyObject attribute_count(ThreadContext context) {
+        return currentNode().getAttributeCount();
+    }
+
+    @JRubyMethod
+    public IRubyObject attribute_nodes(ThreadContext context) {
+        return currentNode().getAttributesNodes();
+    }
+
+    @JRubyMethod
+    public IRubyObject attr_nodes(ThreadContext context) {
+        return currentNode().getAttributesNodes();
+    }
+
+    @JRubyMethod(name = "attributes?")
+    public IRubyObject attributes_p(ThreadContext context) {
+        return currentNode().hasAttributes();
+    }
+
+    @JRubyMethod
+    public IRubyObject base_uri(ThreadContext context) {
+        return currentNode().getXmlBase();
+    }
+
+    @JRubyMethod(name="default?")
+    public IRubyObject default_p(ThreadContext context){
+        return currentNode().isDefault();
+    }
+
+    @JRubyMethod
+    public IRubyObject depth(ThreadContext context) {
+        return currentNode().getDepth();
+    }
+
+    @JRubyMethod(name = {"empty_element?", "self_closing?"})
+    public IRubyObject empty_element_p(ThreadContext context) {
+        ReaderNode readerNode = currentNode();
+        ensureNodeClosed(context);
+
+        if (readerNode == null) return context.getRuntime().getNil();
+        if (!(readerNode instanceof ElementNode)) context.getRuntime().getFalse();
+        return RubyBoolean.newBoolean(context.getRuntime(), !readerNode.hasChildren);
+    }
+
+    @JRubyMethod(meta = true, rest = true)
+    public static IRubyObject from_io(ThreadContext context, IRubyObject cls, IRubyObject args[]) {
+        // Only to pass the  source test.
+        Ruby runtime = context.getRuntime();
+        // Not nil allowed!
+        if(args[0].isNil()) throw runtime.newArgumentError("io cannot be nil");
+
+        XmlReader reader = (XmlReader) NokogiriService.XML_READER_ALLOCATOR.allocate(runtime, getNokogiriClass(runtime, "Nokogiri::XML::Reader"));
+        reader.init(runtime);
+        reader.setInstanceVariable("@source", args[0]);
+        reader.setInstanceVariable("@errors", runtime.newArray());
+        IRubyObject url = context.nil;
+        if (args.length > 1) url = args[1];
+        if (args.length > 2) reader.setInstanceVariable("@encoding", args[2]);
+
+        Options options;
+        if (args.length > 3) {
+          options = new ParserContext.Options((Long)args[3].toJava(Long.class));
+        } else {
+          // use the default options RECOVER | NONET
+          options = new ParserContext.Options(2048 | 1);
+        }
+
+        InputStream in = new UncloseableInputStream(new IOInputStream(args[0]));
+        reader.setInput(context, in, url, options);
+        return reader;
+    }
+
+    @JRubyMethod(meta = true, rest = true)
+    public static IRubyObject from_memory(ThreadContext context, IRubyObject cls, IRubyObject args[]) {
+        // args[0]: string, args[1]: url, args[2]: encoding, args[3]: options
+        Ruby runtime = context.getRuntime();
+        // Not nil allowed!
+        if(args[0].isNil()) throw runtime.newArgumentError("string cannot be nil");
+
+        XmlReader reader = (XmlReader) NokogiriService.XML_READER_ALLOCATOR.allocate(runtime, getNokogiriClass(runtime, "Nokogiri::XML::Reader"));
+        reader.init(runtime);
+        reader.setInstanceVariable("@source", args[0]);
+        reader.setInstanceVariable("@errors", runtime.newArray());
+        IRubyObject url = context.nil;
+        if (args.length > 1) url = args[1];
+        if (args.length > 2) reader.setInstanceVariable("@encoding", args[2]);
+
+        Options options;
+        if (args.length > 3) {
+          options = new ParserContext.Options((Long)args[3].toJava(Long.class));
+        } else {
+          // use the default options RECOVER | NONET
+          options = new ParserContext.Options(2048 | 1);
+        }
+        IRubyObject stringIO = NokogiriService.getNokogiriClassCache(context.getRuntime()).get("StringIO").newInstance(context, args[0], Block.NULL_BLOCK);
+        InputStream in = new UncloseableInputStream(new IOInputStream(stringIO));
+        reader.setInput(context, in, url, options);
+        return reader;
+    }
+
+    @JRubyMethod
+    public IRubyObject node_type(ThreadContext context) {
+        IRubyObject node_type = currentNode().getNodeType();
+        return node_type == null ? RubyFixnum.zero(context.getRuntime()) : node_type;
+    }
+
+    @JRubyMethod
+    public IRubyObject inner_xml(ThreadContext context) {
+        ensureNodeClosed(context);
+        return stringOrBlank(context.getRuntime(), getInnerXml(currentNode()));
+    }
+
+    private String getInnerXml(ReaderNode current) {
+        if (current.depth < 0) return null;
+        if (!current.hasChildren) return null;
+        StringBuffer sb = new StringBuffer();
+        for (int i = current.startOffset + 1; i <= current.endOffset - 1; i++) {
+          sb.append(nodeQueue.get(i).getString());
+        }
+        return new String(sb);
+    }
+
+    @JRubyMethod
+    public IRubyObject outer_xml(ThreadContext context) {
+        ensureNodeClosed(context);
+        return stringOrBlank(context.getRuntime(), getOuterXml());
+    }
+
+    private String getOuterXml() {
+        ReaderNode current = currentNode();
+        if (current.depth < 0) return null;
+
+        if (current instanceof ClosingNode) {
+          return "<" + current.name + "/>";
+        }
+
+        StringBuffer sb = new StringBuffer();
+        for (int i = position; i <= current.endOffset; i++) {
+          sb.append(nodeQueue.get(i).getString());
+        }
+        return new String(sb);
+    }
+
+    @JRubyMethod
+    public IRubyObject lang(ThreadContext context) {
+        return currentNode().getLang();
+    }
+
+    @JRubyMethod
+    public IRubyObject local_name(ThreadContext context) {
+        return currentNode().getLocalName();
+    }
+
+    @JRubyMethod
+    public IRubyObject name(ThreadContext context) {
+        return currentNode().getName();
+    }
+
+    @JRubyMethod
+    public IRubyObject namespace_uri(ThreadContext context) {
+        return currentNode().getUri();
+    }
+
+    @JRubyMethod
+    public IRubyObject namespaces(ThreadContext context) {
+        return currentNode().getNamespaces(context);
+    }
+
+    @JRubyMethod
+    public IRubyObject prefix(ThreadContext context) {
+        return currentNode().getPrefix();
+    }
+
+    private void readMoreData(ThreadContext context) {
+      if (!continueParsing) {
+        throw context.runtime.newRuntimeError("Cannot parse more data");
+      }
+      try {
+        continueParsing = config.parse(false);
+      } catch (XNIException e) {
+        Ruby ruby = context.runtime;
+        XmlSyntaxError exception = (XmlSyntaxError) NokogiriService.XML_SYNTAXERROR_ALLOCATOR.allocate(ruby, getNokogiriClass(ruby, "Nokogiri::XML::SyntaxError"));
+        throw new RaiseException(exception);
+      } catch (IOException e) {
+        throw context.getRuntime().newRuntimeError("Received IOException: " + e.getMessage());
+      }
+    }
+
+    private void ensureNodeClosed(ThreadContext context) {
+      ReaderNode node = currentNode();
+      if (node instanceof TextNode) {
+        return;
+      }
+      while (node.endOffset < 1) {
+        readMoreData(context);
+      }
+    }
+
+    @JRubyMethod
+    public IRubyObject read(ThreadContext context) {
+        position++;
+        while (nodeQueue.size() <= position && continueParsing) {
+          readMoreData(context);
+        }
+        if(currentNode() == null) {
+            return context.nil;
+        } else if(currentNode().isError()) {
+            RubyArray errors = (RubyArray) this.getInstanceVariable("@errors");
+            errors.append(currentNode().toSyntaxError());
+
+            this.setInstanceVariable("@errors", errors);
+
+            throw new RaiseException((XmlSyntaxError) currentNode().toSyntaxError());
+        } else {
+            return this;
+        }
+    }
+
+    private ReaderNode currentNode() {
+      if (position >= nodeQueue.size())
+        return null;
+      return nodeQueue.get(position);
+    }
+
+    @JRubyMethod
+    public IRubyObject state(ThreadContext context) {
+        return context.getRuntime().newFixnum(this.state);
+    }
+
+    @JRubyMethod
+    public IRubyObject value(ThreadContext context) {
+        return currentNode().getValue();
+    }
+
+    @JRubyMethod(name = "value?")
+    public IRubyObject value_p(ThreadContext context) {
+        return currentNode().hasValue();
+    }
+
+    @JRubyMethod
+    public IRubyObject xml_version(ThreadContext context) {
+        return currentNode().getXmlVersion();
+    }
+
+    protected XMLPullParserConfiguration createReader(Ruby ruby, Options options) {
+        StandardParserConfiguration config = new StandardParserConfiguration();
+        DocumentHandler handler = new DocumentHandler(ruby);
+        // XMLReader reader = XMLReaderFactory.createXMLReader();
+        config.setDocumentHandler(handler);
+        config.setDTDHandler(handler);
+        config.setErrorHandler(handler);
+        config.setEntityResolver(new EntityResolver2Wrapper(new NokogiriEntityResolver(ruby, null, options)));
+        // config.setFeature("http://xml.org/sax/features/xmlns-uris", true);
+        // config.setFeature("http://xml.org/sax/features/namespace-prefixes", true);
+        config.setFeature("http://apache.org/xml/features/nonvalidating/load-external-dtd", options.dtdLoad || options.dtdValid);
+        return config;
+    }
+
+    private class DocumentHandler extends DefaultXMLDocumentHandler implements XMLErrorHandler {
+
+        Stack<String> langStack;
+        int depth;
+        Stack<String> xmlBaseStack;
+        Stack<ReaderNode.ElementNode> elementStack;
+        private final Ruby ruby;
+
+        public DocumentHandler(Ruby ruby) {
+          this.ruby = ruby;
+        }
+
+
+
+        @Override
+        public void startGeneralEntity(String name, XMLResourceIdentifier identifier, String encoding,
+            Augmentations augs) throws XNIException {
+          Object entitySkipped;
+          if (augs != null && (entitySkipped = augs.getItem(Constants.ENTITY_SKIPPED)) != null && ((Boolean) entitySkipped) == true) {
+            nodeQueue.add(new ReaderNode.ExceptionNode(ruby, null));
+          }
+        }
+
+
+
+        @Override
+        public void startDocument(XMLLocator locator, String encoding, NamespaceContext context, Augmentations augs) {
+            depth = 0;
+            langStack = new Stack<String>();
+            xmlBaseStack = new Stack<String>();
+            elementStack = new Stack<ReaderNode.ElementNode>();
+        }
+
+        @Override
+        public void endDocument(Augmentations augs) {
+            langStack = null;
+            xmlBaseStack = null;
+            elementStack = null;
+        }
+
+        @Override
+        public void startElement(QName element, XMLAttributes attrs, Augmentations augs) {
+          commonElement(element, attrs, false);
+        }
+
+        @Override
+        public void endElement(QName element, Augmentations augs) {
+            String uri = element.uri;
+            String localName = element.localpart;
+            String qName = element.rawname;
+            depth--;
+            ElementNode startElementNode = elementStack.pop();
+            ReaderNode node = ReaderNode.createClosingNode(ruby, uri, localName, qName, depth, langStack, xmlBaseStack);
+
+            startElementNode.endOffset = nodeQueue.size() - 1;
+
+            if (startElementNode.endOffset != startElementNode.startOffset) {
+              // this node isn't empty
+              node.attributeList = startElementNode.attributeList;
+              node.namespaces = startElementNode.namespaces;
+              node.startOffset = startElementNode.startOffset;
+              node.endOffset = ++startElementNode.endOffset;
+              node.hasChildren = startElementNode.hasChildren = true;
+              nodeQueue.add(node);
+            }
+            if (!langStack.isEmpty()) langStack.pop();
+            if (!xmlBaseStack.isEmpty()) xmlBaseStack.pop();
+        }
+
+        @Override
+        public void emptyElement(QName element, XMLAttributes attrs, Augmentations augs) {
+          commonElement(element, attrs, true);
+        }
+
+        private void commonElement(QName element, XMLAttributes attrs, boolean isEmpty) {
+            String qName = element.rawname;
+            String uri = element.uri;
+            String localName = element.localpart;
+            ReaderNode readerNode = ReaderNode.createElementNode(ruby, uri, localName, qName, attrs, depth, langStack, xmlBaseStack);
+            if (!elementStack.isEmpty()) {
+              ElementNode parent = elementStack.peek();
+              parent.hasChildren = true;
+            }
+            nodeQueue.add(readerNode);
+            readerNode.startOffset = nodeQueue.size() - 1;
+            if (!isEmpty) {
+              depth++;
+              if (readerNode.lang != null) langStack.push(readerNode.lang);
+              if (readerNode.xmlBase != null) xmlBaseStack.push(readerNode.xmlBase);
+              elementStack.push((ReaderNode.ElementNode)readerNode);
+            } else {
+              readerNode.endOffset = readerNode.startOffset;
+              readerNode.hasChildren = false;
+            }
+        }
+
+        @Override
+        public void characters(XMLString string, Augmentations augs) {
+            ReaderNode.TextNode node = ReaderNode.createTextNode(ruby, string.toString(), depth, langStack, xmlBaseStack);
+            nodeQueue.add(node);
+            node.startOffset = node.endOffset = nodeQueue.size() - 1;
+        }
+
+        @Override
+        public void error(String domain, String key, XMLParseException ex) {
+            nodeQueue.add(new ReaderNode.ExceptionNode(ruby, ex));
+            throw ex;
+        }
+
+        @Override
+        public void fatalError(String domain, String key, XMLParseException ex) {
+            nodeQueue.add(new ReaderNode.ExceptionNode(ruby, ex));
+            throw ex;
+        }
+
+        @Override
+        public void warning(String domain, String key, XMLParseException ex) {
+            nodeQueue.add(new ReaderNode.ExceptionNode(ruby, ex));
+            throw ex;
+        }
+    };
+}
+
+package nokogiri.internals;
+
+import static nokogiri.internals.NokogiriHelpers.getNokogiriClass;
+import static nokogiri.internals.NokogiriHelpers.isNamespace;
+import static nokogiri.internals.NokogiriHelpers.stringOrNil;
+import nokogiri.HtmlDocument;
+import nokogiri.NokogiriService;
+import nokogiri.XmlDocument;
+
+import org.apache.xerces.parsers.DOMParser;
+import org.apache.xerces.xni.Augmentations;
+import org.apache.xerces.xni.QName;
+import org.apache.xerces.xni.XMLAttributes;
+import org.apache.xerces.xni.XNIException;
+import org.apache.xerces.xni.parser.XMLDocumentFilter;
+import org.apache.xerces.xni.parser.XMLParserConfiguration;
+import org.cyberneko.html.HTMLConfiguration;
+import org.cyberneko.html.filters.DefaultFilter;
+import org.jruby.Ruby;
+import org.jruby.RubyClass;
+import org.jruby.runtime.ThreadContext;
+import org.jruby.runtime.builtin.IRubyObject;
+import org.w3c.dom.Document;
+import org.w3c.dom.NamedNodeMap;
+import org.w3c.dom.NodeList;
+
+/**
+ * Parser for HtmlDocument. This class actually parses HtmlDocument using NekoHtml.
+ *
+ * @author sergio
+ * @author Patrick Mahoney <pat@polycrystal.org>
+ * @author Yoko Harada <yokolet@gmail.com>
+ */
+public class HtmlDomParserContext extends XmlDomParserContext {
+
+    public HtmlDomParserContext(Ruby runtime, IRubyObject options) {
+        super(runtime, options);
+    }
+
+    public HtmlDomParserContext(Ruby runtime, IRubyObject encoding, IRubyObject options) {
+        super(runtime, encoding, options);
+    }
+
+    @Override
+    protected void initErrorHandler() {
+        if (options.strict) {
+            errorHandler = new NokogiriStrictErrorHandler(options.noError, options.noWarning);
+        } else {
+            errorHandler = new NokogiriNonStrictErrorHandler4NekoHtml(options.noError, options.noWarning);
+        }
+    }
+
+    @Override
+    protected void initParser(Ruby runtime) {
+        XMLParserConfiguration config = new HTMLConfiguration();
+        XMLDocumentFilter removeNSAttrsFilter = new RemoveNSAttrsFilter();
+        XMLDocumentFilter elementValidityCheckFilter = new ElementValidityCheckFilter(errorHandler);
+        //XMLDocumentFilter[] filters = { removeNSAttrsFilter,  elementValidityCheckFilter};
+        XMLDocumentFilter[] filters = { elementValidityCheckFilter};
+
+        config.setErrorHandler(this.errorHandler);
+
+        parser = new NokogiriDomParser(config);
+
+        // see http://nekohtml.sourceforge.net/settings.html for details
+        setProperty("http://cyberneko.org/html/properties/default-encoding", java_encoding);
+        setProperty("http://cyberneko.org/html/properties/names/elems", "lower");
+        setProperty("http://cyberneko.org/html/properties/names/attrs", "lower");
+        setProperty("http://cyberneko.org/html/properties/filters", filters);
+        setFeature("http://cyberneko.org/html/features/report-errors", true);
+        setFeature("http://xml.org/sax/features/namespaces", false);
+    }
+
+    /**
+     * Enable NekoHTML feature for balancing tags in a document fragment.
+     *
+     * This method is used in XmlNode#in_context method.
+     */
+    public void enableDocumentFragment() {
+        setFeature("http://cyberneko.org/html/features/balance-tags/document-fragment", true);
+    }
+
+    @Override
+    protected XmlDocument getNewEmptyDocument(ThreadContext context) {
+        IRubyObject[] args = new IRubyObject[0];
+        return (XmlDocument) XmlDocument.rbNew(context, getNokogiriClass(context.getRuntime(), "Nokogiri::HTML::Document"), args);
+    }
+
+    @Override
+    protected XmlDocument wrapDocument(ThreadContext context,
+                                       RubyClass klazz,
+                                       Document document) {
+        HtmlDocument htmlDocument = (HtmlDocument) NokogiriService.HTML_DOCUMENT_ALLOCATOR.allocate(context.getRuntime(), klazz);
+        htmlDocument.setDocumentNode(context, document);
+        if (ruby_encoding.isNil()) {
+            // ruby_encoding might have detected by HtmlDocument::EncodingReader
+            if (detected_encoding != null && !detected_encoding.isNil()) {
+                ruby_encoding = detected_encoding;
+            } else {
+                // no encoding given & no encoding detected, then try to get it
+                String charset = tryGetCharsetFromHtml5MetaTag(document);
+                ruby_encoding = stringOrNil(context.getRuntime(), charset);
+            }
+        }
+        htmlDocument.setEncoding(ruby_encoding);
+        htmlDocument.setParsedEncoding(java_encoding);
+        return htmlDocument;
+    }
+
+    // NekoHtml doesn't understand HTML5 meta tag format. This fails to detect charset
+    // from an HTML5 style meta tag. Luckily, the meta tag and charset exists in DOM tree
+    // so, this method attempts to find the charset.
+    private String tryGetCharsetFromHtml5MetaTag(Document document) {
+        if (!"html".equalsIgnoreCase(document.getDocumentElement().getNodeName())) return null;
+        NodeList list = document.getDocumentElement().getChildNodes();
+        for (int i = 0; i < list.getLength(); i++) {
+            if ("head".equalsIgnoreCase(list.item(i).getNodeName())) {
+                NodeList headers = list.item(i).getChildNodes();
+                for (int j = 0; j < headers.getLength(); j++) {
+                    if ("meta".equalsIgnoreCase(headers.item(j).getNodeName())) {
+                        NamedNodeMap nodeMap = headers.item(j).getAttributes();
+                        for (int k = 0; k < nodeMap.getLength(); k++) {
+                            if ("charset".equalsIgnoreCase(nodeMap.item(k).getNodeName())) {
+                                return nodeMap.item(k).getNodeValue();
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        return null;
+    }
+
+    /**
+     * Filter to strip out attributes that pertain to XML namespaces.
+     */
+    public static class RemoveNSAttrsFilter extends DefaultFilter {
+        @Override
+        public void startElement(QName element, XMLAttributes attrs,
+                                 Augmentations augs) throws XNIException {
+            int i;
+            for (i = 0; i < attrs.getLength(); ++i) {
+                if (isNamespace(attrs.getQName(i))) {
+                    attrs.removeAttributeAt(i);
+                    --i;
+                }
+            }
+
+            element.uri = null;
+            super.startElement(element, attrs, augs);
+        }
+    }
+
+    public static class ElementValidityCheckFilter extends DefaultFilter {
+        private NokogiriErrorHandler errorHandler;
+
+        private ElementValidityCheckFilter(NokogiriErrorHandler errorHandler) {
+            this.errorHandler = errorHandler;
+        }
+
+        // element names from xhtml1-strict.dtd
+        private static String[][] element_names = {
+                {"a", "abbr", "acronym", "address", "area"}
+        };
+
+        private boolean isValid(String testee) {
+            char[] c = testee.toCharArray();
+            int index = new Integer(c[0]) - 97;
+            if (index > 25) return false;
+            for (int i=0; i<element_names[index].length; i++) {
+                if (testee.equals(element_names[index][i])) {
+                    return true;
+                }
+            }
+            return false;
+        }
+
+        @Override
+        public void startElement(QName name, XMLAttributes attrs, Augmentations augs) throws XNIException {
+            if (!isValid(name.rawname)) {
+                errorHandler.getErrors().add(new Exception("Tag " + name.rawname + " invalid"));
+            }
+            super.startElement(name, attrs, augs);
+        }
+    }
+}
+
+package nokogiri.internals;
+
+import java.io.IOException;
+
+import nokogiri.XmlDocument;
+
+import org.apache.xerces.parsers.DOMParser;
+import org.apache.xerces.parsers.XIncludeParserConfiguration;
+import org.apache.xerces.xni.parser.XMLParserConfiguration;
+import org.cyberneko.dtd.DTDConfiguration;
+import org.w3c.dom.Document;
+import org.xml.sax.Attributes;
+import org.xml.sax.ContentHandler;
+import org.xml.sax.InputSource;
+import org.xml.sax.Locator;
+import org.xml.sax.SAXException;
+
+/**
+ * Sets up a Xerces/XNI DOM Parser for use with Nokogiri.  Uses
+ * NekoDTD to parse the DTD into a tree of Nodes.
+ *
+ * @author Patrick Mahoney <pat@polycrystal.org>
+ */
+public class NokogiriDomParser extends DOMParser {
+    protected DOMParser dtd;
+    protected boolean xInclude;
+    protected XMLParserConfiguration config;
+
+    public NokogiriDomParser(XMLParserConfiguration config) {
+        super(config);
+        this.config = config;
+        initialize();
+    }
+
+    public NokogiriDomParser(ParserContext.Options options) {
+        xInclude = options.xInclude;
+        initialize();
+    }
+
+    protected void initialize() {
+        if (config == null) {
+            if (xInclude) {
+                config = new XIncludeParserConfiguration();
+            } else {
+                config = getXMLParserConfiguration();
+            }
+        }
+
+        DTDConfiguration dtdConfig = new DTDConfiguration();
+        dtd = new DOMParser(dtdConfig);
+
+        config.setDTDHandler(dtdConfig);
+        config.setDTDContentModelHandler(dtdConfig);
+    }
+
+    @Override
+    public void parse(InputSource source) throws SAXException, IOException {
+        dtd.reset();
+        if (xInclude) {
+            setEntityResolver(new NokogiriXInlcudeEntityResolver(source));
+        }
+        super.parse(source);
+        Document doc = getDocument();
+        if (doc == null)
+            throw new RuntimeException("null document");
+
+        doc.setUserData(XmlDocument.DTD_RAW_DOCUMENT, dtd.getDocument(), null);
+    }
+
+    private class NokogiriXInlcudeEntityResolver implements org.xml.sax.EntityResolver {
+        InputSource source;
+        private NokogiriXInlcudeEntityResolver(InputSource source) {
+            this.source = source;
+        }
+
+        @Override
+        public InputSource resolveEntity(String publicId, String systemId)
+                throws SAXException, IOException {
+            if (systemId != null) source.setSystemId(systemId);
+            if (publicId != null) source.setPublicId(publicId);
+            return source;
+        }
+    }
+}
+
+package nokogiri.internals;
+
+import org.apache.xerces.xni.parser.XMLParseException;
+import org.xml.sax.SAXException;
+import org.xml.sax.SAXParseException;
+
+/**
+ * Error Handler for XML document when recover is true (default).
+ *
+ * @author sergio
+ * @author Yoko Harada <yokolet@gmail.com>
+ */
+public class NokogiriNonStrictErrorHandler extends NokogiriErrorHandler{
+    public NokogiriNonStrictErrorHandler(boolean noerror, boolean nowarning) {
+        super(noerror, nowarning);
+    }
+
+    public void warning(SAXParseException ex) throws SAXException {
+        errors.add(ex);
+    }
+
+    public void error(SAXParseException ex) throws SAXException {
+        errors.add(ex);
+    }
+
+    public void fatalError(SAXParseException ex) throws SAXException {
+        // fix #837
+        // Xerces won't skip the reference entity (and other invalid) constructs
+        // found in the prolog, instead it will keep calling this method and we'll
+        // keep inserting the error in the document errors array until we run
+        // out of memory
+        errors.add(ex);
+        String message = ex.getMessage();
+
+        // The problem with Xerces is that some errors will cause the
+        // parser not to advance the reader and it will keep reporting
+        // the same error over and over, which will cause the parser
+        // to enter an infinite loop unless we throw the exception.
+        if (message != null && isFatal(message)) {
+          throw ex;
+        }
+    }
+
+    public void error(String domain, String key, XMLParseException e) {
+        errors.add(e);
+    }
+
+    public void fatalError(String domain, String key, XMLParseException e) {
+        errors.add(e);
+    }
+
+    public void warning(String domain, String key, XMLParseException e) {
+        errors.add(e);
+    }
+
+    /*
+     * Determine whether this is a fatal error that should cause
+     * the parsing to stop, or an error that can be ignored.
+     */
+    private static boolean isFatal(String msg) {
+        String msgLowerCase = msg.toLowerCase();
+        return
+          msgLowerCase.contains("in prolog") ||
+          msgLowerCase.contains("limit") ||
+          msgLowerCase.contains("preceding the root element must be well-formed") ||
+          msgLowerCase.contains("following the root element must be well-formed");
+    }
+}
+
+package nokogiri.internals.c14n;
+
+import java.io.OutputStream;
+import java.util.Map;
+import java.util.concurrent.ConcurrentHashMap;
+
+import org.w3c.dom.Node;
+
+/**
+ *
+ * @author Christian Geuer-Pollmann
+ */
+public class Canonicalizer {
+
+    /** The output encoding of canonicalized data */
+    public static final String ENCODING = "UTF8";
+
+    /**
+     * XPath Expression for selecting every node and continuous comments joined
+     * in only one node
+     */
+    public static final String XPATH_C14N_WITH_COMMENTS_SINGLE_NODE =
+        "(.//. | .//@* | .//namespace::*)";
+
+    /**
+     * The URL defined in XML-SEC Rec for inclusive c14n <b>without</b> comments.
+     */
+    public static final String ALGO_ID_C14N_OMIT_COMMENTS =
+        "http://www.w3.org/TR/2001/REC-xml-c14n-20010315";
+    /**
+     * The URL defined in XML-SEC Rec for inclusive c14n <b>with</b> comments.
+     */
+    public static final String ALGO_ID_C14N_WITH_COMMENTS =
+        ALGO_ID_C14N_OMIT_COMMENTS + "#WithComments";
+    /**
+     * The URL defined in XML-SEC Rec for exclusive c14n <b>without</b> comments.
+     */
+    public static final String ALGO_ID_C14N_EXCL_OMIT_COMMENTS =
+        "http://www.w3.org/2001/10/xml-exc-c14n#";
+    /**
+     * The URL defined in XML-SEC Rec for exclusive c14n <b>with</b> comments.
+     */
+    public static final String ALGO_ID_C14N_EXCL_WITH_COMMENTS =
+        ALGO_ID_C14N_EXCL_OMIT_COMMENTS + "WithComments";
+    /**
+     * The URI for inclusive c14n 1.1 <b>without</b> comments.
+     */
+    public static final String ALGO_ID_C14N11_OMIT_COMMENTS =
+        "http://www.w3.org/2006/12/xml-c14n11";
+    /**
+     * The URI for inclusive c14n 1.1 <b>with</b> comments.
+     */
+    public static final String ALGO_ID_C14N11_WITH_COMMENTS =
+        ALGO_ID_C14N11_OMIT_COMMENTS + "#WithComments";
+    /**
+     * Non-standard algorithm to serialize the physical representation for XML Encryption
+     */
+    public static final String ALGO_ID_C14N_PHYSICAL =
+        "http://santuario.apache.org/c14n/physical";
+
+    private static Map<String, Class<? extends CanonicalizerSpi>> canonicalizerHash = null;
+
+    private final CanonicalizerSpi canonicalizerSpi;
+
+    /**
+     * Constructor Canonicalizer
+     *
+     * @param algorithmURI
+     * @throws InvalidCanonicalizerException
+     */
+    private Canonicalizer(String algorithmURI) throws CanonicalizationException {
+        try {
+            Class<? extends CanonicalizerSpi> implementingClass =
+                canonicalizerHash.get(algorithmURI);
+
+            canonicalizerSpi = implementingClass.newInstance();
+            canonicalizerSpi.reset = true;
+        } catch (Exception e) {
+            Object exArgs[] = { algorithmURI };
+            throw new CanonicalizationException(
+                "signature.Canonicalizer.UnknownCanonicalizer", exArgs, e
+            );
+        }
+    }
+
+    /**
+     * Method getInstance
+     *
+     * @param algorithmURI
+     * @return a Canonicalizer instance ready for the job
+     * @throws InvalidCanonicalizerException
+     */
+    public static final Canonicalizer getInstance(String algorithmURI)
+        throws CanonicalizationException {
+        if (canonicalizerHash == null) {
+            canonicalizerHash = new ConcurrentHashMap<String, Class<? extends CanonicalizerSpi>>();
+            Canonicalizer.registerDefaultAlgorithms();
+        }
+        return new Canonicalizer(algorithmURI);
+    }
+
+    /**
+     * Method register
+     *
+     * @param algorithmURI
+     * @param implementingClass
+     * @throws CanonicalizationException
+     */
+    @SuppressWarnings("unchecked")
+    public static void register(String algorithmURI, String implementingClass)
+        throws CanonicalizationException, ClassNotFoundException {
+        // check whether URI is already registered
+        Class<? extends CanonicalizerSpi> registeredClass =
+            canonicalizerHash.get(algorithmURI);
+
+        if (registeredClass != null)  {
+            Object exArgs[] = { algorithmURI, registeredClass };
+            throw new CanonicalizationException("algorithm.alreadyRegistered", exArgs);
+        }
+
+        canonicalizerHash.put(
+            algorithmURI, (Class<? extends CanonicalizerSpi>)Class.forName(implementingClass)
+        );
+    }
+
+    /**
+     * Method register
+     *
+     * @param algorithmURI
+     * @param implementingClass
+     * @throws CanonicalizationException
+     */
+    public static void register(String algorithmURI, Class<? extends CanonicalizerSpi> implementingClass)
+        throws CanonicalizationException, ClassNotFoundException {
+        // check whether URI is already registered
+        Class<? extends CanonicalizerSpi> registeredClass = canonicalizerHash.get(algorithmURI);
+
+        if (registeredClass != null)  {
+            Object exArgs[] = { algorithmURI, registeredClass };
+            throw new CanonicalizationException("algorithm.alreadyRegistered", exArgs);
+        }
+
+        canonicalizerHash.put(algorithmURI, implementingClass);
+    }
+
+    /**
+     * This method registers the default algorithms.
+     */
+    private static void registerDefaultAlgorithms() {
+        canonicalizerHash.put(Canonicalizer.ALGO_ID_C14N_OMIT_COMMENTS,
+                Canonicalizer20010315OmitComments.class);
+        canonicalizerHash.put(Canonicalizer.ALGO_ID_C14N_WITH_COMMENTS,
+                Canonicalizer20010315WithComments.class);
+        canonicalizerHash.put(Canonicalizer.ALGO_ID_C14N_EXCL_OMIT_COMMENTS,
+                Canonicalizer20010315ExclOmitComments.class);
+        canonicalizerHash.put(Canonicalizer.ALGO_ID_C14N_EXCL_WITH_COMMENTS,
+                Canonicalizer20010315ExclWithComments.class);
+        canonicalizerHash.put(Canonicalizer.ALGO_ID_C14N11_OMIT_COMMENTS,
+                Canonicalizer11_OmitComments.class);
+        canonicalizerHash.put(Canonicalizer.ALGO_ID_C14N11_WITH_COMMENTS,
+                Canonicalizer11_WithComments.class);
+        canonicalizerHash.put(Canonicalizer.ALGO_ID_C14N_PHYSICAL,
+                CanonicalizerPhysical.class);
+    }
+
+    /**
+     * Method getURI
+     *
+     * @return the URI defined for this c14n instance.
+     */
+    public final String getURI() {
+        return canonicalizerSpi.engineGetURI();
+    }
+
+    /**
+     * Method getIncludeComments
+     *
+     * @return true if the c14n respect the comments.
+     */
+    public boolean getIncludeComments() {
+        return canonicalizerSpi.engineGetIncludeComments();
+    }
+
+    /**
+     * Canonicalizes the subtree rooted by <CODE>node</CODE>.
+     *
+     * @param node The node to canonicalize
+     * @return the result of the c14n.
+     *
+     * @throws CanonicalizationException
+     */
+    public byte[] canonicalizeSubtree(Node node, CanonicalFilter filter) throws CanonicalizationException {
+        return canonicalizerSpi.engineCanonicalizeSubTree(node, filter);
+    }
+
+    /**
+     * Canonicalizes the subtree rooted by <CODE>node</CODE>.
+     *
+     * @param node
+     * @param inclusiveNamespaces
+     * @return the result of the c14n.
+     * @throws CanonicalizationException
+     */
+    public byte[] canonicalizeSubtree(Node node, String inclusiveNamespaces, CanonicalFilter filter)
+        throws CanonicalizationException {
+        return canonicalizerSpi.engineCanonicalizeSubTree(node, inclusiveNamespaces, filter);
+    }
+
+    /**
+     * Sets the writer where the canonicalization ends.  ByteArrayOutputStream
+     * if none is set.
+     * @param os
+     */
+    public void setWriter(OutputStream os) {
+        canonicalizerSpi.setWriter(os);
+    }
+
+    /**
+     * Returns the name of the implementing {@link CanonicalizerSpi} class
+     *
+     * @return the name of the implementing {@link CanonicalizerSpi} class
+     */
+    public String getImplementingCanonicalizerClass() {
+        return canonicalizerSpi.getClass().getName();
+    }
+
+    /**
+     * Set the canonicalizer behaviour to not reset.
+     */
+    public void notReset() {
+        canonicalizerSpi.reset = false;
+    }
+
+}
+
+package org.scribe.builder;
+
+import java.io.*;
+import org.scribe.builder.api.*;
+import org.scribe.exceptions.*;
+import org.scribe.model.*;
+import org.scribe.oauth.*;
+import org.scribe.utils.*;
+
+/**
+ * Implementation of the Builder pattern, with a fluent interface that creates a
+ * {@link OAuthService}
+ *
+ * @author Pablo Fernandez
+ *
+ */
+public class ServiceBuilder
+{
+  private String apiKey;
+  private String apiSecret;
+  private String callback;
+  private Api api;
+  private String scope;
+  private SignatureType signatureType;
+  private OutputStream debugStream;
+
+  /**
+   * Default constructor
+   */
+  public ServiceBuilder()
+  {
+    this.callback = OAuthConstants.OUT_OF_BAND;
+    this.signatureType = SignatureType.Header;
+    this.debugStream = null;
+  }
+
+  /**
+   * Configures the {@link Api}
+   *
+   * @param apiClass the class of one of the existent {@link Api}s on org.scribe.api package
+   * @return the {@link ServiceBuilder} instance for method chaining
+   */
+  public ServiceBuilder provider(Class<? extends Api> apiClass)
+  {
+    this.api = createApi(apiClass);
+    return this;
+  }
+
+  private Api createApi(Class<? extends Api> apiClass)
+  {
+    Preconditions.checkNotNull(apiClass, "Api class cannot be null");
+    Api api;
+    try
+    {
+      api = apiClass.newInstance();
+    }
+    catch(Exception e)
+    {
+      throw new OAuthException("Error while creating the Api object", e);
+    }
+    return api;
+  }
+
+  /**
+   * Configures the {@link Api}
+   *
+   * Overloaded version. Let's you use an instance instead of a class.
+   *
+   * @param api instance of {@link Api}s
+   * @return the {@link ServiceBuilder} instance for method chaining
+   */
+  public ServiceBuilder provider(Api api)
+  {
+	  Preconditions.checkNotNull(api, "Api cannot be null");
+	  this.api = api;
+	  return this;
+  }
+
+  /**
+   * Adds an OAuth callback url
+   *
+   * @param callback callback url. Must be a valid url or 'oob' for out of band OAuth
+   * @return the {@link ServiceBuilder} instance for method chaining
+   */
+  public ServiceBuilder callback(String callback)
+  {
+    Preconditions.checkNotNull(callback, "Callback can't be null");
+    this.callback = callback;
+    return this;
+  }
+
+  /**
+   * Configures the api key
+   *
+   * @param apiKey The api key for your application
+   * @return the {@link ServiceBuilder} instance for method chaining
+   */
+  public ServiceBuilder apiKey(String apiKey)
+  {
+    Preconditions.checkEmptyString(apiKey, "Invalid Api key");
+    this.apiKey = apiKey;
+    return this;
+  }
+
+  /**
+   * Configures the api secret
+   *
+   * @param apiSecret The api secret for your application
+   * @return the {@link ServiceBuilder} instance for method chaining
+   */
+  public ServiceBuilder apiSecret(String apiSecret)
+  {
+    Preconditions.checkEmptyString(apiSecret, "Invalid Api secret");
+    this.apiSecret = apiSecret;
+    return this;
+  }
+
+  /**
+   * Configures the OAuth scope. This is only necessary in some APIs (like Google's).
+   *
+   * @param scope The OAuth scope
+   * @return the {@link ServiceBuilder} instance for method chaining
+   */
+  public ServiceBuilder scope(String scope)
+  {
+    Preconditions.checkEmptyString(scope, "Invalid OAuth scope");
+    this.scope = scope;
+    return this;
+  }
+
+  /**
+   * Configures the signature type, choose between header, querystring, etc. Defaults to Header
+   *
+   * @param scope The OAuth scope
+   * @return the {@link ServiceBuilder} instance for method chaining
+   */
+  public ServiceBuilder signatureType(SignatureType type)
+  {
+    Preconditions.checkNotNull(type, "Signature type can't be null");
+    this.signatureType = type;
+    return this;
+  }
+
+  public ServiceBuilder debugStream(OutputStream stream)
+  {
+    Preconditions.checkNotNull(stream, "debug stream can't be null");
+    this.debugStream = stream;
+    return this;
+  }
+
+  public ServiceBuilder debug()
+  {
+    this.debugStream(System.out);
+    return this;
+  }
+
+  /**
+   * Returns the fully configured {@link OAuthService}
+   *
+   * @return fully configured {@link OAuthService}
+   */
+  public OAuthService build()
+  {
+    Preconditions.checkNotNull(api, "You must specify a valid api through the provider() method");
+    Preconditions.checkEmptyString(apiKey, "You must provide an api key");
+    Preconditions.checkEmptyString(apiSecret, "You must provide an api secret");
+    return api.createService(new OAuthConfig(apiKey, apiSecret, callback, signatureType, scope, debugStream));
+  }
+}
+
+package org.scribe.services;
+
+import org.scribe.exceptions.*;
+import java.security.*;
+
+/**
+ * A signature service that uses the RSA-SHA1 algorithm.
+ */
+public class RSASha1SignatureService implements SignatureService
+{
+  private static final String METHOD = "RSA-SHA1";
+  private static final String RSA_SHA1 = "SHA1withRSA";
+  private static final String UTF8 = "UTF-8";
+
+  private PrivateKey privateKey;
+
+  public RSASha1SignatureService(PrivateKey privateKey)
+  {
+    this.privateKey = privateKey;
+  }
+
+  /**
+   * {@inheritDoc}
+   */
+  public String getSignature(String baseString, String apiSecret, String tokenSecret)
+  {
+    try
+    {
+      Signature signature = Signature.getInstance(RSA_SHA1);
+      signature.initSign(privateKey);
+      signature.update(baseString.getBytes(UTF8));
+      return bytesToBase64String(signature);
+    }
+    catch (Exception e)
+    {
+      throw new OAuthSignatureException(baseString, e);
+    }
+  }
+
+  private String bytesToBase64String(Signature signature) throws SignatureException
+  {
+    return Base64Encoder.getInstance().encode(signature.sign());
+  }
+
+  /**
+   * {@inheritDoc}
+   */
+  public String getSignatureMethod()
+  {
+    return METHOD;
+  }
+}
+
+package org.scribe.services;
+
+import javax.crypto.*;
+import javax.crypto.spec.*;
+
+import org.scribe.exceptions.*;
+import org.scribe.utils.*;
+
+/**
+ * HMAC-SHA1 implementation of {@link SignatureService}
+ *
+ * @author Pablo Fernandez
+ *
+ */
+public class HMACSha1SignatureService implements SignatureService
+{
+  private static final String EMPTY_STRING = "";
+  private static final String CARRIAGE_RETURN = "\r\n";
+  private static final String UTF8 = "UTF-8";
+  private static final String HMAC_SHA1 = "HmacSHA1";
+  private static final String METHOD = "HMAC-SHA1";
+
+  /**
+   * {@inheritDoc}
+   */
+  public String getSignature(String baseString, String apiSecret, String tokenSecret)
+  {
+    try
+    {
+      Preconditions.checkEmptyString(baseString, "Base string cant be null or empty string");
+      Preconditions.checkEmptyString(apiSecret, "Api secret cant be null or empty string");
+      return doSign(baseString, OAuthEncoder.encode(apiSecret) + '&' + OAuthEncoder.encode(tokenSecret));
+    }
+    catch (Exception e)
+    {
+      throw new OAuthSignatureException(baseString, e);
+    }
+  }
+
+  private String doSign(String toSign, String keyString) throws Exception
+  {
+    SecretKeySpec key = new SecretKeySpec((keyString).getBytes(UTF8), HMAC_SHA1);
+    Mac mac = Mac.getInstance(HMAC_SHA1);
+    mac.init(key);
+    byte[] bytes = mac.doFinal(toSign.getBytes(UTF8));
+    return bytesToBase64String(bytes).replace(CARRIAGE_RETURN, EMPTY_STRING);
+  }
+
+  private String bytesToBase64String(byte[] bytes)
+  {
+    return Base64Encoder.getInstance().encode(bytes);
+  }
+
+  /**
+   * {@inheritDoc}
+   */
+  public String getSignatureMethod()
+  {
+    return METHOD;
+  }
+}
+
+package org.scribe.oauth;
+
+import java.util.*;
+
+import org.scribe.builder.api.*;
+import org.scribe.model.*;
+import org.scribe.services.*;
+import org.scribe.utils.*;
+import java.util.concurrent.TimeUnit;
+
+/**
+ * OAuth 1.0a implementation of {@link OAuthService}
+ *
+ * @author Pablo Fernandez
+ */
+public class OAuth10aServiceImpl implements OAuthService
+{
+  private static final String VERSION = "1.0";
+
+  private OAuthConfig config;
+  private DefaultApi10a api;
+
+  /**
+   * Default constructor
+   *
+   * @param api OAuth1.0a api information
+   * @param config OAuth 1.0a configuration param object
+   */
+  public OAuth10aServiceImpl(DefaultApi10a api, OAuthConfig config)
+  {
+    this.api = api;
+    this.config = config;
+  }
+
+  /**
+   * {@inheritDoc}
+   */
+  public Token getRequestToken(int timeout, TimeUnit unit)
+  {
+    return getRequestToken(new TimeoutTuner(timeout, unit));
+  }
+
+  public Token getRequestToken()
+  {
+    return getRequestToken(2, TimeUnit.SECONDS);
+  }
+
+  public Token getRequestToken(RequestTuner tuner)
+  {
+    config.log("obtaining request token from " + api.getRequestTokenEndpoint());
+    OAuthRequest request = new OAuthRequest(api.getRequestTokenVerb(), api.getRequestTokenEndpoint());
+
+    config.log("setting oauth_callback to " + config.getCallback());
+    request.addOAuthParameter(OAuthConstants.CALLBACK, config.getCallback());
+    addOAuthParams(request, OAuthConstants.EMPTY_TOKEN);
+    appendSignature(request);
+
+    config.log("sending request...");
+    Response response = request.send(tuner);
+    String body = response.getBody();
+
+    config.log("response status code: " + response.getCode());
+    config.log("response body: " + body);
+    return api.getRequestTokenExtractor().extract(body);
+  }
+
+  private void addOAuthParams(OAuthRequest request, Token token)
+  {
+    request.addOAuthParameter(OAuthConstants.TIMESTAMP, api.getTimestampService().getTimestampInSeconds());
+    request.addOAuthParameter(OAuthConstants.NONCE, api.getTimestampService().getNonce());
+    request.addOAuthParameter(OAuthConstants.CONSUMER_KEY, config.getApiKey());
+    request.addOAuthParameter(OAuthConstants.SIGN_METHOD, api.getSignatureService().getSignatureMethod());
+    request.addOAuthParameter(OAuthConstants.VERSION, getVersion());
+    if(config.hasScope()) request.addOAuthParameter(OAuthConstants.SCOPE, config.getScope());
+    request.addOAuthParameter(OAuthConstants.SIGNATURE, getSignature(request, token));
+
+    config.log("appended additional OAuth parameters: " + MapUtils.toString(request.getOauthParameters()));
+  }
+
+  /**
+   * {@inheritDoc}
+   */
+  public Token getAccessToken(Token requestToken, Verifier verifier, int timeout, TimeUnit unit)
+  {
+    return getAccessToken(requestToken, verifier, new TimeoutTuner(timeout, unit));
+  }
+
+  public Token getAccessToken(Token requestToken, Verifier verifier)
+  {
+    return getAccessToken(requestToken, verifier, 2, TimeUnit.SECONDS);
+  }
+
+  public Token getAccessToken(Token requestToken, Verifier verifier, RequestTuner tuner)
+  {
+    config.log("obtaining access token from " + api.getAccessTokenEndpoint());
+    OAuthRequest request = new OAuthRequest(api.getAccessTokenVerb(), api.getAccessTokenEndpoint());
+    request.addOAuthParameter(OAuthConstants.TOKEN, requestToken.getToken());
+    request.addOAuthParameter(OAuthConstants.VERIFIER, verifier.getValue());
+
+    config.log("setting token to: " + requestToken + " and verifier to: " + verifier);
+    addOAuthParams(request, requestToken);
+    appendSignature(request);
+
+    config.log("sending request...");
+    Response response = request.send(tuner);
+    String body = response.getBody();
+
+    config.log("response status code: " + response.getCode());
+    config.log("response body: " + body);
+    return api.getAccessTokenExtractor().extract(body);
+  }
+
+  /**
+   * {@inheritDoc}
+   */
+  public void signRequest(Token token, OAuthRequest request)
+  {
+    config.log("signing request: " + request.getCompleteUrl());
+
+    // Do not append the token if empty. This is for two legged OAuth calls.
+    if (!token.isEmpty())
+    {
+      request.addOAuthParameter(OAuthConstants.TOKEN, token.getToken());
+    }
+    config.log("setting token to: " + token);
+    addOAuthParams(request, token);
+    appendSignature(request);
+  }
+
+  /**
+   * {@inheritDoc}
+   */
+  public String getVersion()
+  {
+    return VERSION;
+  }
+
+  /**
+   * {@inheritDoc}
+   */
+  public String getAuthorizationUrl(Token requestToken)
+  {
+    return api.getAuthorizationUrl(requestToken);
+  }
+
+  private String getSignature(OAuthRequest request, Token token)
+  {
+    config.log("generating signature...");
+    config.log("using base64 encoder: " + Base64Encoder.type());
+    String baseString = api.getBaseStringExtractor().extract(request);
+    String signature = api.getSignatureService().getSignature(baseString, config.getApiSecret(), token.getSecret());
+
+    config.log("base string is: " + baseString);
+    config.log("signature is: " + signature);
+    return signature;
+  }
+
+  private void appendSignature(OAuthRequest request)
+  {
+    switch (config.getSignatureType())
+    {
+      case Header:
+        config.log("using Http Header signature");
+
+        String oauthHeader = api.getHeaderExtractor().extract(request);
+        request.addHeader(OAuthConstants.HEADER, oauthHeader);
+        break;
+      case QueryString:
+        config.log("using Querystring signature");
+
+        for (Map.Entry<String, String> entry : request.getOauthParameters().entrySet())
+        {
+          request.addQuerystringParameter(entry.getKey(), entry.getValue());
+        }
+        break;
+    }
+  }
+
+  private static class TimeoutTuner extends RequestTuner
+  {
+    private final int duration;
+    private final TimeUnit unit;
+
+    public TimeoutTuner(int duration, TimeUnit unit)
+    {
+      this.duration = duration;
+      this.unit = unit;
+    }
+
+    @Override
+    public void tune(Request request)
+    {
+      request.setReadTimeout(duration, unit);
+    }
+  }
+}
+
+package org.scribe.oauth;
+
+import org.scribe.builder.api.*;
+import org.scribe.model.*;
+
+public class OAuth20ServiceImpl implements OAuthService
+{
+  private static final String VERSION = "2.0";
+
+  private final DefaultApi20 api;
+  private final OAuthConfig config;
+
+  /**
+   * Default constructor
+   *
+   * @param api OAuth2.0 api information
+   * @param config OAuth 2.0 configuration param object
+   */
+  public OAuth20ServiceImpl(DefaultApi20 api, OAuthConfig config)
+  {
+    this.api = api;
+    this.config = config;
+  }
+
+  /**
+   * {@inheritDoc}
+   */
+  public Token getAccessToken(Token requestToken, Verifier verifier)
+  {
+    OAuthRequest request = new OAuthRequest(api.getAccessTokenVerb(), api.getAccessTokenEndpoint());
+    request.addQuerystringParameter(OAuthConstants.CLIENT_ID, config.getApiKey());
+    request.addQuerystringParameter(OAuthConstants.CLIENT_SECRET, config.getApiSecret());
+    request.addQuerystringParameter(OAuthConstants.CODE, verifier.getValue());
+    request.addQuerystringParameter(OAuthConstants.REDIRECT_URI, config.getCallback());
+    if(config.hasScope()) request.addQuerystringParameter(OAuthConstants.SCOPE, config.getScope());
+    Response response = request.send();
+    return api.getAccessTokenExtractor().extract(response.getBody());
+  }
+
+  /**
+   * {@inheritDoc}
+   */
+  public Token getRequestToken()
+  {
+    throw new UnsupportedOperationException("Unsupported operation, please use 'getAuthorizationUrl' and redirect your users there");
+  }
+
+  /**
+   * {@inheritDoc}
+   */
+  public String getVersion()
+  {
+    return VERSION;
+  }
+
+  /**
+   * {@inheritDoc}
+   */
+  public void signRequest(Token accessToken, OAuthRequest request)
+  {
+    request.addQuerystringParameter(OAuthConstants.ACCESS_TOKEN, accessToken.getToken());
+  }
+
+  /**
+   * {@inheritDoc}
+   */
+  public String getAuthorizationUrl(Token requestToken)
+  {
+    return api.getAuthorizationUrl(config);
+  }
+
+}
+
+package org.scribe.model;
+
+import java.util.ArrayList;
+import java.util.Collections;
+import java.util.List;
+import java.util.Map;
+import org.scribe.utils.OAuthEncoder;
+import org.scribe.utils.Preconditions;
+
+/**
+ * @author Pablo Fernandez
+ */
+public class ParameterList
+{
+  private static final char QUERY_STRING_SEPARATOR = '?';
+  private static final String PARAM_SEPARATOR = "&";
+  private static final String PAIR_SEPARATOR = "=";
+  private static final String EMPTY_STRING = "";
+
+  private final List<Parameter> params;
+
+  public ParameterList()
+  {
+    params = new ArrayList<Parameter>();
+  }
+
+  ParameterList(List<Parameter> params)
+  {
+    this.params = new ArrayList<Parameter>(params);
+  }
+
+  public ParameterList(Map<String, String> map)
+  {
+    this();
+    for(Map.Entry<String, String> entry : map.entrySet())
+    {
+      params.add(new Parameter(entry.getKey(), entry.getValue()));
+    }
+  }
+
+  public void add(String key, String value)
+  {
+    params.add(new Parameter(key, value));
+  }
+
+  public String appendTo(String url)
+  {
+    Preconditions.checkNotNull(url, "Cannot append to null URL");
+    String queryString = asFormUrlEncodedString();
+    if (queryString.equals(EMPTY_STRING))
+    {
+      return url;
+    }
+    else
+    {
+      url += url.indexOf(QUERY_STRING_SEPARATOR) != -1 ? PARAM_SEPARATOR : QUERY_STRING_SEPARATOR;
+      url += queryString;
+      return url;
+    }
+  }
+
+  public String asOauthBaseString()
+  {
+    return OAuthEncoder.encode(asFormUrlEncodedString());
+  }
+
+  public String asFormUrlEncodedString()
+  {
+    if (params.size() == 0) return EMPTY_STRING;
+
+    StringBuilder builder = new StringBuilder();
+    for(Parameter p : params)
+    {
+      builder.append('&').append(p.asUrlEncodedPair());
+    }
+    return builder.toString().substring(1);
+  }
+
+  public void addAll(ParameterList other)
+  {
+    params.addAll(other.params);
+  }
+
+  public void addQuerystring(String queryString)
+  {
+    if (queryString != null && queryString.length() > 0)
+    {
+      for (String param : queryString.split(PARAM_SEPARATOR))
+      {
+        String pair[] = param.split(PAIR_SEPARATOR);
+        String key = OAuthEncoder.decode(pair[0]);
+        String value = pair.length > 1 ? OAuthEncoder.decode(pair[1]) : EMPTY_STRING;
+        params.add(new Parameter(key, value));
+      }
+    }
+  }
+
+  public boolean contains(Parameter param)
+  {
+    return params.contains(param);
+  }
+
+  public int size()
+  {
+    return params.size();
+  }
+
+  public ParameterList sort()
+  {
+    ParameterList sorted = new ParameterList(params);
+    Collections.sort(sorted.params);
+    return sorted;
+  }
+}
+
+package org.scribe.model;
+
+import java.io.*;
+import java.net.*;
+import java.nio.charset.*;
+import java.util.*;
+import java.util.concurrent.*;
+
+import org.scribe.exceptions.*;
+
+/**
+ * Represents an HTTP Request object
+ *
+ * @author Pablo Fernandez
+ */
+public class Request
+{
+  private static final String CONTENT_LENGTH = "Content-Length";
+  private static final String CONTENT_TYPE = "Content-Type";
+  private static RequestTuner NOOP = new RequestTuner() {
+    @Override public void tune(Request _){}
+  };
+  public static final String DEFAULT_CONTENT_TYPE = "application/x-www-form-urlencoded";
+
+  private String url;
+  private Verb verb;
+  private ParameterList querystringParams;
+  private ParameterList bodyParams;
+  private Map<String, String> headers;
+  private String payload = null;
+  private HttpURLConnection connection;
+  private String charset;
+  private byte[] bytePayload = null;
+  private boolean connectionKeepAlive = false;
+  private boolean followRedirects = true;
+  private Long connectTimeout = null;
+  private Long readTimeout = null;
+
+  /**
+   * Creates a new Http Request
+   *
+   * @param verb Http Verb (GET, POST, etc)
+   * @param url url with optional querystring parameters.
+   */
+  public Request(Verb verb, String url)
+  {
+    this.verb = verb;
+    this.url = url;
+    this.querystringParams = new ParameterList();
+    this.bodyParams = new ParameterList();
+    this.headers = new HashMap<String, String>();
+  }
+
+  /**
+   * Execute the request and return a {@link Response}
+   *
+   * @return Http Response
+   * @throws RuntimeException
+   *           if the connection cannot be created.
+   */
+  public Response send(RequestTuner tuner)
+  {
+    try
+    {
+      createConnection();
+      return doSend(tuner);
+    }
+    catch (Exception e)
+    {
+      throw new OAuthConnectionException(e);
+    }
+  }
+
+  public Response send()
+  {
+    return send(NOOP);
+  }
+
+  private void createConnection() throws IOException
+  {
+    String completeUrl = getCompleteUrl();
+    if (connection == null)
+    {
+      System.setProperty("http.keepAlive", connectionKeepAlive ? "true" : "false");
+      connection = (HttpURLConnection) new URL(completeUrl).openConnection();
+      connection.setInstanceFollowRedirects(followRedirects);
+    }
+  }
+
+  /**
+   * Returns the complete url (host + resource + encoded querystring parameters).
+   *
+   * @return the complete url.
+   */
+  public String getCompleteUrl()
+  {
+    return querystringParams.appendTo(url);
+  }
+
+  Response doSend(RequestTuner tuner) throws IOException
+  {
+    connection.setRequestMethod(this.verb.name());
+    if (connectTimeout != null)
+    {
+      connection.setConnectTimeout(connectTimeout.intValue());
+    }
+    if (readTimeout != null)
+    {
+      connection.setReadTimeout(readTimeout.intValue());
+    }
+    addHeaders(connection);
+    if (verb.equals(Verb.PUT) || verb.equals(Verb.POST))
+    {
+      addBody(connection, getByteBodyContents());
+    }
+    tuner.tune(this);
+    return new Response(connection);
+  }
+
+  void addHeaders(HttpURLConnection conn)
+  {
+    for (String key : headers.keySet())
+      conn.setRequestProperty(key, headers.get(key));
+  }
+
+  void addBody(HttpURLConnection conn, byte[] content) throws IOException
+  {
+    conn.setRequestProperty(CONTENT_LENGTH, String.valueOf(content.length));
+
+    // Set default content type if none is set.
+    if (conn.getRequestProperty(CONTENT_TYPE) == null)
+    {
+      conn.setRequestProperty(CONTENT_TYPE, DEFAULT_CONTENT_TYPE);
+    }
+    conn.setDoOutput(true);
+    conn.getOutputStream().write(content);
+  }
+
+  /**
+   * Add an HTTP Header to the Request
+   *
+   * @param key the header name
+   * @param value the header value
+   */
+  public void addHeader(String key, String value)
+  {
+    this.headers.put(key, value);
+  }
+
+  /**
+   * Add a body Parameter (for POST/ PUT Requests)
+   *
+   * @param key the parameter name
+   * @param value the parameter value
+   */
+  public void addBodyParameter(String key, String value)
+  {
+    this.bodyParams.add(key, value);
+  }
+
+  /**
+   * Add a QueryString parameter
+   *
+   * @param key the parameter name
+   * @param value the parameter value
+   */
+  public void addQuerystringParameter(String key, String value)
+  {
+    this.querystringParams.add(key, value);
+  }
+
+  /**
+   * Add body payload.
+   *
+   * This method is used when the HTTP body is not a form-url-encoded string,
+   * but another thing. Like for example XML.
+   *
+   * Note: The contents are not part of the OAuth signature
+   *
+   * @param payload the body of the request
+   */
+  public void addPayload(String payload)
+  {
+    this.payload = payload;
+  }
+
+  /**
+   * Overloaded version for byte arrays
+   *
+   * @param payload
+   */
+  public void addPayload(byte[] payload)
+  {
+    this.bytePayload = payload.clone();
+  }
+
+  /**
+   * Get a {@link ParameterList} with the query string parameters.
+   *
+   * @return a {@link ParameterList} containing the query string parameters.
+   * @throws OAuthException if the request URL is not valid.
+   */
+  public ParameterList getQueryStringParams()
+  {
+    try
+    {
+      ParameterList result = new ParameterList();
+      String queryString = new URL(url).getQuery();
+      result.addQuerystring(queryString);
+      result.addAll(querystringParams);
+      return result;
+    }
+    catch (MalformedURLException mue)
+    {
+      throw new OAuthException("Malformed URL", mue);
+    }
+  }
+
+  /**
+   * Obtains a {@link ParameterList} of the body parameters.
+   *
+   * @return a {@link ParameterList}containing the body parameters.
+   */
+  public ParameterList getBodyParams()
+  {
+    return bodyParams;
+  }
+
+  /**
+   * Obtains the URL of the HTTP Request.
+   *
+   * @return the original URL of the HTTP Request
+   */
+  public String getUrl()
+  {
+    return url;
+  }
+
+  /**
+   * Returns the URL without the default port and the query string part.
+   *
+   * @return the OAuth-sanitized URL
+   */
+  public String getSanitizedUrl()
+  {
+	 if(url.startsWith("http://") && (url.endsWith(":80") || url.contains(":80/"))){
+	   return url.replaceAll("\\?.*", "").replaceAll(":80", "");
+	 }
+	 else  if(url.startsWith("https://") && (url.endsWith(":443") || url.contains(":443/"))){
+	   return url.replaceAll("\\?.*", "").replaceAll(":443", "");
+	 }
+	 else{
+	   return url.replaceAll("\\?.*", "");
+	 }
+   }
+
+  /**
+   * Returns the body of the request
+   *
+   * @return form encoded string
+   * @throws OAuthException if the charset chosen is not supported
+   */
+  public String getBodyContents()
+  {
+    try
+    {
+      return new String(getByteBodyContents(),getCharset());
+    }
+    catch(UnsupportedEncodingException uee)
+    {
+      throw new OAuthException("Unsupported Charset: "+charset, uee);
+    }
+  }
+
+  byte[] getByteBodyContents()
+  {
+    if (bytePayload != null) return bytePayload;
+    String body = (payload != null) ? payload : bodyParams.asFormUrlEncodedString();
+    try
+    {
+      return body.getBytes(getCharset());
+    }
+    catch(UnsupportedEncodingException uee)
+    {
+      throw new OAuthException("Unsupported Charset: "+getCharset(), uee);
+    }
+  }
+
+  /**
+   * Returns the HTTP Verb
+   *
+   * @return the verb
+   */
+  public Verb getVerb()
+  {
+    return verb;
+  }
+
+  /**
+   * Returns the connection headers as a {@link Map}
+   *
+   * @return map of headers
+   */
+  public Map<String, String> getHeaders()
+  {
+    return headers;
+  }
+
+  /**
+   * Returns the connection charset. Defaults to {@link Charset} defaultCharset if not set
+   *
+   * @return charset
+   */
+  public String getCharset()
+  {
+    return charset == null ? Charset.defaultCharset().name() : charset;
+  }
+
+  /**
+   * Sets the connect timeout for the underlying {@link HttpURLConnection}
+   *
+   * @param duration duration of the timeout
+   *
+   * @param unit unit of time (milliseconds, seconds, etc)
+   */
+  public void setConnectTimeout(int duration, TimeUnit unit)
+  {
+    this.connectTimeout = unit.toMillis(duration);
+  }
+
+  /**
+   * Sets the read timeout for the underlying {@link HttpURLConnection}
+   *
+   * @param duration duration of the timeout
+   *
+   * @param unit unit of time (milliseconds, seconds, etc)
+   */
+  public void setReadTimeout(int duration, TimeUnit unit)
+  {
+    this.readTimeout = unit.toMillis(duration);
+  }
+
+  /**
+   * Set the charset of the body of the request
+   *
+   * @param charsetName name of the charset of the request
+   */
+  public void setCharset(String charsetName)
+  {
+    this.charset = charsetName;
+  }
+
+  /**
+   * Sets whether the underlying Http Connection is persistent or not.
+   *
+   * @see http://download.oracle.com/javase/1.5.0/docs/guide/net/http-keepalive.html
+   * @param connectionKeepAlive
+   */
+  public void setConnectionKeepAlive(boolean connectionKeepAlive)
+  {
+    this.connectionKeepAlive = connectionKeepAlive;
+  }
+
+  /**
+   * Sets whether the underlying Http Connection follows redirects or not.
+   *
+   * Defaults to true (follow redirects)
+   *
+   * @see http://docs.oracle.com/javase/6/docs/api/java/net/HttpURLConnection.html#setInstanceFollowRedirects(boolean)
+   * @param followRedirects
+   */
+  public void setFollowRedirects(boolean followRedirects)
+  {
+    this.followRedirects = followRedirects;
+  }
+
+  /*
+   * We need this in order to stub the connection object for test cases
+   */
+  void setConnection(HttpURLConnection connection)
+  {
+    this.connection = connection;
+  }
+
+  @Override
+  public String toString()
+  {
+    return String.format("@Request(%s %s)", getVerb(), getUrl());
+  }
+}
+
+package org.scribe.model;
+
+import java.io.*;
+import java.net.*;
+import java.util.*;
+
+import org.scribe.exceptions.*;
+import org.scribe.utils.*;
+
+/**
+ * Represents an HTTP Response.
+ *
+ * @author Pablo Fernandez
+ */
+public class Response
+{
+  private static final String EMPTY = "";
+
+  private int code;
+  private String message;
+  private String body;
+  private InputStream stream;
+  private Map<String, String> headers;
+
+  Response(HttpURLConnection connection) throws IOException
+  {
+    try
+    {
+      connection.connect();
+      code = connection.getResponseCode();
+      message = connection.getResponseMessage();
+      headers = parseHeaders(connection);
+      stream = isSuccessful() ? connection.getInputStream() : connection.getErrorStream();
+    }
+    catch (UnknownHostException e)
+    {
+      throw new OAuthException("The IP address of a host could not be determined.", e);
+    }
+  }
+
+  private String parseBodyContents()
+  {
+    body = StreamUtils.getStreamContents(getStream());
+    return body;
+  }
+
+  private Map<String, String> parseHeaders(HttpURLConnection conn)
+  {
+    Map<String, String> headers = new HashMap<String, String>();
+    for (String key : conn.getHeaderFields().keySet())
+    {
+      headers.put(key, conn.getHeaderFields().get(key).get(0));
+    }
+    return headers;
+  }
+
+  public boolean isSuccessful()
+  {
+    return getCode() >= 200 && getCode() < 400;
+  }
+
+  /**
+   * Obtains the HTTP Response body
+   *
+   * @return response body
+   */
+  public String getBody()
+  {
+    return body != null ? body : parseBodyContents();
+  }
+
+  /**
+   * Obtains the meaningful stream of the HttpUrlConnection, either inputStream
+   * or errorInputStream, depending on the status code
+   *
+   * @return input stream / error stream
+   */
+  public InputStream getStream()
+  {
+    return stream;
+  }
+
+  /**
+   * Obtains the HTTP status code
+   *
+   * @return the status code
+   */
+  public int getCode()
+  {
+    return code;
+  }
+
+  /**
+   * Obtains the HTTP status message.
+   * Returns <code>null</code> if the message can not be discerned from the response (not valid HTTP)
+   *
+   * @return the status message
+   */
+  public String getMessage()
+  {
+    return message;
+  }
+
+  /**
+   * Obtains a {@link Map} containing the HTTP Response Headers
+   *
+   * @return headers
+   */
+  public Map<String, String> getHeaders()
+  {
+    return headers;
+  }
+
+  /**
+   * Obtains a single HTTP Header value, or null if undefined
+   *
+   * @param name the header name.
+   *
+   * @return header value or null.
+   */
+  public String getHeader(String name)
+  {
+    return headers.get(name);
+  }
+
+}
+
+package com.daimajia.swipe;
+
+import android.content.Context;
+import android.content.res.TypedArray;
+import android.graphics.Rect;
+import android.support.v4.view.ViewCompat;
+import android.support.v4.widget.ViewDragHelper;
+import android.util.AttributeSet;
+import android.view.GestureDetector;
+import android.view.MotionEvent;
+import android.view.View;
+import android.view.ViewConfiguration;
+import android.view.ViewGroup;
+import android.view.ViewParent;
+import android.widget.Adapter;
+import android.widget.AdapterView;
+import android.widget.BaseAdapter;
+import android.widget.FrameLayout;
+import android.widget.ListAdapter;
+
+import java.util.ArrayList;
+import java.util.HashMap;
+import java.util.List;
+import java.util.Map;
+
+public class SwipeLayout extends FrameLayout {
+
+    public static final int EMPTY_LAYOUT = -1;
+
+    private static final int DRAG_LEFT = 1;
+    private static final int DRAG_RIGHT = 2;
+    private static final int DRAG_TOP = 4;
+    private static final int DRAG_BOTTOM = 8;
+
+    private int mTouchSlop;
+
+    private int mLeftIndex;
+    private int mRightIndex;
+    private int mTopIndex;
+    private int mBottomIndex;
+
+    private int mCurrentDirectionIndex = 0;
+    private ViewDragHelper mDragHelper;
+
+    private int mDragDistance = 0;
+    private List<DragEdge> mDragEdges;
+    private ShowMode mShowMode;
+
+    private float mLeftEdgeSwipeOffset;
+    private float mRightEdgeSwipeOffset;
+    private float mTopEdgeSwipeOffset;
+    private float mBottomEdgeSwipeOffset;
+
+    private Map<DragEdge, Integer> mBottomViewIdMap = new HashMap<DragEdge, Integer>();
+    private boolean mBottomViewIdsSet = false;
+
+    private List<SwipeListener> mSwipeListeners = new ArrayList<SwipeListener>();
+    private List<SwipeDenier> mSwipeDeniers = new ArrayList<SwipeDenier>();
+    private Map<View, ArrayList<OnRevealListener>> mRevealListeners = new HashMap<View, ArrayList<OnRevealListener>>();
+    private Map<View, Boolean> mShowEntirely = new HashMap<View, Boolean>();
+
+    private DoubleClickListener mDoubleClickListener;
+
+    private boolean mSwipeEnabled = true;
+    private boolean mLeftSwipeEnabled = true;
+    private boolean mRightSwipeEnabled = true;
+    private boolean mTopSwipeEnabled = true;
+    private boolean mBottomSwipeEnabled = true;
+
+    public static enum DragEdge {
+        Left,
+        Right,
+        Top,
+        Bottom;
+    }
+
+    ;
+
+    public static enum ShowMode {
+        LayDown,
+        PullOut
+    }
+
+    public SwipeLayout(Context context) {
+        this(context, null);
+    }
+
+    public SwipeLayout(Context context, AttributeSet attrs) {
+        this(context, attrs, 0);
+    }
+
+    public SwipeLayout(Context context, AttributeSet attrs, int defStyle) {
+        super(context, attrs, defStyle);
+        mDragHelper = ViewDragHelper.create(this, mDragHelperCallback);
+        mTouchSlop = ViewConfiguration.get(context).getScaledTouchSlop();
+
+        TypedArray a = context.obtainStyledAttributes(attrs, R.styleable.SwipeLayout);
+        int dragEdgeChoices = a.getInt(R.styleable.SwipeLayout_drag_edge, DRAG_RIGHT);
+        mLeftEdgeSwipeOffset = a.getDimension(R.styleable.SwipeLayout_leftEdgeSwipeOffset, 0);
+        mRightEdgeSwipeOffset = a.getDimension(R.styleable.SwipeLayout_rightEdgeSwipeOffset, 0);
+        mTopEdgeSwipeOffset = a.getDimension(R.styleable.SwipeLayout_topEdgeSwipeOffset, 0);
+        mBottomEdgeSwipeOffset = a.getDimension(R.styleable.SwipeLayout_bottomEdgeSwipeOffset, 0);
+
+        mDragEdges = new ArrayList<DragEdge>();
+        if ((dragEdgeChoices & DRAG_LEFT) == DRAG_LEFT) {
+            mDragEdges.add(DragEdge.Left);
+        }
+        if ((dragEdgeChoices & DRAG_RIGHT) == DRAG_RIGHT) {
+            mDragEdges.add(DragEdge.Right);
+        }
+        if ((dragEdgeChoices & DRAG_TOP) == DRAG_TOP) {
+            mDragEdges.add(DragEdge.Top);
+        }
+        if ((dragEdgeChoices & DRAG_BOTTOM) == DRAG_BOTTOM) {
+            mDragEdges.add(DragEdge.Bottom);
+        }
+        populateIndexes();
+        int ordinal = a.getInt(R.styleable.SwipeLayout_show_mode, ShowMode.PullOut.ordinal());
+        mShowMode = ShowMode.values()[ordinal];
+        a.recycle();
+    }
+
+    public interface SwipeListener {
+        public void onStartOpen(SwipeLayout layout);
+
+        public void onOpen(SwipeLayout layout);
+
+        public void onStartClose(SwipeLayout layout);
+
+        public void onClose(SwipeLayout layout);
+
+        public void onUpdate(SwipeLayout layout, int leftOffset, int topOffset);
+
+        public void onHandRelease(SwipeLayout layout, float xvel, float yvel);
+    }
+
+    public void addSwipeListener(SwipeListener l) {
+        mSwipeListeners.add(l);
+    }
+
+    public void removeSwipeListener(SwipeListener l) {
+        mSwipeListeners.remove(l);
+    }
+
+    public static interface SwipeDenier {
+        /*
+         * Called in onInterceptTouchEvent Determines if this swipe event should
+         * be denied Implement this interface if you are using views with swipe
+         * gestures As a child of SwipeLayout
+         *
+         * @return true deny false allow
+         */
+        public boolean shouldDenySwipe(MotionEvent ev);
+    }
+
+    public void addSwipeDenier(SwipeDenier denier) {
+        mSwipeDeniers.add(denier);
+    }
+
+    public void removeSwipeDenier(SwipeDenier denier) {
+        mSwipeDeniers.remove(denier);
+    }
+
+    public void removeAllSwipeDeniers() {
+        mSwipeDeniers.clear();
+    }
+
+    public interface OnRevealListener {
+        public void onReveal(View child, DragEdge edge, float fraction, int distance);
+    }
+
+    /**
+     * bind a view with a specific
+     * {@link com.daimajia.swipe.SwipeLayout.OnRevealListener}
+     *
+     * @param childId the view id.
+     * @param l       the target
+     *                {@link com.daimajia.swipe.SwipeLayout.OnRevealListener}
+     */
+    public void addRevealListener(int childId, OnRevealListener l) {
+        View child = findViewById(childId);
+        if (child == null) {
+            throw new IllegalArgumentException("Child does not belong to SwipeListener.");
+        }
+
+        if (!mShowEntirely.containsKey(child)) {
+            mShowEntirely.put(child, false);
+        }
+        if (mRevealListeners.get(child) == null)
+            mRevealListeners.put(child, new ArrayList<OnRevealListener>());
+
+        mRevealListeners.get(child).add(l);
+    }
+
+    /**
+     * bind multiple views with an
+     * {@link com.daimajia.swipe.SwipeLayout.OnRevealListener}.
+     *
+     * @param childIds the view id.
+     * @param l        the {@link com.daimajia.swipe.SwipeLayout.OnRevealListener}
+     */
+    public void addRevealListener(int[] childIds, OnRevealListener l) {
+        for (int i : childIds)
+            addRevealListener(i, l);
+    }
+
+    public void removeRevealListener(int childId, OnRevealListener l) {
+        View child = findViewById(childId);
+
+        if (child == null) return;
+
+        mShowEntirely.remove(child);
+        if (mRevealListeners.containsKey(child)) mRevealListeners.get(child).remove(l);
+    }
+
+    public void removeAllRevealListeners(int childId) {
+        View child = findViewById(childId);
+        if (child != null) {
+            mRevealListeners.remove(child);
+            mShowEntirely.remove(child);
+        }
+    }
+
+    private ViewDragHelper.Callback mDragHelperCallback = new ViewDragHelper.Callback() {
+
+        @Override
+        public int clampViewPositionHorizontal(View child, int left, int dx) {
+            if (child == getSurfaceView()) {
+                switch (mDragEdges.get(mCurrentDirectionIndex)) {
+                    case Top:
+                    case Bottom:
+                        return getPaddingLeft();
+                    case Left:
+                        if (left < getPaddingLeft()) return getPaddingLeft();
+                        if (left > getPaddingLeft() + mDragDistance)
+                            return getPaddingLeft() + mDragDistance;
+                        break;
+                    case Right:
+                        if (left > getPaddingLeft()) return getPaddingLeft();
+                        if (left < getPaddingLeft() - mDragDistance)
+                            return getPaddingLeft() - mDragDistance;
+                        break;
+                }
+            } else if (getBottomViews().get(mCurrentDirectionIndex) == child) {
+
+                switch (mDragEdges.get(mCurrentDirectionIndex)) {
+                    case Top:
+                    case Bottom:
+                        return getPaddingLeft();
+                    case Left:
+                        if (mShowMode == ShowMode.PullOut) {
+                            if (left > getPaddingLeft()) return getPaddingLeft();
+                        }
+                        break;
+                    case Right:
+                        if (mShowMode == ShowMode.PullOut) {
+                            if (left < getMeasuredWidth() - mDragDistance) {
+                                return getMeasuredWidth() - mDragDistance;
+                            }
+                        }
+                        break;
+                }
+            }
+            return left;
+        }
+
+        @Override
+        public int clampViewPositionVertical(View child, int top, int dy) {
+            if (child == getSurfaceView()) {
+                switch (mDragEdges.get(mCurrentDirectionIndex)) {
+                    case Left:
+                    case Right:
+                        return getPaddingTop();
+                    case Top:
+                        if (top < getPaddingTop()) return getPaddingTop();
+                        if (top > getPaddingTop() + mDragDistance)
+                            return getPaddingTop() + mDragDistance;
+                        break;
+                    case Bottom:
+                        if (top < getPaddingTop() - mDragDistance) {
+                            return getPaddingTop() - mDragDistance;
+                        }
+                        if (top > getPaddingTop()) {
+                            return getPaddingTop();
+                        }
+                }
+            } else {
+                switch (mDragEdges.get(mCurrentDirectionIndex)) {
+                    case Left:
+                    case Right:
+                        return getPaddingTop();
+                    case Top:
+                        if (mShowMode == ShowMode.PullOut) {
+                            if (top > getPaddingTop()) return getPaddingTop();
+                        } else {
+                            if (getSurfaceView().getTop() + dy < getPaddingTop())
+                                return getPaddingTop();
+                            if (getSurfaceView().getTop() + dy > getPaddingTop() + mDragDistance)
+                                return getPaddingTop() + mDragDistance;
+                        }
+                        break;
+                    case Bottom:
+                        if (mShowMode == ShowMode.PullOut) {
+                            if (top < getMeasuredHeight() - mDragDistance)
+                                return getMeasuredHeight() - mDragDistance;
+                        } else {
+                            if (getSurfaceView().getTop() + dy >= getPaddingTop())
+                                return getPaddingTop();
+                            if (getSurfaceView().getTop() + dy <= getPaddingTop() - mDragDistance)
+                                return getPaddingTop() - mDragDistance;
+                        }
+                }
+            }
+            return top;
+        }
+
+        @Override
+        public boolean tryCaptureView(View child, int pointerId) {
+            return child == getSurfaceView() || getBottomViews().contains(child);
+        }
+
+        @Override
+        public int getViewHorizontalDragRange(View child) {
+            return mDragDistance;
+        }
+
+        @Override
+        public int getViewVerticalDragRange(View child) {
+            return mDragDistance;
+        }
+
+        @Override
+        public void onViewReleased(View releasedChild, float xvel, float yvel) {
+            super.onViewReleased(releasedChild, xvel, yvel);
+            for (SwipeListener l : mSwipeListeners)
+                l.onHandRelease(SwipeLayout.this, xvel, yvel);
+            if (releasedChild == getSurfaceView()) {
+                processSurfaceRelease(xvel, yvel);
+            } else if (getBottomViews().contains(releasedChild)) {
+                if (getShowMode() == ShowMode.PullOut) {
+                    processBottomPullOutRelease(xvel, yvel);
+                } else if (getShowMode() == ShowMode.LayDown) {
+                    processBottomLayDownMode(xvel, yvel);
+                }
+            }
+
+            invalidate();
+        }
+
+        @Override
+        public void onViewPositionChanged(View changedView, int left, int top, int dx, int dy) {
+            int evLeft = getSurfaceView().getLeft(), evRight = getSurfaceView().getRight(), evTop = getSurfaceView()
+                    .getTop(), evBottom = getSurfaceView().getBottom();
+            if (changedView == getSurfaceView()) {
+
+                if (mShowMode == ShowMode.PullOut) {
+                    if (mDragEdges.get(mCurrentDirectionIndex) == DragEdge.Left
+                            || mDragEdges.get(mCurrentDirectionIndex) == DragEdge.Right)
+                        getBottomViews().get(mCurrentDirectionIndex).offsetLeftAndRight(dx);
+                    else getBottomViews().get(mCurrentDirectionIndex).offsetTopAndBottom(dy);
+                }
+
+            } else if (getBottomViews().contains(changedView)) {
+
+                if (mShowMode == ShowMode.PullOut) {
+                    getSurfaceView().offsetLeftAndRight(dx);
+                    getSurfaceView().offsetTopAndBottom(dy);
+                } else {
+                    Rect rect = computeBottomLayDown(mDragEdges.get(mCurrentDirectionIndex));
+                    getBottomViews().get(mCurrentDirectionIndex).layout(rect.left, rect.top, rect.right, rect.bottom);
+
+                    int newLeft = getSurfaceView().getLeft() + dx, newTop = getSurfaceView().getTop() + dy;
+
+                    if (mDragEdges.get(mCurrentDirectionIndex) == DragEdge.Left && newLeft < getPaddingLeft())
+                        newLeft = getPaddingLeft();
+                    else if (mDragEdges.get(mCurrentDirectionIndex) == DragEdge.Right && newLeft > getPaddingLeft())
+                        newLeft = getPaddingLeft();
+                    else if (mDragEdges.get(mCurrentDirectionIndex) == DragEdge.Top && newTop < getPaddingTop())
+                        newTop = getPaddingTop();
+                    else if (mDragEdges.get(mCurrentDirectionIndex) == DragEdge.Bottom && newTop > getPaddingTop())
+                        newTop = getPaddingTop();
+
+                    getSurfaceView()
+                            .layout(newLeft, newTop, newLeft + getMeasuredWidth(), newTop + getMeasuredHeight());
+                }
+            }
+
+            dispatchRevealEvent(evLeft, evTop, evRight, evBottom);
+
+            dispatchSwipeEvent(evLeft, evTop, dx, dy);
+
+            invalidate();
+        }
+    };
+
+    /**
+     * the dispatchRevealEvent method may not always get accurate position, it
+     * makes the view may not always get the event when the view is totally
+     * show( fraction = 1), so , we need to calculate every time.
+     *
+     * @param child
+     * @param relativePosition
+     * @param edge
+     * @param surfaceLeft
+     * @param surfaceTop
+     * @param surfaceRight
+     * @param surfaceBottom
+     * @return
+     */
+    protected boolean isViewTotallyFirstShowed(View child, Rect relativePosition, DragEdge edge, int surfaceLeft,
+                                               int surfaceTop, int surfaceRight, int surfaceBottom) {
+        if (mShowEntirely.get(child)) return false;
+        int childLeft = relativePosition.left;
+        int childRight = relativePosition.right;
+        int childTop = relativePosition.top;
+        int childBottom = relativePosition.bottom;
+        boolean r = false;
+        if (getShowMode() == ShowMode.LayDown) {
+            if ((edge == DragEdge.Right && surfaceRight <= childLeft)
+                    || (edge == DragEdge.Left && surfaceLeft >= childRight)
+                    || (edge == DragEdge.Top && surfaceTop >= childBottom)
+                    || (edge == DragEdge.Bottom && surfaceBottom <= childTop)) r = true;
+        } else if (getShowMode() == ShowMode.PullOut) {
+            if ((edge == DragEdge.Right && childRight <= getWidth())
+                    || (edge == DragEdge.Left && childLeft >= getPaddingLeft())
+                    || (edge == DragEdge.Top && childTop >= getPaddingTop())
+                    || (edge == DragEdge.Bottom && childBottom <= getHeight())) r = true;
+        }
+        return r;
+    }
+
+    protected boolean isViewShowing(View child, Rect relativePosition, DragEdge availableEdge, int surfaceLeft,
+                                    int surfaceTop, int surfaceRight, int surfaceBottom) {
+        int childLeft = relativePosition.left;
+        int childRight = relativePosition.right;
+        int childTop = relativePosition.top;
+        int childBottom = relativePosition.bottom;
+        if (getShowMode() == ShowMode.LayDown) {
+            switch (availableEdge) {
+                case Right:
+                    if (surfaceRight > childLeft && surfaceRight <= childRight) {
+                        return true;
+                    }
+                    break;
+                case Left:
+                    if (surfaceLeft < childRight && surfaceLeft >= childLeft) {
+                        return true;
+                    }
+                    break;
+                case Top:
+                    if (surfaceTop >= childTop && surfaceTop < childBottom) {
+                        return true;
+                    }
+                    break;
+                case Bottom:
+                    if (surfaceBottom > childTop && surfaceBottom <= childBottom) {
+                        return true;
+                    }
+                    break;
+            }
+        } else if (getShowMode() == ShowMode.PullOut) {
+            switch (availableEdge) {
+                case Right:
+                    if (childLeft <= getWidth() && childRight > getWidth()) return true;
+                    break;
+                case Left:
+                    if (childRight >= getPaddingLeft() && childLeft < getPaddingLeft()) return true;
+                    break;
+                case Top:
+                    if (childTop < getPaddingTop() && childBottom >= getPaddingTop()) return true;
+                    break;
+                case Bottom:
+                    if (childTop < getHeight() && childTop >= getPaddingTop()) return true;
+                    break;
+            }
+        }
+        return false;
+    }
+
+    protected Rect getRelativePosition(View child) {
+        View t = child;
+        Rect r = new Rect(t.getLeft(), t.getTop(), 0, 0);
+        while (t.getParent() != null && t != getRootView()) {
+            t = (View) t.getParent();
+            if (t == this) break;
+            r.left += t.getLeft();
+            r.top += t.getTop();
+        }
+        r.right = r.left + child.getMeasuredWidth();
+        r.bottom = r.top + child.getMeasuredHeight();
+        return r;
+    }
+
+    private int mEventCounter = 0;
+
+    protected void dispatchSwipeEvent(int surfaceLeft, int surfaceTop, int dx, int dy) {
+        DragEdge edge = getDragEdge();
+        boolean open = true;
+        if (edge == DragEdge.Left) {
+            if (dx < 0) open = false;
+        } else if (edge == DragEdge.Right) {
+            if (dx > 0) open = false;
+        } else if (edge == DragEdge.Top) {
+            if (dy < 0) open = false;
+        } else if (edge == DragEdge.Bottom) {
+            if (dy > 0) open = false;
+        }
+
+        dispatchSwipeEvent(surfaceLeft, surfaceTop, open);
+    }
+
+    protected void dispatchSwipeEvent(int surfaceLeft, int surfaceTop, boolean open) {
+        safeBottomView();
+        Status status = getOpenStatus();
+
+        if (!mSwipeListeners.isEmpty()) {
+            mEventCounter++;
+            for (SwipeListener l : mSwipeListeners) {
+                if (mEventCounter == 1) {
+                    if (open) {
+                        l.onStartOpen(this);
+                    } else {
+                        l.onStartClose(this);
+                    }
+                }
+                l.onUpdate(SwipeLayout.this, surfaceLeft - getPaddingLeft(), surfaceTop - getPaddingTop());
+            }
+
+            if (status == Status.Close) {
+                for (SwipeListener l : mSwipeListeners) {
+                    l.onClose(SwipeLayout.this);
+                }
+                mEventCounter = 0;
+            }
+
+            if (status == Status.Open) {
+                getBottomViews().get(mCurrentDirectionIndex).setEnabled(true);
+                for (SwipeListener l : mSwipeListeners) {
+                    l.onOpen(SwipeLayout.this);
+                }
+                mEventCounter = 0;
+            }
+        }
+    }
+
+    /**
+     * prevent bottom view get any touch event. Especially in LayDown mode.
+     */
+    private void safeBottomView() {
+        Status status = getOpenStatus();
+        List<ViewGroup> bottoms = getBottomViews();
+
+        if (status == Status.Close) {
+            for (ViewGroup bottom : bottoms) {
+                if (bottom.getVisibility() != INVISIBLE) bottom.setVisibility(INVISIBLE);
+            }
+        } else {
+            if (bottoms.get(mCurrentDirectionIndex).getVisibility() != VISIBLE)
+                bottoms.get(mCurrentDirectionIndex).setVisibility(VISIBLE);
+        }
+    }
+
+    protected void dispatchRevealEvent(final int surfaceLeft, final int surfaceTop, final int surfaceRight,
+                                       final int surfaceBottom) {
+        if (mRevealListeners.isEmpty()) return;
+        for (Map.Entry<View, ArrayList<OnRevealListener>> entry : mRevealListeners.entrySet()) {
+            View child = entry.getKey();
+            Rect rect = getRelativePosition(child);
+            if (isViewShowing(child, rect, mDragEdges.get(mCurrentDirectionIndex), surfaceLeft, surfaceTop,
+                    surfaceRight, surfaceBottom)) {
+                mShowEntirely.put(child, false);
+                int distance = 0;
+                float fraction = 0f;
+                if (getShowMode() == ShowMode.LayDown) {
+                    switch (mDragEdges.get(mCurrentDirectionIndex)) {
+                        case Left:
+                            distance = rect.left - surfaceLeft;
+                            fraction = distance / (float) child.getWidth();
+                            break;
+                        case Right:
+                            distance = rect.right - surfaceRight;
+                            fraction = distance / (float) child.getWidth();
+                            break;
+                        case Top:
+                            distance = rect.top - surfaceTop;
+                            fraction = distance / (float) child.getHeight();
+                            break;
+                        case Bottom:
+                            distance = rect.bottom - surfaceBottom;
+                            fraction = distance / (float) child.getHeight();
+                            break;
+                    }
+                } else if (getShowMode() == ShowMode.PullOut) {
+                    switch (mDragEdges.get(mCurrentDirectionIndex)) {
+                        case Left:
+                            distance = rect.right - getPaddingLeft();
+                            fraction = distance / (float) child.getWidth();
+                            break;
+                        case Right:
+                            distance = rect.left - getWidth();
+                            fraction = distance / (float) child.getWidth();
+                            break;
+                        case Top:
+                            distance = rect.bottom - getPaddingTop();
+                            fraction = distance / (float) child.getHeight();
+                            break;
+                        case Bottom:
+                            distance = rect.top - getHeight();
+                            fraction = distance / (float) child.getHeight();
+                            break;
+                    }
+                }
+
+                for (OnRevealListener l : entry.getValue()) {
+                    l.onReveal(child, mDragEdges.get(mCurrentDirectionIndex), Math.abs(fraction), distance);
+                    if (Math.abs(fraction) == 1) {
+                        mShowEntirely.put(child, true);
+                    }
+                }
+            }
+
+            if (isViewTotallyFirstShowed(child, rect, mDragEdges.get(mCurrentDirectionIndex), surfaceLeft, surfaceTop,
+                    surfaceRight, surfaceBottom)) {
+                mShowEntirely.put(child, true);
+                for (OnRevealListener l : entry.getValue()) {
+                    if (mDragEdges.get(mCurrentDirectionIndex) == DragEdge.Left
+                            || mDragEdges.get(mCurrentDirectionIndex) == DragEdge.Right)
+                        l.onReveal(child, mDragEdges.get(mCurrentDirectionIndex), 1, child.getWidth());
+                    else
+                        l.onReveal(child, mDragEdges.get(mCurrentDirectionIndex), 1, child.getHeight());
+                }
+            }
+
+        }
+    }
+
+    @Override
+    public void computeScroll() {
+        super.computeScroll();
+        if (mDragHelper.continueSettling(true)) {
+            ViewCompat.postInvalidateOnAnimation(this);
+        }
+    }
+
+    /**
+     * {@link android.view.View.OnLayoutChangeListener} added in API 11. I need
+     * to support it from API 8.
+     */
+    public interface OnLayout {
+        public void onLayout(SwipeLayout v);
+    }
+
+    private List<OnLayout> mOnLayoutListeners;
+
+    public void addOnLayoutListener(OnLayout l) {
+        if (mOnLayoutListeners == null) mOnLayoutListeners = new ArrayList<OnLayout>();
+        mOnLayoutListeners.add(l);
+    }
+
+    public void removeOnLayoutListener(OnLayout l) {
+        if (mOnLayoutListeners != null) mOnLayoutListeners.remove(l);
+    }
+
+    @Override
+    protected void onLayout(boolean changed, int l, int t, int r, int b) {
+        int childCount = getChildCount();
+        if (childCount != 1 + mDragEdges.size()) {
+            throw new IllegalStateException("You need to have one surface view plus one view for each of your drag edges");
+        }
+        for (int i = 0; i < childCount; i++) {
+            if (!(getChildAt(i) instanceof ViewGroup)) {
+                throw new IllegalArgumentException("All the children in SwipeLayout must be an instance of ViewGroup");
+            }
+        }
+
+        if (mShowMode == ShowMode.PullOut)
+            layoutPullOut();
+        else if (mShowMode == ShowMode.LayDown) layoutLayDown();
+
+        safeBottomView();
+
+        if (mOnLayoutListeners != null) for (int i = 0; i < mOnLayoutListeners.size(); i++) {
+            mOnLayoutListeners.get(i).onLayout(this);
+        }
+
+    }
+
+    void layoutPullOut() {
+        Rect rect = computeSurfaceLayoutArea(false);
+        getSurfaceView().layout(rect.left, rect.top, rect.right, rect.bottom);
+        rect = computeBottomLayoutAreaViaSurface(ShowMode.PullOut, rect);
+        getBottomViews().get(mCurrentDirectionIndex).layout(rect.left, rect.top, rect.right, rect.bottom);
+        bringChildToFront(getSurfaceView());
+    }
+
+    void layoutLayDown() {
+        Rect rect = computeSurfaceLayoutArea(false);
+        getSurfaceView().layout(rect.left, rect.top, rect.right, rect.bottom);
+        rect = computeBottomLayoutAreaViaSurface(ShowMode.LayDown, rect);
+        getBottomViews().get(mCurrentDirectionIndex).layout(rect.left, rect.top, rect.right, rect.bottom);
+        bringChildToFront(getSurfaceView());
+    }
+
+    @Override
+    protected void onMeasure(int widthMeasureSpec, int heightMeasureSpec) {
+        super.onMeasure(widthMeasureSpec, heightMeasureSpec);
+
+        if (mDragEdges.get(mCurrentDirectionIndex) == DragEdge.Left
+                || mDragEdges.get(mCurrentDirectionIndex) == DragEdge.Right)
+            mDragDistance = getBottomViews().get(mCurrentDirectionIndex).getMeasuredWidth()
+                    - dp2px(getCurrentOffset());
+        else mDragDistance = getBottomViews().get(mCurrentDirectionIndex).getMeasuredHeight()
+                - dp2px(getCurrentOffset());
+    }
+
+    private boolean mTouchConsumedByChild = false;
+
+    @Override
+    public boolean onInterceptTouchEvent(MotionEvent ev) {
+
+        if (!isEnabled() || !isEnabledInAdapterView()) {
+            return true;
+        }
+
+        if (!isSwipeEnabled()) {
+            return false;
+        }
+
+        for (SwipeDenier denier : mSwipeDeniers) {
+            if (denier != null && denier.shouldDenySwipe(ev)) {
+                return false;
+            }
+        }
+        //
+        // if a child wants to handle the touch event,
+        // then let it do it.
+        //
+        int action = ev.getActionMasked();
+        switch (action) {
+            case MotionEvent.ACTION_DOWN:
+                Status status = getOpenStatus();
+                if (status == Status.Close) {
+                    mTouchConsumedByChild = childNeedHandleTouchEvent(getSurfaceView(), ev) != null;
+                } else if (status == Status.Open) {
+                    mTouchConsumedByChild = childNeedHandleTouchEvent(getBottomViews().get(mCurrentDirectionIndex), ev) != null;
+                }
+                break;
+            case MotionEvent.ACTION_UP:
+            case MotionEvent.ACTION_CANCEL:
+                mTouchConsumedByChild = false;
+        }
+
+        if (mTouchConsumedByChild) return false;
+        return mDragHelper.shouldInterceptTouchEvent(ev);
+    }
+
+    /**
+     * if the ViewGroup children want to handle this event.
+     *
+     * @param v
+     * @param event
+     * @return
+     */
+    private View childNeedHandleTouchEvent(ViewGroup v, MotionEvent event) {
+        if (v == null) return null;
+        if (v.onTouchEvent(event)) return v;
+
+        int childCount = v.getChildCount();
+        for (int i = childCount - 1; i >= 0; i--) {
+            View child = v.getChildAt(i);
+            if (child instanceof ViewGroup) {
+                View grandChild = childNeedHandleTouchEvent((ViewGroup) child, event);
+                if (grandChild != null) return grandChild;
+            } else {
+                if (childNeedHandleTouchEvent(v.getChildAt(i), event)) return v.getChildAt(i);
+            }
+        }
+        return null;
+    }
+
+    /**
+     * if the view (v) wants to handle this event.
+     *
+     * @param v
+     * @param event
+     * @return
+     */
+    private boolean childNeedHandleTouchEvent(View v, MotionEvent event) {
+        if (v == null) return false;
+
+        int[] loc = new int[2];
+        v.getLocationOnScreen(loc);
+        int left = loc[0], top = loc[1];
+
+        if (event.getRawX() > left && event.getRawX() < left + v.getWidth() && event.getRawY() > top
+                && event.getRawY() < top + v.getHeight()) {
+            return v.onTouchEvent(event);
+        }
+
+        return false;
+    }
+
+    private float sX = -1, sY = -1;
+
+    private boolean shouldAllowSwipe() {
+        if (mCurrentDirectionIndex == mLeftIndex && !mLeftSwipeEnabled) return false;
+        if (mCurrentDirectionIndex == mRightIndex && !mRightSwipeEnabled) return false;
+        if (mCurrentDirectionIndex == mTopIndex && !mTopSwipeEnabled) return false;
+        if (mCurrentDirectionIndex == mBottomIndex && !mBottomSwipeEnabled) return false;
+        return true;
+    }
+
+    @Override
+    public boolean onTouchEvent(MotionEvent event) {
+        if (!isEnabledInAdapterView() || !isEnabled()) return true;
+
+        if (!isSwipeEnabled()) return super.onTouchEvent(event);
+
+        int action = event.getActionMasked();
+        ViewParent parent = getParent();
+
+        gestureDetector.onTouchEvent(event);
+        Status status = getOpenStatus();
+        ViewGroup touching = null;
+        if (status == Status.Close) {
+            touching = getSurfaceView();
+        } else if (status == Status.Open) {
+            touching = getBottomViews().get(mCurrentDirectionIndex);
+        }
+
+        switch (action) {
+            case MotionEvent.ACTION_DOWN:
+                mDragHelper.processTouchEvent(event);
+                parent.requestDisallowInterceptTouchEvent(true);
+
+                sX = event.getRawX();
+                sY = event.getRawY();
+
+                if (touching != null) touching.setPressed(true);
+                return true;
+            case MotionEvent.ACTION_MOVE: {
+                float distanceX = event.getRawX() - sX;
+                float distanceY = event.getRawY() - sY;
+                float angle = Math.abs(distanceY / distanceX);
+                angle = (float) Math.toDegrees(Math.atan(angle));
+                if (getOpenStatus() == Status.Close) {
+                    int lastCurrentDirectionIndex = mCurrentDirectionIndex;
+                    if (angle < 45) {
+                        if (mLeftIndex != -1 && distanceX > 0 && isLeftSwipeEnabled()) {
+                            mCurrentDirectionIndex = mLeftIndex;
+                        } else if (mRightIndex != -1 && distanceX < 0 && isRightSwipeEnabled()) {
+                            mCurrentDirectionIndex = mRightIndex;
+                        }
+                    } else {
+                        if (mTopIndex != -1 && distanceY > 0 && isTopSwipeEnabled()) {
+                            mCurrentDirectionIndex = mTopIndex;
+                        } else if (mBottomIndex != -1 && distanceY < 0 && isBottomSwipeEnabled()) {
+                            mCurrentDirectionIndex = mBottomIndex;
+                        }
+                    }
+                    if (lastCurrentDirectionIndex != mCurrentDirectionIndex) {
+                        updateBottomViews();
+                    }
+                }
+                if (!shouldAllowSwipe()) return super.onTouchEvent(event);
+
+                boolean doNothing = false;
+                if (mDragEdges.get(mCurrentDirectionIndex) == DragEdge.Right) {
+                    boolean suitable = (status == Status.Open && distanceX > mTouchSlop)
+                            || (status == Status.Close && distanceX < -mTouchSlop);
+                    suitable = suitable || (status == Status.Middle);
+
+                    if (angle > 30 || !suitable) {
+                        doNothing = true;
+                    }
+                }
+
+                if (mDragEdges.get(mCurrentDirectionIndex) == DragEdge.Left) {
+                    boolean suitable = (status == Status.Open && distanceX < -mTouchSlop)
+                            || (status == Status.Close && distanceX > mTouchSlop);
+                    suitable = suitable || status == Status.Middle;
+
+                    if (angle > 30 || !suitable) {
+                        doNothing = true;
+                    }
+                }
+
+                if (mDragEdges.get(mCurrentDirectionIndex) == DragEdge.Top) {
+                    boolean suitable = (status == Status.Open && distanceY < -mTouchSlop)
+                            || (status == Status.Close && distanceY > mTouchSlop);
+                    suitable = suitable || status == Status.Middle;
+
+                    if (angle < 60 || !suitable) {
+                        doNothing = true;
+                    }
+                }
+
+                if (mDragEdges.get(mCurrentDirectionIndex) == DragEdge.Bottom) {
+                    boolean suitable = (status == Status.Open && distanceY > mTouchSlop)
+                            || (status == Status.Close && distanceY < -mTouchSlop);
+                    suitable = suitable || status == Status.Middle;
+
+                    if (angle < 60 || !suitable) {
+                        doNothing = true;
+                    }
+                }
+
+                if (doNothing) {
+                    parent.requestDisallowInterceptTouchEvent(false);
+                    return false;
+                } else {
+                    if (touching != null) {
+                        touching.setPressed(false);
+                    }
+                    parent.requestDisallowInterceptTouchEvent(true);
+                    mDragHelper.processTouchEvent(event);
+                }
+                break;
+            }
+            case MotionEvent.ACTION_UP:
+            case MotionEvent.ACTION_CANCEL: {
+                sX = -1;
+                sY = -1;
+                if (touching != null) {
+                    touching.setPressed(false);
+                }
+            }
+            default:
+                parent.requestDisallowInterceptTouchEvent(true);
+                mDragHelper.processTouchEvent(event);
+        }
+
+        return true;
+    }
+
+    /**
+     * if working in {@link android.widget.AdapterView}, we should response
+     * {@link android.widget.Adapter} isEnable(int position).
+     *
+     * @return true when item is enabled, else disabled.
+     */
+    private boolean isEnabledInAdapterView() {
+        AdapterView adapterView = getAdapterView();
+        boolean enable = true;
+        if (adapterView != null) {
+            Adapter adapter = adapterView.getAdapter();
+            if (adapter != null) {
+                int p = adapterView.getPositionForView(SwipeLayout.this);
+                if (adapter instanceof BaseAdapter) {
+                    enable = ((BaseAdapter) adapter).isEnabled(p);
+                } else if (adapter instanceof ListAdapter) {
+                    enable = ((ListAdapter) adapter).isEnabled(p);
+                }
+            }
+        }
+        return enable;
+    }
+
+    public void setSwipeEnabled(boolean enabled) {
+        mSwipeEnabled = enabled;
+    }
+
+    public boolean isSwipeEnabled() {
+        return mSwipeEnabled;
+    }
+
+    public boolean isLeftSwipeEnabled() {
+        return mLeftSwipeEnabled;
+    }
+
+    public void setLeftSwipeEnabled(boolean leftSwipeEnabled) {
+        this.mLeftSwipeEnabled = leftSwipeEnabled;
+    }
+
+    public boolean isRightSwipeEnabled() {
+        return mRightSwipeEnabled;
+    }
+
+    public void setRightSwipeEnabled(boolean rightSwipeEnabled) {
+        this.mRightSwipeEnabled = rightSwipeEnabled;
+    }
+
+    public boolean isTopSwipeEnabled() {
+        return mTopSwipeEnabled;
+    }
+
+    public void setTopSwipeEnabled(boolean topSwipeEnabled) {
+        this.mTopSwipeEnabled = topSwipeEnabled;
+    }
+
+    public boolean isBottomSwipeEnabled() {
+        return mBottomSwipeEnabled;
+    }
+
+    public void setBottomSwipeEnabled(boolean bottomSwipeEnabled) {
+        this.mBottomSwipeEnabled = bottomSwipeEnabled;
+    }
+
+    private boolean insideAdapterView() {
+        return getAdapterView() != null;
+    }
+
+    private AdapterView getAdapterView() {
+        ViewParent t = getParent();
+        while (t != null) {
+            if (t instanceof AdapterView) {
+                return (AdapterView) t;
+            }
+            t = t.getParent();
+        }
+        return null;
+    }
+
+    /**
+     * There are 2 diffirent show mode.
+     * {@link com.daimajia.swipe.SwipeLayout.ShowMode}.Pull
+     *
+     * @param mode
+     */
+    public void setShowMode(ShowMode mode) {
+        mShowMode = mode;
+        requestLayout();
+    }
+
+    public DragEdge getDragEdge() {
+        return mDragEdges.get(mCurrentDirectionIndex);
+    }
+
+    public int getDragDistance() {
+        return mDragDistance;
+    }
+
+    public ShowMode getShowMode() {
+        return mShowMode;
+    }
+
+    public ViewGroup getSurfaceView() {
+        return (ViewGroup) getChildAt(getChildCount() - 1);
+    }
+
+    public List<ViewGroup> getBottomViews() {
+        List<ViewGroup> lvg = new ArrayList<ViewGroup>();
+        // If the user has provided a map for views to
+        if (mBottomViewIdsSet) {
+            if (mDragEdges.contains(DragEdge.Left)) {
+                lvg.add(mLeftIndex, ((ViewGroup) findViewById(mBottomViewIdMap.get(DragEdge.Left))));
+            }
+            if (mDragEdges.contains(DragEdge.Right)) {
+                lvg.add(mRightIndex, ((ViewGroup) findViewById(mBottomViewIdMap.get(DragEdge.Right))));
+            }
+            if (mDragEdges.contains(DragEdge.Top)) {
+                lvg.add(mTopIndex, ((ViewGroup) findViewById(mBottomViewIdMap.get(DragEdge.Top))));
+            }
+            if (mDragEdges.contains(DragEdge.Bottom)) {
+                lvg.add(mBottomIndex, ((ViewGroup) findViewById(mBottomViewIdMap.get(DragEdge.Bottom))));
+            }
+        }
+        // Default behaviour is to simply use the first n-1 children in the order they're listed in the layout
+        // and return them in
+        else {
+            for (int i = 0; i < (getChildCount() - 1); i++) {
+                lvg.add((ViewGroup) getChildAt(i));
+            }
+        }
+        return lvg;
+    }
+
+    public enum Status {
+        Middle,
+        Open,
+        Close
+    }
+
+    /**
+     * get the open status.
+     *
+     * @return {@link com.daimajia.swipe.SwipeLayout.Status} Open , Close or
+     * Middle.
+     */
+    public Status getOpenStatus() {
+        int surfaceLeft = getSurfaceView().getLeft();
+        int surfaceTop = getSurfaceView().getTop();
+        if (surfaceLeft == getPaddingLeft() && surfaceTop == getPaddingTop()) return Status.Close;
+
+        if (surfaceLeft == (getPaddingLeft() - mDragDistance) || surfaceLeft == (getPaddingLeft() + mDragDistance)
+                || surfaceTop == (getPaddingTop() - mDragDistance) || surfaceTop == (getPaddingTop() + mDragDistance))
+            return Status.Open;
+
+        return Status.Middle;
+    }
+
+    /**
+     * process bottom (LayDown mode) hand release event.
+     *
+     * @param xvel
+     * @param yvel
+     */
+    private void processBottomLayDownMode(float xvel, float yvel) {
+
+        if (xvel == 0 && getOpenStatus() == Status.Middle) close();
+
+        int l = getPaddingLeft(), t = getPaddingTop();
+
+        if (xvel < 0 && mDragEdges.get(mCurrentDirectionIndex) == DragEdge.Right)
+            l -= mDragDistance;
+        if (xvel > 0 && mDragEdges.get(mCurrentDirectionIndex) == DragEdge.Left) l += mDragDistance;
+
+        if (yvel > 0 && mDragEdges.get(mCurrentDirectionIndex) == DragEdge.Top) t += mDragDistance;
+        if (yvel < 0 && mDragEdges.get(mCurrentDirectionIndex) == DragEdge.Bottom)
+            t -= mDragDistance;
+
+        mDragHelper.smoothSlideViewTo(getSurfaceView(), l, t);
+        invalidate();
+    }
+
+    /**
+     * smoothly open surface.
+     */
+    public void open() {
+        open(true, true);
+    }
+
+    public void open(boolean smooth) {
+        open(smooth, true);
+    }
+
+    public void open(boolean smooth, boolean notify) {
+        ViewGroup surface = getSurfaceView(), bottom = getBottomViews().get(mCurrentDirectionIndex);
+        int dx, dy;
+        Rect rect = computeSurfaceLayoutArea(true);
+        if (smooth) {
+            mDragHelper.smoothSlideViewTo(getSurfaceView(), rect.left, rect.top);
+        } else {
+            dx = rect.left - surface.getLeft();
+            dy = rect.top - surface.getTop();
+            surface.layout(rect.left, rect.top, rect.right, rect.bottom);
+            if (getShowMode() == ShowMode.PullOut) {
+                Rect bRect = computeBottomLayoutAreaViaSurface(ShowMode.PullOut, rect);
+                bottom.layout(bRect.left, bRect.top, bRect.right, bRect.bottom);
+            }
+            if (notify) {
+                dispatchRevealEvent(rect.left, rect.top, rect.right, rect.bottom);
+                dispatchSwipeEvent(rect.left, rect.top, dx, dy);
+            } else {
+                safeBottomView();
+            }
+        }
+        invalidate();
+    }
+
+    /**
+     * close surface
+     *
+     * @param smooth smoothly or not.
+     * @param notify if notify all the listeners.
+     */
+    public void close(boolean smooth, boolean notify) {
+        ViewGroup surface = getSurfaceView();
+        int dx, dy;
+        if (smooth)
+            mDragHelper.smoothSlideViewTo(getSurfaceView(), getPaddingLeft(), getPaddingTop());
+        else {
+            Rect rect = computeSurfaceLayoutArea(false);
+            dx = rect.left - surface.getLeft();
+            dy = rect.top - surface.getTop();
+            surface.layout(rect.left, rect.top, rect.right, rect.bottom);
+            if (notify) {
+                dispatchRevealEvent(rect.left, rect.top, rect.right, rect.bottom);
+                dispatchSwipeEvent(rect.left, rect.top, dx, dy);
+            } else {
+                safeBottomView();
+            }
+        }
+        invalidate();
+    }
+
+    public void toggle() {
+        toggle(true);
+    }
+
+    public void toggle(boolean smooth) {
+        if (getOpenStatus() == Status.Open)
+            close(smooth);
+        else if (getOpenStatus() == Status.Close) open(smooth);
+    }
+
+    /**
+     * a helper function to compute the Rect area that surface will hold in.
+     *
+     * @param open open status or close status.
+     * @return
+     */
+    private Rect computeSurfaceLayoutArea(boolean open) {
+        int l = getPaddingLeft(), t = getPaddingTop();
+        if (open) {
+            if (mDragEdges.get(mCurrentDirectionIndex) == DragEdge.Left)
+                l = getPaddingLeft() + mDragDistance;
+            else if (mDragEdges.get(mCurrentDirectionIndex) == DragEdge.Right)
+                l = getPaddingLeft() - mDragDistance;
+            else if (mDragEdges.get(mCurrentDirectionIndex) == DragEdge.Top)
+                t = getPaddingTop() + mDragDistance;
+            else t = getPaddingTop() - mDragDistance;
+        }
+        return new Rect(l, t, l + getMeasuredWidth(), t + getMeasuredHeight());
+    }
+
+    private Rect computeBottomLayoutAreaViaSurface(ShowMode mode, Rect surfaceArea) {
+        Rect rect = surfaceArea;
+
+        int bl = rect.left, bt = rect.top, br = rect.right, bb = rect.bottom;
+        if (mode == ShowMode.PullOut) {
+            if (mDragEdges.get(mCurrentDirectionIndex) == DragEdge.Left)
+                bl = rect.left - mDragDistance;
+            else if (mDragEdges.get(mCurrentDirectionIndex) == DragEdge.Right)
+                bl = rect.right;
+            else if (mDragEdges.get(mCurrentDirectionIndex) == DragEdge.Top)
+                bt = rect.top - mDragDistance;
+            else bt = rect.bottom;
+
+            if (mDragEdges.get(mCurrentDirectionIndex) == DragEdge.Left || mDragEdges.get(mCurrentDirectionIndex) == DragEdge.Right) {
+                bb = rect.bottom;
+                br = bl + getBottomViews().get(mCurrentDirectionIndex).getMeasuredWidth();
+            } else {
+                bb = bt + getBottomViews().get(mCurrentDirectionIndex).getMeasuredHeight();
+                br = rect.right;
+            }
+        } else if (mode == ShowMode.LayDown) {
+            if (mDragEdges.get(mCurrentDirectionIndex) == DragEdge.Left)
+                br = bl + mDragDistance;
+            else if (mDragEdges.get(mCurrentDirectionIndex) == DragEdge.Right)
+                bl = br - mDragDistance;
+            else if (mDragEdges.get(mCurrentDirectionIndex) == DragEdge.Top)
+                bb = bt + mDragDistance;
+            else bt = bb - mDragDistance;
+
+        }
+        return new Rect(bl, bt, br, bb);
+
+    }
+
+    private Rect computeBottomLayDown(DragEdge dragEdge) {
+        int bl = getPaddingLeft(), bt = getPaddingTop();
+        int br, bb;
+        if (dragEdge == DragEdge.Right) {
+            bl = getMeasuredWidth() - mDragDistance;
+        } else if (dragEdge == DragEdge.Bottom) {
+            bt = getMeasuredHeight() - mDragDistance;
+        }
+        if (dragEdge == DragEdge.Left || dragEdge == DragEdge.Right) {
+            br = bl + mDragDistance;
+            bb = bt + getMeasuredHeight();
+        } else {
+            br = bl + getMeasuredWidth();
+            bb = bt + mDragDistance;
+        }
+        return new Rect(bl, bt, br, bb);
+    }
+
+    public void setOnDoubleClickListener(DoubleClickListener doubleClickListener) {
+        mDoubleClickListener = doubleClickListener;
+    }
+
+    public interface DoubleClickListener {
+        public void onDoubleClick(SwipeLayout layout, boolean surface);
+    }
+}

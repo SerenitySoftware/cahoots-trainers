@@ -1,0 +1,4504 @@
+/*!	SWFObject v2.2 <http://code.google.com/p/swfobject/>
+	is released under the MIT License <http://www.opensource.org/licenses/mit-license.php>
+*/
+
+var swfobject = function() {
+
+	var UNDEF = "undefined",
+		OBJECT = "object",
+		SHOCKWAVE_FLASH = "Shockwave Flash",
+		SHOCKWAVE_FLASH_AX = "ShockwaveFlash.ShockwaveFlash",
+		FLASH_MIME_TYPE = "application/x-shockwave-flash",
+		EXPRESS_INSTALL_ID = "SWFObjectExprInst",
+		ON_READY_STATE_CHANGE = "onreadystatechange",
+
+		win = window,
+		doc = document,
+		nav = navigator,
+
+		plugin = false,
+		domLoadFnArr = [main],
+		regObjArr = [],
+		objIdArr = [],
+		listenersArr = [],
+		storedAltContent,
+		storedAltContentId,
+		storedCallbackFn,
+		storedCallbackObj,
+		isDomLoaded = false,
+		isExpressInstallActive = false,
+		dynamicStylesheet,
+		dynamicStylesheetMedia,
+		autoHideShow = true,
+
+	/* Centralized function for browser feature detection
+		- User agent string detection is only used when no good alternative is possible
+		- Is executed directly for optimal performance
+	*/
+	ua = function() {
+		var w3cdom = typeof doc.getElementById != UNDEF && typeof doc.getElementsByTagName != UNDEF && typeof doc.createElement != UNDEF,
+			u = nav.userAgent.toLowerCase(),
+			p = nav.platform.toLowerCase(),
+			windows = p ? /win/.test(p) : /win/.test(u),
+			mac = p ? /mac/.test(p) : /mac/.test(u),
+			webkit = /webkit/.test(u) ? parseFloat(u.replace(/^.*webkit\/(\d+(\.\d+)?).*$/, "$1")) : false, // returns either the webkit version or false if not webkit
+			ie = !+"\v1", // feature detection based on Andrea Giammarchi's solution: http://webreflection.blogspot.com/2009/01/32-bytes-to-know-if-your-browser-is-ie.html
+			playerVersion = [0,0,0],
+			d = null;
+		if (typeof nav.plugins != UNDEF && typeof nav.plugins[SHOCKWAVE_FLASH] == OBJECT) {
+			d = nav.plugins[SHOCKWAVE_FLASH].description;
+			if (d && !(typeof nav.mimeTypes != UNDEF && nav.mimeTypes[FLASH_MIME_TYPE] && !nav.mimeTypes[FLASH_MIME_TYPE].enabledPlugin)) { // navigator.mimeTypes["application/x-shockwave-flash"].enabledPlugin indicates whether plug-ins are enabled or disabled in Safari 3+
+				plugin = true;
+				ie = false; // cascaded feature detection for Internet Explorer
+				d = d.replace(/^.*\s+(\S+\s+\S+$)/, "$1");
+				playerVersion[0] = parseInt(d.replace(/^(.*)\..*$/, "$1"), 10);
+				playerVersion[1] = parseInt(d.replace(/^.*\.(.*)\s.*$/, "$1"), 10);
+				playerVersion[2] = /[a-zA-Z]/.test(d) ? parseInt(d.replace(/^.*[a-zA-Z]+(.*)$/, "$1"), 10) : 0;
+			}
+		}
+		else if (typeof win.ActiveXObject != UNDEF) {
+			try {
+				var a = new ActiveXObject(SHOCKWAVE_FLASH_AX);
+				if (a) { // a will return null when ActiveX is disabled
+					d = a.GetVariable("$version");
+					if (d) {
+						ie = true; // cascaded feature detection for Internet Explorer
+						d = d.split(" ")[1].split(",");
+						playerVersion = [parseInt(d[0], 10), parseInt(d[1], 10), parseInt(d[2], 10)];
+					}
+				}
+			}
+			catch(e) {}
+		}
+		return { w3:w3cdom, pv:playerVersion, wk:webkit, ie:ie, win:windows, mac:mac };
+	}(),
+
+	/* Cross-browser onDomLoad
+		- Will fire an event as soon as the DOM of a web page is loaded
+		- Internet Explorer workaround based on Diego Perini's solution: http://javascript.nwbox.com/IEContentLoaded/
+		- Regular onload serves as fallback
+	*/
+	onDomLoad = function() {
+		if (!ua.w3) { return; }
+		if ((typeof doc.readyState != UNDEF && doc.readyState == "complete") || (typeof doc.readyState == UNDEF && (doc.getElementsByTagName("body")[0] || doc.body))) { // function is fired after onload, e.g. when script is inserted dynamically
+			callDomLoadFunctions();
+		}
+		if (!isDomLoaded) {
+			if (typeof doc.addEventListener != UNDEF) {
+				doc.addEventListener("DOMContentLoaded", callDomLoadFunctions, false);
+			}
+			if (ua.ie && ua.win) {
+				doc.attachEvent(ON_READY_STATE_CHANGE, function() {
+					if (doc.readyState == "complete") {
+						doc.detachEvent(ON_READY_STATE_CHANGE, arguments.callee);
+						callDomLoadFunctions();
+					}
+				});
+				if (win == top) { // if not inside an iframe
+					(function(){
+						if (isDomLoaded) { return; }
+						try {
+							doc.documentElement.doScroll("left");
+						}
+						catch(e) {
+							setTimeout(arguments.callee, 0);
+							return;
+						}
+						callDomLoadFunctions();
+					})();
+				}
+			}
+			if (ua.wk) {
+				(function(){
+					if (isDomLoaded) { return; }
+					if (!/loaded|complete/.test(doc.readyState)) {
+						setTimeout(arguments.callee, 0);
+						return;
+					}
+					callDomLoadFunctions();
+				})();
+			}
+			addLoadEvent(callDomLoadFunctions);
+		}
+	}();
+
+	function callDomLoadFunctions() {
+		if (isDomLoaded) { return; }
+		try { // test if we can really add/remove elements to/from the DOM; we don't want to fire it too early
+			var t = doc.getElementsByTagName("body")[0].appendChild(createElement("span"));
+			t.parentNode.removeChild(t);
+		}
+		catch (e) { return; }
+		isDomLoaded = true;
+		var dl = domLoadFnArr.length;
+		for (var i = 0; i < dl; i++) {
+			domLoadFnArr[i]();
+		}
+	}
+
+	function addDomLoadEvent(fn) {
+		if (isDomLoaded) {
+			fn();
+		}
+		else {
+			domLoadFnArr[domLoadFnArr.length] = fn; // Array.push() is only available in IE5.5+
+		}
+	}
+
+	/* Cross-browser onload
+		- Based on James Edwards' solution: http://brothercake.com/site/resources/scripts/onload/
+		- Will fire an event as soon as a web page including all of its assets are loaded
+	 */
+	function addLoadEvent(fn) {
+		if (typeof win.addEventListener != UNDEF) {
+			win.addEventListener("load", fn, false);
+		}
+		else if (typeof doc.addEventListener != UNDEF) {
+			doc.addEventListener("load", fn, false);
+		}
+		else if (typeof win.attachEvent != UNDEF) {
+			addListener(win, "onload", fn);
+		}
+		else if (typeof win.onload == "function") {
+			var fnOld = win.onload;
+			win.onload = function() {
+				fnOld();
+				fn();
+			};
+		}
+		else {
+			win.onload = fn;
+		}
+	}
+
+	/* Main function
+		- Will preferably execute onDomLoad, otherwise onload (as a fallback)
+	*/
+	function main() {
+		if (plugin) {
+			testPlayerVersion();
+		}
+		else {
+			matchVersions();
+		}
+	}
+
+	/* Detect the Flash Player version for non-Internet Explorer browsers
+		- Detecting the plug-in version via the object element is more precise than using the plugins collection item's description:
+		  a. Both release and build numbers can be detected
+		  b. Avoid wrong descriptions by corrupt installers provided by Adobe
+		  c. Avoid wrong descriptions by multiple Flash Player entries in the plugin Array, caused by incorrect browser imports
+		- Disadvantage of this method is that it depends on the availability of the DOM, while the plugins collection is immediately available
+	*/
+	function testPlayerVersion() {
+		var b = doc.getElementsByTagName("body")[0];
+		var o = createElement(OBJECT);
+		o.setAttribute("type", FLASH_MIME_TYPE);
+		var t = b.appendChild(o);
+		if (t) {
+			var counter = 0;
+			(function(){
+				if (typeof t.GetVariable != UNDEF) {
+					var d = t.GetVariable("$version");
+					if (d) {
+						d = d.split(" ")[1].split(",");
+						ua.pv = [parseInt(d[0], 10), parseInt(d[1], 10), parseInt(d[2], 10)];
+					}
+				}
+				else if (counter < 10) {
+					counter++;
+					setTimeout(arguments.callee, 10);
+					return;
+				}
+				b.removeChild(o);
+				t = null;
+				matchVersions();
+			})();
+		}
+		else {
+			matchVersions();
+		}
+	}
+
+	/* Perform Flash Player and SWF version matching; static publishing only
+	*/
+	function matchVersions() {
+		var rl = regObjArr.length;
+		if (rl > 0) {
+			for (var i = 0; i < rl; i++) { // for each registered object element
+				var id = regObjArr[i].id;
+				var cb = regObjArr[i].callbackFn;
+				var cbObj = {success:false, id:id};
+				if (ua.pv[0] > 0) {
+					var obj = getElementById(id);
+					if (obj) {
+						if (hasPlayerVersion(regObjArr[i].swfVersion) && !(ua.wk && ua.wk < 312)) { // Flash Player version >= published SWF version: Houston, we have a match!
+							setVisibility(id, true);
+							if (cb) {
+								cbObj.success = true;
+								cbObj.ref = getObjectById(id);
+								cb(cbObj);
+							}
+						}
+						else if (regObjArr[i].expressInstall && canExpressInstall()) { // show the Adobe Express Install dialog if set by the web page author and if supported
+							var att = {};
+							att.data = regObjArr[i].expressInstall;
+							att.width = obj.getAttribute("width") || "0";
+							att.height = obj.getAttribute("height") || "0";
+							if (obj.getAttribute("class")) { att.styleclass = obj.getAttribute("class"); }
+							if (obj.getAttribute("align")) { att.align = obj.getAttribute("align"); }
+							// parse HTML object param element's name-value pairs
+							var par = {};
+							var p = obj.getElementsByTagName("param");
+							var pl = p.length;
+							for (var j = 0; j < pl; j++) {
+								if (p[j].getAttribute("name").toLowerCase() != "movie") {
+									par[p[j].getAttribute("name")] = p[j].getAttribute("value");
+								}
+							}
+							showExpressInstall(att, par, id, cb);
+						}
+						else { // Flash Player and SWF version mismatch or an older Webkit engine that ignores the HTML object element's nested param elements: display alternative content instead of SWF
+							displayAltContent(obj);
+							if (cb) { cb(cbObj); }
+						}
+					}
+				}
+				else {	// if no Flash Player is installed or the fp version cannot be detected we let the HTML object element do its job (either show a SWF or alternative content)
+					setVisibility(id, true);
+					if (cb) {
+						var o = getObjectById(id); // test whether there is an HTML object element or not
+						if (o && typeof o.SetVariable != UNDEF) {
+							cbObj.success = true;
+							cbObj.ref = o;
+						}
+						cb(cbObj);
+					}
+				}
+			}
+		}
+	}
+
+	function getObjectById(objectIdStr) {
+		var r = null;
+		var o = getElementById(objectIdStr);
+		if (o && o.nodeName == "OBJECT") {
+			if (typeof o.SetVariable != UNDEF) {
+				r = o;
+			}
+			else {
+				var n = o.getElementsByTagName(OBJECT)[0];
+				if (n) {
+					r = n;
+				}
+			}
+		}
+		return r;
+	}
+
+	/* Requirements for Adobe Express Install
+		- only one instance can be active at a time
+		- fp 6.0.65 or higher
+		- Win/Mac OS only
+		- no Webkit engines older than version 312
+	*/
+	function canExpressInstall() {
+		return !isExpressInstallActive && hasPlayerVersion("6.0.65") && (ua.win || ua.mac) && !(ua.wk && ua.wk < 312);
+	}
+
+	/* Show the Adobe Express Install dialog
+		- Reference: http://www.adobe.com/cfusion/knowledgebase/index.cfm?id=6a253b75
+	*/
+	function showExpressInstall(att, par, replaceElemIdStr, callbackFn) {
+		isExpressInstallActive = true;
+		storedCallbackFn = callbackFn || null;
+		storedCallbackObj = {success:false, id:replaceElemIdStr};
+		var obj = getElementById(replaceElemIdStr);
+		if (obj) {
+			if (obj.nodeName == "OBJECT") { // static publishing
+				storedAltContent = abstractAltContent(obj);
+				storedAltContentId = null;
+			}
+			else { // dynamic publishing
+				storedAltContent = obj;
+				storedAltContentId = replaceElemIdStr;
+			}
+			att.id = EXPRESS_INSTALL_ID;
+			if (typeof att.width == UNDEF || (!/%$/.test(att.width) && parseInt(att.width, 10) < 310)) { att.width = "310"; }
+			if (typeof att.height == UNDEF || (!/%$/.test(att.height) && parseInt(att.height, 10) < 137)) { att.height = "137"; }
+			doc.title = doc.title.slice(0, 47) + " - Flash Player Installation";
+			var pt = ua.ie && ua.win ? "ActiveX" : "PlugIn",
+				fv = "MMredirectURL=" + win.location.toString().replace(/&/g,"%26") + "&MMplayerType=" + pt + "&MMdoctitle=" + doc.title;
+			if (typeof par.flashvars != UNDEF) {
+				par.flashvars += "&" + fv;
+			}
+			else {
+				par.flashvars = fv;
+			}
+			// IE only: when a SWF is loading (AND: not available in cache) wait for the readyState of the object element to become 4 before removing it,
+			// because you cannot properly cancel a loading SWF file without breaking browser load references, also obj.onreadystatechange doesn't work
+			if (ua.ie && ua.win && obj.readyState != 4) {
+				var newObj = createElement("div");
+				replaceElemIdStr += "SWFObjectNew";
+				newObj.setAttribute("id", replaceElemIdStr);
+				obj.parentNode.insertBefore(newObj, obj); // insert placeholder div that will be replaced by the object element that loads expressinstall.swf
+				obj.style.display = "none";
+				(function(){
+					if (obj.readyState == 4) {
+						obj.parentNode.removeChild(obj);
+					}
+					else {
+						setTimeout(arguments.callee, 10);
+					}
+				})();
+			}
+			createSWF(att, par, replaceElemIdStr);
+		}
+	}
+
+	/* Functions to abstract and display alternative content
+	*/
+	function displayAltContent(obj) {
+		if (ua.ie && ua.win && obj.readyState != 4) {
+			// IE only: when a SWF is loading (AND: not available in cache) wait for the readyState of the object element to become 4 before removing it,
+			// because you cannot properly cancel a loading SWF file without breaking browser load references, also obj.onreadystatechange doesn't work
+			var el = createElement("div");
+			obj.parentNode.insertBefore(el, obj); // insert placeholder div that will be replaced by the alternative content
+			el.parentNode.replaceChild(abstractAltContent(obj), el);
+			obj.style.display = "none";
+			(function(){
+				if (obj.readyState == 4) {
+					obj.parentNode.removeChild(obj);
+				}
+				else {
+					setTimeout(arguments.callee, 10);
+				}
+			})();
+		}
+		else {
+			obj.parentNode.replaceChild(abstractAltContent(obj), obj);
+		}
+	}
+
+	function abstractAltContent(obj) {
+		var ac = createElement("div");
+		if (ua.win && ua.ie) {
+			ac.innerHTML = obj.innerHTML;
+		}
+		else {
+			var nestedObj = obj.getElementsByTagName(OBJECT)[0];
+			if (nestedObj) {
+				var c = nestedObj.childNodes;
+				if (c) {
+					var cl = c.length;
+					for (var i = 0; i < cl; i++) {
+						if (!(c[i].nodeType == 1 && c[i].nodeName == "PARAM") && !(c[i].nodeType == 8)) {
+							ac.appendChild(c[i].cloneNode(true));
+						}
+					}
+				}
+			}
+		}
+		return ac;
+	}
+
+	/* Cross-browser dynamic SWF creation
+	*/
+	function createSWF(attObj, parObj, id) {
+		var r, el = getElementById(id);
+		if (ua.wk && ua.wk < 312) { return r; }
+		if (el) {
+			if (typeof attObj.id == UNDEF) { // if no 'id' is defined for the object element, it will inherit the 'id' from the alternative content
+				attObj.id = id;
+			}
+			if (ua.ie && ua.win) { // Internet Explorer + the HTML object element + W3C DOM methods do not combine: fall back to outerHTML
+				var att = "";
+				for (var i in attObj) {
+					if (attObj[i] != Object.prototype[i]) { // filter out prototype additions from other potential libraries
+						if (i.toLowerCase() == "data") {
+							parObj.movie = attObj[i];
+						}
+						else if (i.toLowerCase() == "styleclass") { // 'class' is an ECMA4 reserved keyword
+							att += ' class="' + attObj[i] + '"';
+						}
+						else if (i.toLowerCase() != "classid") {
+							att += ' ' + i + '="' + attObj[i] + '"';
+						}
+					}
+				}
+				var par = "";
+				for (var j in parObj) {
+					if (parObj[j] != Object.prototype[j]) { // filter out prototype additions from other potential libraries
+						par += '<param name="' + j + '" value="' + parObj[j] + '" />';
+					}
+				}
+				el.outerHTML = '<object classid="clsid:D27CDB6E-AE6D-11cf-96B8-444553540000"' + att + '>' + par + '</object>';
+				objIdArr[objIdArr.length] = attObj.id; // stored to fix object 'leaks' on unload (dynamic publishing only)
+				r = getElementById(attObj.id);
+			}
+			else { // well-behaving browsers
+				var o = createElement(OBJECT);
+				o.setAttribute("type", FLASH_MIME_TYPE);
+				for (var m in attObj) {
+					if (attObj[m] != Object.prototype[m]) { // filter out prototype additions from other potential libraries
+						if (m.toLowerCase() == "styleclass") { // 'class' is an ECMA4 reserved keyword
+							o.setAttribute("class", attObj[m]);
+						}
+						else if (m.toLowerCase() != "classid") { // filter out IE specific attribute
+							o.setAttribute(m, attObj[m]);
+						}
+					}
+				}
+				for (var n in parObj) {
+					if (parObj[n] != Object.prototype[n] && n.toLowerCase() != "movie") { // filter out prototype additions from other potential libraries and IE specific param element
+						createObjParam(o, n, parObj[n]);
+					}
+				}
+				el.parentNode.replaceChild(o, el);
+				r = o;
+			}
+		}
+		return r;
+	}
+
+	function createObjParam(el, pName, pValue) {
+		var p = createElement("param");
+		p.setAttribute("name", pName);
+		p.setAttribute("value", pValue);
+		el.appendChild(p);
+	}
+
+	/* Cross-browser SWF removal
+		- Especially needed to safely and completely remove a SWF in Internet Explorer
+	*/
+	function removeSWF(id) {
+		var obj = getElementById(id);
+		if (obj && obj.nodeName == "OBJECT") {
+			if (ua.ie && ua.win) {
+				obj.style.display = "none";
+				(function(){
+					if (obj.readyState == 4) {
+						removeObjectInIE(id);
+					}
+					else {
+						setTimeout(arguments.callee, 10);
+					}
+				})();
+			}
+			else {
+				obj.parentNode.removeChild(obj);
+			}
+		}
+	}
+
+	function removeObjectInIE(id) {
+		var obj = getElementById(id);
+		if (obj) {
+			for (var i in obj) {
+				if (typeof obj[i] == "function") {
+					obj[i] = null;
+				}
+			}
+			obj.parentNode.removeChild(obj);
+		}
+	}
+
+	/* Functions to optimize JavaScript compression
+	*/
+	function getElementById(id) {
+		var el = null;
+		try {
+			el = doc.getElementById(id);
+		}
+		catch (e) {}
+		return el;
+	}
+
+	function createElement(el) {
+		return doc.createElement(el);
+	}
+
+	/* Updated attachEvent function for Internet Explorer
+		- Stores attachEvent information in an Array, so on unload the detachEvent functions can be called to avoid memory leaks
+	*/
+	function addListener(target, eventType, fn) {
+		target.attachEvent(eventType, fn);
+		listenersArr[listenersArr.length] = [target, eventType, fn];
+	}
+
+	/* Flash Player and SWF content version matching
+	*/
+	function hasPlayerVersion(rv) {
+		var pv = ua.pv, v = rv.split(".");
+		v[0] = parseInt(v[0], 10);
+		v[1] = parseInt(v[1], 10) || 0; // supports short notation, e.g. "9" instead of "9.0.0"
+		v[2] = parseInt(v[2], 10) || 0;
+		return (pv[0] > v[0] || (pv[0] == v[0] && pv[1] > v[1]) || (pv[0] == v[0] && pv[1] == v[1] && pv[2] >= v[2])) ? true : false;
+	}
+
+	/* Cross-browser dynamic CSS creation
+		- Based on Bobby van der Sluis' solution: http://www.bobbyvandersluis.com/articles/dynamicCSS.php
+	*/
+	function createCSS(sel, decl, media, newStyle) {
+		if (ua.ie && ua.mac) { return; }
+		var h = doc.getElementsByTagName("head")[0];
+		if (!h) { return; } // to also support badly authored HTML pages that lack a head element
+		var m = (media && typeof media == "string") ? media : "screen";
+		if (newStyle) {
+			dynamicStylesheet = null;
+			dynamicStylesheetMedia = null;
+		}
+		if (!dynamicStylesheet || dynamicStylesheetMedia != m) {
+			// create dynamic stylesheet + get a global reference to it
+			var s = createElement("style");
+			s.setAttribute("type", "text/css");
+			s.setAttribute("media", m);
+			dynamicStylesheet = h.appendChild(s);
+			if (ua.ie && ua.win && typeof doc.styleSheets != UNDEF && doc.styleSheets.length > 0) {
+				dynamicStylesheet = doc.styleSheets[doc.styleSheets.length - 1];
+			}
+			dynamicStylesheetMedia = m;
+		}
+		// add style rule
+		if (ua.ie && ua.win) {
+			if (dynamicStylesheet && typeof dynamicStylesheet.addRule == OBJECT) {
+				dynamicStylesheet.addRule(sel, decl);
+			}
+		}
+		else {
+			if (dynamicStylesheet && typeof doc.createTextNode != UNDEF) {
+				dynamicStylesheet.appendChild(doc.createTextNode(sel + " {" + decl + "}"));
+			}
+		}
+	}
+
+	function setVisibility(id, isVisible) {
+		if (!autoHideShow) { return; }
+		var v = isVisible ? "visible" : "hidden";
+		if (isDomLoaded && getElementById(id)) {
+			getElementById(id).style.visibility = v;
+		}
+		else {
+			createCSS("#" + id, "visibility:" + v);
+		}
+	}
+
+	/* Filter to avoid XSS attacks
+	*/
+	function urlEncodeIfNecessary(s) {
+		var regex = /[\\\"<>\.;]/;
+		var hasBadChars = regex.exec(s) != null;
+		return hasBadChars && typeof encodeURIComponent != UNDEF ? encodeURIComponent(s) : s;
+	}
+
+	/* Release memory to avoid memory leaks caused by closures, fix hanging audio/video threads and force open sockets/NetConnections to disconnect (Internet Explorer only)
+	*/
+	var cleanup = function() {
+		if (ua.ie && ua.win) {
+			window.attachEvent("onunload", function() {
+				// remove listeners to avoid memory leaks
+				var ll = listenersArr.length;
+				for (var i = 0; i < ll; i++) {
+					listenersArr[i][0].detachEvent(listenersArr[i][1], listenersArr[i][2]);
+				}
+				// cleanup dynamically embedded objects to fix audio/video threads and force open sockets and NetConnections to disconnect
+				var il = objIdArr.length;
+				for (var j = 0; j < il; j++) {
+					removeSWF(objIdArr[j]);
+				}
+				// cleanup library's main closures to avoid memory leaks
+				for (var k in ua) {
+					ua[k] = null;
+				}
+				ua = null;
+				for (var l in swfobject) {
+					swfobject[l] = null;
+				}
+				swfobject = null;
+			});
+		}
+	}();
+
+	return {
+		/* Public API
+			- Reference: http://code.google.com/p/swfobject/wiki/documentation
+		*/
+		registerObject: function(objectIdStr, swfVersionStr, xiSwfUrlStr, callbackFn) {
+			if (ua.w3 && objectIdStr && swfVersionStr) {
+				var regObj = {};
+				regObj.id = objectIdStr;
+				regObj.swfVersion = swfVersionStr;
+				regObj.expressInstall = xiSwfUrlStr;
+				regObj.callbackFn = callbackFn;
+				regObjArr[regObjArr.length] = regObj;
+				setVisibility(objectIdStr, false);
+			}
+			else if (callbackFn) {
+				callbackFn({success:false, id:objectIdStr});
+			}
+		},
+
+		getObjectById: function(objectIdStr) {
+			if (ua.w3) {
+				return getObjectById(objectIdStr);
+			}
+		},
+
+		embedSWF: function(swfUrlStr, replaceElemIdStr, widthStr, heightStr, swfVersionStr, xiSwfUrlStr, flashvarsObj, parObj, attObj, callbackFn) {
+			var callbackObj = {success:false, id:replaceElemIdStr};
+			if (ua.w3 && !(ua.wk && ua.wk < 312) && swfUrlStr && replaceElemIdStr && widthStr && heightStr && swfVersionStr) {
+				setVisibility(replaceElemIdStr, false);
+				addDomLoadEvent(function() {
+					widthStr += ""; // auto-convert to string
+					heightStr += "";
+					var att = {};
+					if (attObj && typeof attObj === OBJECT) {
+						for (var i in attObj) { // copy object to avoid the use of references, because web authors often reuse attObj for multiple SWFs
+							att[i] = attObj[i];
+						}
+					}
+					att.data = swfUrlStr;
+					att.width = widthStr;
+					att.height = heightStr;
+					var par = {};
+					if (parObj && typeof parObj === OBJECT) {
+						for (var j in parObj) { // copy object to avoid the use of references, because web authors often reuse parObj for multiple SWFs
+							par[j] = parObj[j];
+						}
+					}
+					if (flashvarsObj && typeof flashvarsObj === OBJECT) {
+						for (var k in flashvarsObj) { // copy object to avoid the use of references, because web authors often reuse flashvarsObj for multiple SWFs
+							if (typeof par.flashvars != UNDEF) {
+								par.flashvars += "&" + k + "=" + flashvarsObj[k];
+							}
+							else {
+								par.flashvars = k + "=" + flashvarsObj[k];
+							}
+						}
+					}
+					if (hasPlayerVersion(swfVersionStr)) { // create SWF
+						var obj = createSWF(att, par, replaceElemIdStr);
+						if (att.id == replaceElemIdStr) {
+							setVisibility(replaceElemIdStr, true);
+						}
+						callbackObj.success = true;
+						callbackObj.ref = obj;
+					}
+					else if (xiSwfUrlStr && canExpressInstall()) { // show Adobe Express Install
+						att.data = xiSwfUrlStr;
+						showExpressInstall(att, par, replaceElemIdStr, callbackFn);
+						return;
+					}
+					else { // show alternative content
+						setVisibility(replaceElemIdStr, true);
+					}
+					if (callbackFn) { callbackFn(callbackObj); }
+				});
+			}
+			else if (callbackFn) { callbackFn(callbackObj);	}
+		},
+
+		switchOffAutoHideShow: function() {
+			autoHideShow = false;
+		},
+
+		ua: ua,
+
+		getFlashPlayerVersion: function() {
+			return { major:ua.pv[0], minor:ua.pv[1], release:ua.pv[2] };
+		},
+
+		hasFlashPlayerVersion: hasPlayerVersion,
+
+		createSWF: function(attObj, parObj, replaceElemIdStr) {
+			if (ua.w3) {
+				return createSWF(attObj, parObj, replaceElemIdStr);
+			}
+			else {
+				return undefined;
+			}
+		},
+
+		showExpressInstall: function(att, par, replaceElemIdStr, callbackFn) {
+			if (ua.w3 && canExpressInstall()) {
+				showExpressInstall(att, par, replaceElemIdStr, callbackFn);
+			}
+		},
+
+		removeSWF: function(objElemIdStr) {
+			if (ua.w3) {
+				removeSWF(objElemIdStr);
+			}
+		},
+
+		createCSS: function(selStr, declStr, mediaStr, newStyleBoolean) {
+			if (ua.w3) {
+				createCSS(selStr, declStr, mediaStr, newStyleBoolean);
+			}
+		},
+
+		addDomLoadEvent: addDomLoadEvent,
+
+		addLoadEvent: addLoadEvent,
+
+		getQueryParamValue: function(param) {
+			var q = doc.location.search || doc.location.hash;
+			if (q) {
+				if (/\?/.test(q)) { q = q.split("?")[1]; } // strip question mark
+				if (param == null) {
+					return urlEncodeIfNecessary(q);
+				}
+				var pairs = q.split("&");
+				for (var i = 0; i < pairs.length; i++) {
+					if (pairs[i].substring(0, pairs[i].indexOf("=")) == param) {
+						return urlEncodeIfNecessary(pairs[i].substring((pairs[i].indexOf("=") + 1)));
+					}
+				}
+			}
+			return "";
+		},
+
+		// For internal usage only
+		expressInstallCallback: function() {
+			if (isExpressInstallActive) {
+				var obj = getElementById(EXPRESS_INSTALL_ID);
+				if (obj && storedAltContent) {
+					obj.parentNode.replaceChild(storedAltContent, obj);
+					if (storedAltContentId) {
+						setVisibility(storedAltContentId, true);
+						if (ua.ie && ua.win) { storedAltContent.style.display = "block"; }
+					}
+					if (storedCallbackFn) { storedCallbackFn(storedCallbackObj); }
+				}
+				isExpressInstallActive = false;
+			}
+		}
+	};
+}();
+
+// Copyright: Hiroshi Ichikawa <http://gimite.net/en/>
+// License: New BSD License
+// Reference: http://dev.w3.org/html5/websockets/
+// Reference: http://tools.ietf.org/html/rfc6455
+
+package net.gimite.websocket {
+
+import com.adobe.net.proxies.RFC2817Socket;
+import com.gsolo.encryption.SHA1;
+import com.hurlant.crypto.tls.TLSConfig;
+import com.hurlant.crypto.tls.TLSEngine;
+import com.hurlant.crypto.tls.TLSSecurityParameters;
+import com.hurlant.crypto.tls.TLSSocket;
+
+import flash.display.*;
+import flash.errors.*;
+import flash.events.*;
+import flash.external.*;
+import flash.net.*;
+import flash.system.*;
+import flash.utils.*;
+
+import mx.controls.*;
+import mx.core.*;
+import mx.events.*;
+import mx.utils.*;
+
+public class WebSocket extends EventDispatcher {
+
+  private static const WEB_SOCKET_GUID:String = "258EAFA5-E914-47DA-95CA-C5AB0DC85B11";
+
+  private static const CONNECTING:int = 0;
+  private static const OPEN:int = 1;
+  private static const CLOSING:int = 2;
+  private static const CLOSED:int = 3;
+
+  private static const OPCODE_CONTINUATION:int = 0x00;
+  private static const OPCODE_TEXT:int = 0x01;
+  private static const OPCODE_BINARY:int = 0x02;
+  private static const OPCODE_CLOSE:int = 0x08;
+  private static const OPCODE_PING:int = 0x09;
+  private static const OPCODE_PONG:int = 0x0a;
+
+  private static const STATUS_NORMAL_CLOSURE:int = 1000;
+  private static const STATUS_NO_CODE:int = 1005;
+  private static const STATUS_CLOSED_ABNORMALLY:int = 1006;
+  private static const STATUS_CONNECTION_ERROR:int = 5000;
+
+  private var id:int;
+  private var url:String;
+  private var scheme:String;
+  private var host:String;
+  private var port:uint;
+  private var path:String;
+  private var origin:String;
+  private var requestedProtocols:Array;
+  private var cookie:String;
+  private var headers:String;
+
+  private var rawSocket:Socket;
+  private var tlsSocket:TLSSocket;
+  private var tlsConfig:TLSConfig;
+  private var socket:Socket;
+
+  private var acceptedProtocol:String;
+  private var expectedDigest:String;
+
+  private var buffer:ByteArray = new ByteArray();
+  private var fragmentsBuffer:ByteArray = null;
+  private var headerState:int = 0;
+  private var readyState:int = CONNECTING;
+
+  private var logger:IWebSocketLogger;
+  private var base64Encoder:Base64Encoder = new Base64Encoder();
+
+  public function WebSocket(
+      id:int, url:String, protocols:Array, origin:String,
+      proxyHost:String, proxyPort:int,
+      cookie:String, headers:String,
+      logger:IWebSocketLogger) {
+    this.logger = logger;
+    this.id = id;
+    this.url = url;
+    var m:Array = url.match(/^(\w+):\/\/([^\/:]+)(:(\d+))?(\/.*)?(\?.*)?$/);
+    if (!m) fatal("SYNTAX_ERR: invalid url: " + url);
+    this.scheme = m[1];
+    this.host = m[2];
+    var defaultPort:int = scheme == "wss" ? 443 : 80;
+    this.port = parseInt(m[4]) || defaultPort;
+    this.path = (m[5] || "/") + (m[6] || "");
+    this.origin = origin;
+    this.requestedProtocols = protocols;
+    this.cookie = cookie;
+    // if present and not the empty string, headers MUST end with \r\n
+    // headers should be zero or more complete lines, for example
+    // "Header1: xxx\r\nHeader2: yyyy\r\n"
+    this.headers = headers;
+
+    if (proxyHost != null && proxyPort != 0){
+      if (scheme == "wss") {
+        fatal("wss with proxy is not supported");
+      }
+      var proxySocket:RFC2817Socket = new RFC2817Socket();
+      proxySocket.setProxyInfo(proxyHost, proxyPort);
+      proxySocket.addEventListener(ProgressEvent.SOCKET_DATA, onSocketData);
+      rawSocket = socket = proxySocket;
+    } else {
+      rawSocket = new Socket();
+      if (scheme == "wss") {
+        tlsConfig= new TLSConfig(TLSEngine.CLIENT,
+            null, null, null, null, null,
+            TLSSecurityParameters.PROTOCOL_VERSION);
+        tlsConfig.trustAllCertificates = true;
+        tlsConfig.ignoreCommonNameMismatch = true;
+        tlsSocket = new TLSSocket();
+        tlsSocket.addEventListener(ProgressEvent.SOCKET_DATA, onSocketData);
+        socket = tlsSocket;
+      } else {
+        rawSocket.addEventListener(ProgressEvent.SOCKET_DATA, onSocketData);
+        socket = rawSocket;
+      }
+    }
+    rawSocket.addEventListener(Event.CLOSE, onSocketClose);
+    rawSocket.addEventListener(Event.CONNECT, onSocketConnect);
+    rawSocket.addEventListener(IOErrorEvent.IO_ERROR, onSocketIoError);
+    rawSocket.addEventListener(SecurityErrorEvent.SECURITY_ERROR, onSocketSecurityError);
+    rawSocket.connect(host, port);
+  }
+
+  /**
+   * @return  This WebSocket's ID.
+   */
+  public function getId():int {
+    return this.id;
+  }
+
+  /**
+   * @return this WebSocket's readyState.
+   */
+  public function getReadyState():int {
+    return this.readyState;
+  }
+
+  public function getAcceptedProtocol():String {
+    return this.acceptedProtocol;
+  }
+
+  public function send(encData:String):int {
+    var data:String;
+    try {
+      data = decodeURIComponent(encData);
+    } catch (ex:URIError) {
+      logger.error("SYNTAX_ERR: URIError in send()");
+      return 0;
+    }
+    logger.log("send: " + data);
+    var dataBytes:ByteArray = new ByteArray();
+    dataBytes.writeUTFBytes(data);
+    if (readyState == OPEN) {
+      var frame:WebSocketFrame = new WebSocketFrame();
+      frame.opcode = OPCODE_TEXT;
+      frame.payload = dataBytes;
+      if (sendFrame(frame)) {
+        return -1;
+      } else {
+        return dataBytes.length;
+      }
+    } else if (readyState == CLOSING || readyState == CLOSED) {
+      return dataBytes.length;
+    } else {
+      fatal("invalid state");
+      return 0;
+    }
+  }
+
+  public function close(
+      code:int = STATUS_NO_CODE, reason:String = "", origin:String = "client"):void {
+    if (code != STATUS_NORMAL_CLOSURE &&
+        code != STATUS_NO_CODE &&
+        code != STATUS_CONNECTION_ERROR) {
+      logger.error(StringUtil.substitute(
+          "Fail connection by {0}: code={1} reason={2}", origin, code, reason));
+    }
+    var closeConnection:Boolean =
+        code == STATUS_CONNECTION_ERROR || origin == "server";
+    try {
+      if (readyState == OPEN && code != STATUS_CONNECTION_ERROR) {
+        var frame:WebSocketFrame = new WebSocketFrame();
+        frame.opcode = OPCODE_CLOSE;
+        frame.payload = new ByteArray();
+        if (origin == "client" && code != STATUS_NO_CODE) {
+          frame.payload.writeShort(code);
+          frame.payload.writeUTFBytes(reason);
+        }
+        sendFrame(frame);
+      }
+      if (closeConnection) {
+        socket.close();
+      }
+    } catch (ex:Error) {
+      logger.error("Error: " + ex.message);
+    }
+    if (closeConnection) {
+      logger.log("closed");
+      var fireErrorEvent:Boolean = readyState != CONNECTING && code == STATUS_CONNECTION_ERROR;
+      readyState = CLOSED;
+      if (fireErrorEvent) {
+        dispatchEvent(new WebSocketEvent("error"));
+      }
+      var wasClean:Boolean = code != STATUS_CLOSED_ABNORMALLY && code != STATUS_CONNECTION_ERROR;
+      var eventCode:int = code == STATUS_CONNECTION_ERROR ? STATUS_CLOSED_ABNORMALLY : code;
+      dispatchCloseEvent(wasClean, eventCode, reason);
+    } else {
+      logger.log("closing");
+      readyState = CLOSING;
+    }
+  }
+
+  private function onSocketConnect(event:Event):void {
+    logger.log("connected");
+
+    if (scheme == "wss") {
+      logger.log("starting SSL/TLS");
+      tlsSocket.startTLS(rawSocket, host, tlsConfig);
+    }
+
+    var defaultPort:int = scheme == "wss" ? 443 : 80;
+    var hostValue:String = host + (port == defaultPort ? "" : ":" + port);
+    var key:String = generateKey();
+
+    SHA1.b64pad = "=";
+    expectedDigest = SHA1.b64_sha1(key + WEB_SOCKET_GUID);
+
+    var opt:String = "";
+    if (requestedProtocols.length > 0) {
+      opt += "Sec-WebSocket-Protocol: " + requestedProtocols.join(",") + "\r\n";
+    }
+    // if caller passes additional headers they must end with "\r\n"
+    if (headers) opt += headers;
+
+    var req:String = StringUtil.substitute(
+      "GET {0} HTTP/1.1\r\n" +
+      "Host: {1}\r\n" +
+      "Upgrade: websocket\r\n" +
+      "Connection: Upgrade\r\n" +
+      "Sec-WebSocket-Key: {2}\r\n" +
+      "Origin: {3}\r\n" +
+      "Sec-WebSocket-Version: 13\r\n" +
+      "Cookie: {4}\r\n" +
+      "{5}" +
+      "\r\n",
+      path, hostValue, key, origin, cookie, opt);
+    logger.log("request header:\n" + req);
+    socket.writeUTFBytes(req);
+    socket.flush();
+  }
+
+  private function onSocketClose(event:Event):void {
+    logger.log("closed");
+    readyState = CLOSED;
+    dispatchCloseEvent(false, STATUS_CLOSED_ABNORMALLY, "");
+  }
+
+  private function onSocketIoError(event:IOErrorEvent):void {
+    var message:String;
+    if (readyState == CONNECTING) {
+      message = "cannot connect to Web Socket server at " + url + " (IoError: " + event.text + ")";
+    } else {
+      message =
+          "error communicating with Web Socket server at " + url +
+          " (IoError: " + event.text + ")";
+    }
+    onConnectionError(message);
+  }
+
+  private function onSocketSecurityError(event:SecurityErrorEvent):void {
+    var message:String;
+    if (readyState == CONNECTING) {
+      message =
+          "cannot connect to Web Socket server at " + url + " (SecurityError: " + event.text + ")\n" +
+          "make sure the server is running and Flash socket policy file is correctly placed";
+    } else {
+      message =
+          "error communicating with Web Socket server at " + url +
+          " (SecurityError: " + event.text + ")";
+    }
+    onConnectionError(message);
+  }
+
+  private function onConnectionError(message:String):void {
+    if (readyState == CLOSED) return;
+    logger.error(message);
+    close(STATUS_CONNECTION_ERROR);
+  }
+
+  private function onSocketData(event:ProgressEvent):void {
+    var pos:int = buffer.length;
+    socket.readBytes(buffer, pos);
+    for (; pos < buffer.length; ++pos) {
+      if (headerState < 4) {
+        // try to find "\r\n\r\n"
+        if ((headerState == 0 || headerState == 2) && buffer[pos] == 0x0d) {
+          ++headerState;
+        } else if ((headerState == 1 || headerState == 3) && buffer[pos] == 0x0a) {
+          ++headerState;
+        } else {
+          headerState = 0;
+        }
+        if (headerState == 4) {
+          var headerStr:String = readUTFBytes(buffer, 0, pos + 1);
+          logger.log("response header:\n" + headerStr);
+          if (!validateHandshake(headerStr)) return;
+          removeBufferBefore(pos + 1);
+          pos = -1;
+          readyState = OPEN;
+          this.dispatchEvent(new WebSocketEvent("open"));
+        }
+      } else {
+        var frame:WebSocketFrame = parseFrame();
+        if (frame) {
+          removeBufferBefore(frame.length);
+          pos = -1;
+          if (frame.rsv != 0) {
+            close(1002, "RSV must be 0.");
+          } else if (frame.mask) {
+            close(1002, "Frame from server must not be masked.");
+          } else if (frame.opcode >= 0x08 && frame.opcode <= 0x0f && frame.payload.length >= 126) {
+            close(1004, "Payload of control frame must be less than 126 bytes.");
+          } else {
+            switch (frame.opcode) {
+              case OPCODE_CONTINUATION:
+                if (fragmentsBuffer == null) {
+                  close(1002, "Unexpected continuation frame");
+                } else {
+                  fragmentsBuffer.writeBytes(frame.payload);
+                  if (frame.fin) {
+                    data = readUTFBytes(fragmentsBuffer, 0, fragmentsBuffer.length);
+                    try {
+                      this.dispatchEvent(new WebSocketEvent("message", encodeURIComponent(data)));
+                    } catch (ex:URIError) {
+                      close(1007, "URIError while encoding the received data.");
+                    }
+                    fragmentsBuffer = null;
+                  }
+                }
+                break;
+              case OPCODE_TEXT:
+                if (frame.fin) {
+                var data:String = readUTFBytes(frame.payload, 0, frame.payload.length);
+                try {
+                  this.dispatchEvent(new WebSocketEvent("message", encodeURIComponent(data)));
+                } catch (ex:URIError) {
+                  close(1007, "URIError while encoding the received data.");
+                }
+                } else {
+                  fragmentsBuffer = new ByteArray();
+                  fragmentsBuffer.writeBytes(frame.payload);
+                }
+                break;
+              case OPCODE_BINARY:
+                // See https://github.com/gimite/web-socket-js/pull/89
+                // for discussion about supporting binary data.
+                close(1003, "Received binary data, which is not supported.");
+                break;
+              case OPCODE_CLOSE:
+                // Extracts code and reason string.
+                var code:int = STATUS_NO_CODE;
+                var reason:String = "";
+                if (frame.payload.length >= 2) {
+                  frame.payload.endian = Endian.BIG_ENDIAN;
+                  frame.payload.position = 0;
+                  code = frame.payload.readUnsignedShort();
+                  reason = readUTFBytes(frame.payload, 2, frame.payload.length - 2);
+                }
+                logger.log("received closing frame");
+                close(code, reason, "server");
+                break;
+              case OPCODE_PING:
+                sendPong(frame.payload);
+                break;
+              case OPCODE_PONG:
+                break;
+              default:
+                close(1002, "Received unknown opcode: " + frame.opcode);
+                break;
+            }
+          }
+        }
+      }
+    }
+  }
+
+  private function validateHandshake(headerStr:String):Boolean {
+    var lines:Array = headerStr.split(/\r\n/);
+    if (!lines[0].match(/^HTTP\/1.1 101 /)) {
+      onConnectionError("bad response: " + lines[0]);
+      return false;
+    }
+    var header:Object = {};
+    var lowerHeader:Object = {};
+    for (var i:int = 1; i < lines.length; ++i) {
+      if (lines[i].length == 0) continue;
+      var m:Array = lines[i].match(/^(\S+):(.*)$/);
+      if (!m) {
+        onConnectionError("failed to parse response header line: " + lines[i]);
+        return false;
+      }
+      var key:String = m[1].toLowerCase();
+      var value:String = StringUtil.trim(m[2]);
+      header[key] = value;
+      lowerHeader[key] = value.toLowerCase();
+    }
+    if (lowerHeader["upgrade"] != "websocket") {
+      onConnectionError("invalid Upgrade: " + header["Upgrade"]);
+      return false;
+    }
+    if (lowerHeader["connection"] != "upgrade") {
+      onConnectionError("invalid Connection: " + header["Connection"]);
+      return false;
+    }
+    if (!lowerHeader["sec-websocket-accept"]) {
+      onConnectionError(
+        "The WebSocket server speaks old WebSocket protocol, " +
+        "which is not supported by web-socket-js. " +
+        "It requires WebSocket protocol HyBi 10. " +
+        "Try newer version of the server if available.");
+      return false;
+    }
+    var replyDigest:String = header["sec-websocket-accept"]
+    if (replyDigest != expectedDigest) {
+      onConnectionError("digest doesn't match: " + replyDigest + " != " + expectedDigest);
+      return false;
+    }
+    if (requestedProtocols.length > 0) {
+      acceptedProtocol = header["sec-websocket-protocol"];
+      if (requestedProtocols.indexOf(acceptedProtocol) < 0) {
+        onConnectionError("protocol doesn't match: '" +
+          acceptedProtocol + "' not in '" + requestedProtocols.join(",") + "'");
+        return false;
+      }
+    }
+    return true;
+  }
+
+  private function sendPong(payload:ByteArray):Boolean {
+    var frame:WebSocketFrame = new WebSocketFrame();
+    frame.opcode = OPCODE_PONG;
+    frame.payload = payload;
+    return sendFrame(frame);
+  }
+
+  private function sendFrame(frame:WebSocketFrame):Boolean {
+
+    var plength:uint = frame.payload.length;
+
+    // Generates a mask.
+    var mask:ByteArray = new ByteArray();
+    for (var i:int = 0; i < 4; i++) {
+      mask.writeByte(randomInt(0, 255));
+    }
+
+    var header:ByteArray = new ByteArray();
+    // FIN + RSV + opcode
+    header.writeByte((frame.fin ? 0x80 : 0x00) | (frame.rsv << 4) | frame.opcode);
+    if (plength <= 125) {
+      header.writeByte(0x80 | plength);  // Masked + length
+    } else if (plength > 125 && plength < 65536) {
+      header.writeByte(0x80 | 126);  // Masked + 126
+      header.writeShort(plength);
+    } else if (plength >= 65536 && plength < 4294967296) {
+      header.writeByte(0x80 | 127);  // Masked + 127
+      header.writeUnsignedInt(0);  // zero high order bits
+      header.writeUnsignedInt(plength);
+    } else {
+      fatal("Send frame size too large");
+    }
+    header.writeBytes(mask);
+
+    var maskedPayload:ByteArray = new ByteArray();
+    maskedPayload.length = frame.payload.length;
+    for (i = 0; i < frame.payload.length; i++) {
+      maskedPayload[i] = mask[i % 4] ^ frame.payload[i];
+    }
+
+    try {
+      socket.writeBytes(header);
+      socket.writeBytes(maskedPayload);
+      socket.flush();
+    } catch (ex:Error) {
+      logger.error("Error while sending frame: " + ex.message);
+      setTimeout(function():void {
+        if (readyState != CLOSED) {
+          close(STATUS_CONNECTION_ERROR);
+        }
+      }, 0);
+      return false;
+    }
+    return true;
+
+  }
+
+  private function parseFrame():WebSocketFrame {
+
+    var frame:WebSocketFrame = new WebSocketFrame();
+    var hlength:uint = 0;
+    var plength:uint = 0;
+
+    hlength = 2;
+    if (buffer.length < hlength) {
+      return null;
+    }
+
+    frame.fin = (buffer[0] & 0x80) != 0;
+    frame.rsv = (buffer[0] & 0x70) >> 4;
+    frame.opcode  = buffer[0] & 0x0f;
+    // Payload unmasking is not implemented because masking frames from server
+    // is not allowed. This field is used only for error checking.
+    frame.mask = (buffer[1] & 0x80) != 0;
+    plength = buffer[1] & 0x7f;
+
+    if (plength == 126) {
+
+      hlength = 4;
+      if (buffer.length < hlength) {
+        return null;
+      }
+      buffer.endian = Endian.BIG_ENDIAN;
+      buffer.position = 2;
+      plength = buffer.readUnsignedShort();
+
+    } else if (plength == 127) {
+
+      hlength = 10;
+      if (buffer.length < hlength) {
+        return null;
+      }
+      buffer.endian = Endian.BIG_ENDIAN;
+      buffer.position = 2;
+      // Protocol allows 64-bit length, but we only handle 32-bit
+      var big:uint = buffer.readUnsignedInt(); // Skip high 32-bits
+      plength = buffer.readUnsignedInt(); // Low 32-bits
+      if (big != 0) {
+        fatal("Frame length exceeds 4294967295. Bailing out!");
+        return null;
+      }
+
+    }
+
+    if (buffer.length < hlength + plength) {
+      return null;
+    }
+
+    frame.length = hlength + plength;
+    frame.payload = new ByteArray();
+    buffer.position = hlength;
+    buffer.readBytes(frame.payload, 0, plength);
+    return frame;
+
+  }
+
+  private function dispatchCloseEvent(wasClean:Boolean, code:int, reason:String):void {
+    var event:WebSocketEvent = new WebSocketEvent("close");
+    event.wasClean = wasClean;
+    event.code = code;
+    event.reason = reason;
+    dispatchEvent(event);
+  }
+
+  private function removeBufferBefore(pos:int):void {
+    if (pos == 0) return;
+    var nextBuffer:ByteArray = new ByteArray();
+    buffer.position = pos;
+    buffer.readBytes(nextBuffer);
+    buffer = nextBuffer;
+  }
+
+  private function generateKey():String {
+    var vals:ByteArray = new ByteArray();
+    vals.length = 16;
+    for (var i:int = 0; i < vals.length; ++i) {
+        vals[i] = randomInt(0, 127);
+    }
+    base64Encoder.reset();
+    base64Encoder.encodeBytes(vals);
+    return base64Encoder.toString();
+  }
+
+  private function readUTFBytes(buffer:ByteArray, start:int, numBytes:int):String {
+    buffer.position = start;
+    var data:String = "";
+    for(var i:int = start; i < start + numBytes; ++i) {
+      // Workaround of a bug of ByteArray#readUTFBytes() that bytes after "\x00" is discarded.
+      if (buffer[i] == 0x00) {
+        data += buffer.readUTFBytes(i - buffer.position) + "\x00";
+        buffer.position = i + 1;
+      }
+    }
+    data += buffer.readUTFBytes(start + numBytes - buffer.position);
+    return data;
+  }
+
+  private function randomInt(min:uint, max:uint):uint {
+    return min + Math.floor(Math.random() * (Number(max) - min + 1));
+  }
+
+  private function fatal(message:String):void {
+    logger.error(message);
+    throw message;
+  }
+
+}
+
+}
+
+// Copyright: Hiroshi Ichikawa <http://gimite.net/en/>
+// License: New BSD License
+
+package net.gimite.websocket {
+
+import flash.display.Sprite;
+import flash.external.ExternalInterface;
+import flash.system.Security;
+import flash.utils.setTimeout;
+
+import mx.utils.URLUtil;
+
+/**
+  * Provides JavaScript API of WebSocket.
+  */
+public class WebSocketMain extends Sprite implements IWebSocketLogger{
+
+  private var callerUrl:String;
+  private var debug:Boolean = false;
+  private var manualPolicyFileLoaded:Boolean = false;
+  private var webSockets:Array = [];
+  private var eventQueue:Array = [];
+
+  public function WebSocketMain() {
+    ExternalInterface.addCallback("setCallerUrl", setCallerUrl);
+    ExternalInterface.addCallback("setDebug", setDebug);
+    ExternalInterface.addCallback("create", create);
+    ExternalInterface.addCallback("send", send);
+    ExternalInterface.addCallback("close", close);
+    ExternalInterface.addCallback("loadManualPolicyFile", loadManualPolicyFile);
+    ExternalInterface.addCallback("receiveEvents", receiveEvents);
+    ExternalInterface.call("WebSocket.__onFlashInitialized");
+  }
+
+  public function setCallerUrl(url:String):void {
+    callerUrl = url;
+  }
+
+  public function setDebug(val:Boolean):void {
+    debug = val;
+    if (val) {
+      log("debug enabled");
+    }
+  }
+
+  private function loadDefaultPolicyFile(wsUrl:String):void {
+    var policyUrl:String = "xmlsocket://" + URLUtil.getServerName(wsUrl) + ":843";
+    log("policy file: " + policyUrl);
+    Security.loadPolicyFile(policyUrl);
+  }
+
+  public function loadManualPolicyFile(policyUrl:String):void {
+    log("policy file: " + policyUrl);
+    Security.loadPolicyFile(policyUrl);
+    manualPolicyFileLoaded = true;
+  }
+
+  public function log(message:String):void {
+    if (debug) {
+      ExternalInterface.call("WebSocket.__log", encodeURIComponent("[WebSocket] " + message));
+    }
+  }
+
+  public function error(message:String):void {
+    ExternalInterface.call("WebSocket.__error", encodeURIComponent("[WebSocket] " + message));
+  }
+
+  private function parseEvent(event:WebSocketEvent):Object {
+    var webSocket:WebSocket = event.target as WebSocket;
+    var eventObj:Object = {};
+    eventObj.type = event.type;
+    eventObj.webSocketId = webSocket.getId();
+    eventObj.readyState = webSocket.getReadyState();
+    eventObj.protocol = webSocket.getAcceptedProtocol();
+    if (event.message !== null) {
+      eventObj.message = event.message;
+    }
+    if (event.wasClean) {
+      eventObj.wasClean = event.wasClean;
+    }
+    if (event.code) {
+      eventObj.code = event.code;
+    }
+    if (event.reason !== null) {
+      eventObj.reason = event.reason;
+    }
+    return eventObj;
+  }
+
+  public function create(
+      webSocketId:int,
+      url:String, protocols:Array,
+      proxyHost:String = null, proxyPort:int = 0,
+      headers:String = null):void {
+    if (!manualPolicyFileLoaded) {
+      loadDefaultPolicyFile(url);
+    }
+    var newSocket:WebSocket = new WebSocket(
+        webSocketId, url, protocols, getOrigin(), proxyHost, proxyPort,
+        getCookie(url), headers, this);
+    newSocket.addEventListener("open", onSocketEvent);
+    newSocket.addEventListener("close", onSocketEvent);
+    newSocket.addEventListener("error", onSocketEvent);
+    newSocket.addEventListener("message", onSocketEvent);
+    webSockets[webSocketId] = newSocket;
+  }
+
+  public function send(webSocketId:int, encData:String):int {
+    var webSocket:WebSocket = webSockets[webSocketId];
+    return webSocket.send(encData);
+  }
+
+  public function close(webSocketId:int):void {
+    var webSocket:WebSocket = webSockets[webSocketId];
+    webSocket.close();
+  }
+
+  public function receiveEvents():Object {
+    var result:Object = eventQueue;
+    eventQueue = [];
+    return result;
+  }
+
+  private function getOrigin():String {
+    return (URLUtil.getProtocol(this.callerUrl) + "://" +
+      URLUtil.getServerNameWithPort(this.callerUrl)).toLowerCase();
+  }
+
+  private function getCookie(url:String):String {
+    if (URLUtil.getServerName(url).toLowerCase() ==
+        URLUtil.getServerName(this.callerUrl).toLowerCase()) {
+      return ExternalInterface.call("function(){return document.cookie}");
+    } else {
+      return "";
+    }
+  }
+
+  /**
+   * Socket event handler.
+   */
+  public function onSocketEvent(event:WebSocketEvent):void {
+    var eventObj:Object = parseEvent(event);
+    eventQueue.push(eventObj);
+    processEvents();
+  }
+
+  /**
+   * Process our event queue.  If javascript is unresponsive, set
+   * a timeout and try again.
+   */
+  public function processEvents():void {
+    if (eventQueue.length == 0) return;
+    if (!ExternalInterface.call("WebSocket.__onFlashEvent")) {
+      setTimeout(processEvents, 500);
+    }
+  }
+
+}
+
+}
+
+// =================================================================================================
+//
+//	Starling Framework
+//	Copyright 2011-2014 Gamua. All Rights Reserved.
+//
+//	This program is free software. You can redistribute and/or modify it
+//	in accordance with the terms of the accompanying license agreement.
+//
+// =================================================================================================
+
+package starling.core
+{
+    import com.adobe.utils.AGALMiniAssembler;
+
+    import flash.display3D.Context3D;
+    import flash.display3D.Context3DCompareMode;
+    import flash.display3D.Context3DProgramType;
+    import flash.display3D.Context3DStencilAction;
+    import flash.display3D.Context3DTextureFormat;
+    import flash.display3D.Context3DTriangleFace;
+    import flash.display3D.Program3D;
+    import flash.geom.Matrix;
+    import flash.geom.Matrix3D;
+    import flash.geom.Point;
+    import flash.geom.Rectangle;
+    import flash.geom.Vector3D;
+
+    import starling.display.BlendMode;
+    import starling.display.DisplayObject;
+    import starling.display.Quad;
+    import starling.display.QuadBatch;
+    import starling.display.Stage;
+    import starling.errors.MissingContextError;
+    import starling.textures.Texture;
+    import starling.textures.TextureSmoothing;
+    import starling.utils.Color;
+    import starling.utils.MatrixUtil;
+    import starling.utils.RectangleUtil;
+
+    /** A class that contains helper methods simplifying Stage3D rendering.
+     *
+     *  A RenderSupport instance is passed to any "render" method of display objects.
+     *  It allows manipulation of the current transformation matrix (similar to the matrix
+     *  manipulation methods of OpenGL 1.x) and other helper methods.
+     */
+    public class RenderSupport
+    {
+        // members
+
+        private var mProjectionMatrix:Matrix;
+        private var mModelViewMatrix:Matrix;
+        private var mMvpMatrix:Matrix;
+
+        private var mMatrixStack:Vector.<Matrix>;
+        private var mMatrixStackSize:int;
+
+        private var mProjectionMatrix3D:Matrix3D;
+        private var mModelViewMatrix3D:Matrix3D;
+        private var mMvpMatrix3D:Matrix3D;
+
+        private var mMatrixStack3D:Vector.<Matrix3D>;
+        private var mMatrixStack3DSize:int;
+
+        private var mDrawCount:int;
+        private var mBlendMode:String;
+        private var mRenderTarget:Texture;
+
+        private var mClipRectStack:Vector.<Rectangle>;
+        private var mClipRectStackSize:int;
+
+        private var mQuadBatches:Vector.<QuadBatch>;
+        private var mCurrentQuadBatchID:int;
+
+        /** helper objects */
+        private static var sPoint:Point = new Point();
+        private static var sPoint3D:Vector3D = new Vector3D();
+        private static var sClipRect:Rectangle = new Rectangle();
+        private static var sBufferRect:Rectangle = new Rectangle();
+        private static var sScissorRect:Rectangle = new Rectangle();
+        private static var sAssembler:AGALMiniAssembler = new AGALMiniAssembler();
+        private static var sMatrix3D:Matrix3D = new Matrix3D();
+        private static var sMatrixData:Vector.<Number> =
+            new <Number>[0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0];
+
+        // construction
+
+        /** Creates a new RenderSupport object with an empty matrix stack. */
+        public function RenderSupport()
+        {
+            mProjectionMatrix = new Matrix();
+            mModelViewMatrix = new Matrix();
+            mMvpMatrix = new Matrix();
+            mMatrixStack = new <Matrix>[];
+            mMatrixStackSize = 0;
+
+            mProjectionMatrix3D = new Matrix3D();
+            mModelViewMatrix3D = new Matrix3D();
+            mMvpMatrix3D = new Matrix3D();
+            mMatrixStack3D = new <Matrix3D>[];
+            mMatrixStack3DSize = 0;
+
+            mDrawCount = 0;
+            mRenderTarget = null;
+            mBlendMode = BlendMode.NORMAL;
+            mClipRectStack = new <Rectangle>[];
+
+            mCurrentQuadBatchID = 0;
+            mQuadBatches = new <QuadBatch>[new QuadBatch()];
+
+            loadIdentity();
+            setProjectionMatrix(0, 0, 400, 300);
+        }
+
+        /** Disposes all quad batches. */
+        public function dispose():void
+        {
+            for each (var quadBatch:QuadBatch in mQuadBatches)
+                quadBatch.dispose();
+        }
+
+        // matrix manipulation
+
+        /** Sets up the projection matrices for 2D and 3D rendering.
+         *
+         *  <p>The first 4 parameters define which area of the stage you want to view. The camera
+         *  will 'zoom' to exactly this region. The perspective in which you're looking at the
+         *  stage is determined by the final 3 parameters.</p>
+         *
+         *  <p>The stage is always on the rectangle that is spawned up between x- and y-axis (with
+         *  the given size). All objects that are exactly on that rectangle (z equals zero) will be
+         *  rendered in their true size, without any distortion.</p>
+         */
+        public function setProjectionMatrix(x:Number, y:Number, width:Number, height:Number,
+                                            stageWidth:Number=0, stageHeight:Number=0,
+                                            cameraPos:Vector3D=null):void
+        {
+            if (stageWidth  <= 0) stageWidth = width;
+            if (stageHeight <= 0) stageHeight = height;
+            if (cameraPos == null)
+            {
+                cameraPos = sPoint3D;
+                cameraPos.setTo(
+                    stageWidth / 2, stageHeight / 2,   // -> center of stage
+                    stageWidth / Math.tan(0.5) * 0.5); // -> fieldOfView = 1.0 rad
+            }
+
+            // set up 2d (orthographic) projection
+            mProjectionMatrix.setTo(2.0/width, 0, 0, -2.0/height,
+                -(2*x + width) / width, (2*y + height) / height);
+
+            const focalLength:Number = Math.abs(cameraPos.z);
+            const offsetX:Number = cameraPos.x - stageWidth  / 2;
+            const offsetY:Number = cameraPos.y - stageHeight / 2;
+            const far:Number    = focalLength * 20;
+            const near:Number   = 1;
+            const scaleX:Number = stageWidth  / width;
+            const scaleY:Number = stageHeight / height;
+
+            // set up general perspective
+            sMatrixData[ 0] =  2 * focalLength / stageWidth;  // 0,0
+            sMatrixData[ 5] = -2 * focalLength / stageHeight; // 1,1  [negative to invert y-axis]
+            sMatrixData[10] =  far / (far - near);            // 2,2
+            sMatrixData[14] = -far * near / (far - near);     // 2,3
+            sMatrixData[11] =  1;                             // 3,2
+
+            // now zoom in to visible area
+            sMatrixData[0] *=  scaleX;
+            sMatrixData[5] *=  scaleY;
+            sMatrixData[8]  =  scaleX - 1 - 2 * scaleX * (x - offsetX) / stageWidth;
+            sMatrixData[9]  = -scaleY + 1 + 2 * scaleY * (y - offsetY) / stageHeight;
+
+            mProjectionMatrix3D.copyRawDataFrom(sMatrixData);
+            mProjectionMatrix3D.prependTranslation(
+                -stageWidth /2.0 - offsetX,
+                -stageHeight/2.0 - offsetY,
+                focalLength);
+
+            applyClipRect();
+        }
+
+        /** Sets up the projection matrix for ortographic 2D rendering. */
+        [Deprecated(replacement="setProjectionMatrix")]
+        public function setOrthographicProjection(x:Number, y:Number, width:Number, height:Number):void
+        {
+            var stage:Stage = Starling.current.stage;
+            sClipRect.setTo(x, y, width, height);
+            setProjectionMatrix(x, y, width, height,
+                stage.stageWidth, stage.stageHeight, stage.cameraPosition);
+        }
+
+        /** Changes the modelview matrix to the identity matrix. */
+        public function loadIdentity():void
+        {
+            mModelViewMatrix.identity();
+            mModelViewMatrix3D.identity();
+        }
+
+        /** Prepends a translation to the modelview matrix. */
+        public function translateMatrix(dx:Number, dy:Number):void
+        {
+            MatrixUtil.prependTranslation(mModelViewMatrix, dx, dy);
+        }
+
+        /** Prepends a rotation (angle in radians) to the modelview matrix. */
+        public function rotateMatrix(angle:Number):void
+        {
+            MatrixUtil.prependRotation(mModelViewMatrix, angle);
+        }
+
+        /** Prepends an incremental scale change to the modelview matrix. */
+        public function scaleMatrix(sx:Number, sy:Number):void
+        {
+            MatrixUtil.prependScale(mModelViewMatrix, sx, sy);
+        }
+
+        /** Prepends a matrix to the modelview matrix by multiplying it with another matrix. */
+        public function prependMatrix(matrix:Matrix):void
+        {
+            MatrixUtil.prependMatrix(mModelViewMatrix, matrix);
+        }
+
+        /** Prepends translation, scale and rotation of an object to the modelview matrix. */
+        public function transformMatrix(object:DisplayObject):void
+        {
+            MatrixUtil.prependMatrix(mModelViewMatrix, object.transformationMatrix);
+        }
+
+        /** Pushes the current modelview matrix to a stack from which it can be restored later. */
+        public function pushMatrix():void
+        {
+            if (mMatrixStack.length < mMatrixStackSize + 1)
+                mMatrixStack.push(new Matrix());
+
+            mMatrixStack[int(mMatrixStackSize++)].copyFrom(mModelViewMatrix);
+        }
+
+        /** Restores the modelview matrix that was last pushed to the stack. */
+        public function popMatrix():void
+        {
+            mModelViewMatrix.copyFrom(mMatrixStack[int(--mMatrixStackSize)]);
+        }
+
+        /** Empties the matrix stack, resets the modelview matrix to the identity matrix. */
+        public function resetMatrix():void
+        {
+            mMatrixStackSize = 0;
+            mMatrixStack3DSize = 0;
+            loadIdentity();
+        }
+
+        /** Prepends translation, scale and rotation of an object to a custom matrix. */
+        public static function transformMatrixForObject(matrix:Matrix, object:DisplayObject):void
+        {
+            MatrixUtil.prependMatrix(matrix, object.transformationMatrix);
+        }
+
+        /** Calculates the product of modelview and projection matrix.
+         *  CAUTION: Use with care! Each call returns the same instance. */
+        public function get mvpMatrix():Matrix
+        {
+            mMvpMatrix.copyFrom(mModelViewMatrix);
+            mMvpMatrix.concat(mProjectionMatrix);
+            return mMvpMatrix;
+        }
+
+        /** Returns the current modelview matrix.
+         *  CAUTION: Use with care! Each call returns the same instance. */
+        public function get modelViewMatrix():Matrix { return mModelViewMatrix; }
+
+        /** Returns the current projection matrix.
+         *  CAUTION: Use with care! Each call returns the same instance. */
+        public function get projectionMatrix():Matrix { return mProjectionMatrix; }
+        public function set projectionMatrix(value:Matrix):void
+        {
+            mProjectionMatrix.copyFrom(value);
+            applyClipRect();
+        }
+
+        // 3d transformations
+
+        /** Prepends translation, scale and rotation of an object to the 3D modelview matrix.
+         *  The current contents of the 2D modelview matrix is stored in the 3D modelview matrix
+         *  before doing so; the 2D modelview matrix is then reset to the identity matrix. */
+        public function transformMatrix3D(object:DisplayObject):void
+        {
+            mModelViewMatrix3D.prepend(MatrixUtil.convertTo3D(mModelViewMatrix, sMatrix3D));
+            mModelViewMatrix3D.prepend(object.transformationMatrix3D);
+            mModelViewMatrix.identity();
+        }
+
+        /** Pushes the current 3D modelview matrix to a stack from which it can be restored later. */
+        public function pushMatrix3D():void
+        {
+            if (mMatrixStack3D.length < mMatrixStack3DSize + 1)
+                mMatrixStack3D.push(new Matrix3D());
+
+            mMatrixStack3D[int(mMatrixStack3DSize++)].copyFrom(mModelViewMatrix3D);
+        }
+
+        /** Restores the 3D modelview matrix that was last pushed to the stack. */
+        public function popMatrix3D():void
+        {
+            mModelViewMatrix3D.copyFrom(mMatrixStack3D[int(--mMatrixStack3DSize)]);
+        }
+
+        /** Calculates the product of modelview and projection matrix and stores it in a 3D matrix.
+         *  Different to 'mvpMatrix', this also takes 3D transformations into account.
+         *  CAUTION: Use with care! Each call returns the same instance. */
+        public function get mvpMatrix3D():Matrix3D
+        {
+            if (mMatrixStack3DSize == 0)
+            {
+                MatrixUtil.convertTo3D(mvpMatrix, mMvpMatrix3D);
+            }
+            else
+            {
+                mMvpMatrix3D.copyFrom(mProjectionMatrix3D);
+                mMvpMatrix3D.prepend(mModelViewMatrix3D);
+                mMvpMatrix3D.prepend(MatrixUtil.convertTo3D(mModelViewMatrix, sMatrix3D));
+            }
+
+            return mMvpMatrix3D;
+        }
+
+        /** Returns the current 3D projection matrix.
+         *  CAUTION: Use with care! Each call returns the same instance. */
+        public function get projectionMatrix3D():Matrix3D { return mProjectionMatrix3D; }
+        public function set projectionMatrix3D(value:Matrix3D):void
+        {
+            mProjectionMatrix3D.copyFrom(value);
+        }
+
+        // blending
+
+        /** Activates the current blend mode on the active rendering context. */
+        public function applyBlendMode(premultipliedAlpha:Boolean):void
+        {
+            setBlendFactors(premultipliedAlpha, mBlendMode);
+        }
+
+        /** The blend mode to be used on rendering. To apply the factor, you have to manually call
+         *  'applyBlendMode' (because the actual blend factors depend on the PMA mode). */
+        public function get blendMode():String { return mBlendMode; }
+        public function set blendMode(value:String):void
+        {
+            if (value != BlendMode.AUTO) mBlendMode = value;
+        }
+
+        // render targets
+
+        /** The texture that is currently being rendered into, or 'null' to render into the
+         *  back buffer. If you set a new target, it is immediately activated. */
+        public function get renderTarget():Texture { return mRenderTarget; }
+        public function set renderTarget(target:Texture):void
+        {
+            setRenderTarget(target);
+        }
+
+        /** Changes the the current render target.
+         *  @param target       Either a texture or 'null' to render into the back buffer.
+         *  @param antiAliasing Only supported for textures, beginning with AIR 13, and only on
+         *                      Desktop. Values range from 0 (no antialiasing) to 4 (best quality).
+         */
+        public function setRenderTarget(target:Texture, antiAliasing:int=0):void
+        {
+            mRenderTarget = target;
+            applyClipRect();
+
+            if (target) Starling.context.setRenderToTexture(target.base, false, antiAliasing);
+            else        Starling.context.setRenderToBackBuffer();
+        }
+
+        // clipping
+
+        /** The clipping rectangle can be used to limit rendering in the current render target to
+         *  a certain area. This method expects the rectangle in stage coordinates. Internally,
+         *  it uses the 'scissorRectangle' of stage3D, which works with pixel coordinates.
+         *  Any pushed rectangle is intersected with the previous rectangle; the method returns
+         *  that intersection. */
+        public function pushClipRect(rectangle:Rectangle):Rectangle
+        {
+            if (mClipRectStack.length < mClipRectStackSize + 1)
+                mClipRectStack.push(new Rectangle());
+
+            mClipRectStack[mClipRectStackSize].copyFrom(rectangle);
+            rectangle = mClipRectStack[mClipRectStackSize];
+
+            // intersect with the last pushed clip rect
+            if (mClipRectStackSize > 0)
+                RectangleUtil.intersect(rectangle, mClipRectStack[mClipRectStackSize-1],
+                                        rectangle);
+
+            ++mClipRectStackSize;
+            applyClipRect();
+
+            // return the intersected clip rect so callers can skip draw calls if it's empty
+            return rectangle;
+        }
+
+        /** Restores the clipping rectangle that was last pushed to the stack. */
+        public function popClipRect():void
+        {
+            if (mClipRectStackSize > 0)
+            {
+                --mClipRectStackSize;
+                applyClipRect();
+            }
+        }
+
+        /** Updates the context3D scissor rectangle using the current clipping rectangle. This
+         *  method is called automatically when either the render target, the projection matrix,
+         *  or the clipping rectangle changes. */
+        public function applyClipRect():void
+        {
+            finishQuadBatch();
+
+            var context:Context3D = Starling.context;
+            if (context == null) return;
+
+            if (mClipRectStackSize > 0)
+            {
+                var width:int, height:int;
+                var rect:Rectangle = mClipRectStack[mClipRectStackSize-1];
+
+                if (mRenderTarget)
+                {
+                    width  = mRenderTarget.root.nativeWidth;
+                    height = mRenderTarget.root.nativeHeight;
+                }
+                else
+                {
+                    width  = Starling.current.backBufferWidth;
+                    height = Starling.current.backBufferHeight;
+                }
+
+                // convert to pixel coordinates (matrix transformation ends up in range [-1, 1])
+                MatrixUtil.transformCoords(mProjectionMatrix, rect.x, rect.y, sPoint);
+                sClipRect.x = (sPoint.x * 0.5 + 0.5) * width;
+                sClipRect.y = (0.5 - sPoint.y * 0.5) * height;
+
+                MatrixUtil.transformCoords(mProjectionMatrix, rect.right, rect.bottom, sPoint);
+                sClipRect.right  = (sPoint.x * 0.5 + 0.5) * width;
+                sClipRect.bottom = (0.5 - sPoint.y * 0.5) * height;
+
+                sBufferRect.setTo(0, 0, width, height);
+                RectangleUtil.intersect(sClipRect, sBufferRect, sScissorRect);
+
+                // an empty rectangle is not allowed, so we set it to the smallest possible size
+                if (sScissorRect.width < 1 || sScissorRect.height < 1)
+                    sScissorRect.setTo(0, 0, 1, 1);
+
+                context.setScissorRectangle(sScissorRect);
+            }
+            else
+            {
+                context.setScissorRectangle(null);
+            }
+        }
+
+        // stencil masks
+
+        private var mMasks:Vector.<DisplayObject> = new <DisplayObject>[];
+
+        public function pushMask(mask:DisplayObject):void
+        {
+            mMasks[mMasks.length] = mask;
+
+            var context:Context3D = Starling.context;
+            if (context == null) return;
+
+            finishQuadBatch();
+
+            context.setStencilActions(Context3DTriangleFace.FRONT_AND_BACK,
+                    Context3DCompareMode.EQUAL, Context3DStencilAction.INCREMENT_SATURATE);
+
+            pushMatrix();
+            transformMatrix(mask);
+            mask.render(this, 0.0);
+            popMatrix();
+
+            finishQuadBatch();
+
+            context.setStencilReferenceValue(mMasks.length);
+            context.setStencilActions(Context3DTriangleFace.FRONT_AND_BACK,
+                    Context3DCompareMode.EQUAL, Context3DStencilAction.KEEP);
+        }
+
+        public function popMask():void
+        {
+            var mask:DisplayObject = mMasks.pop();
+
+            var context:Context3D = Starling.context;
+            if (context == null) return;
+
+            finishQuadBatch();
+
+            context.setStencilActions(Context3DTriangleFace.FRONT_AND_BACK,
+                    Context3DCompareMode.EQUAL, Context3DStencilAction.DECREMENT_SATURATE);
+
+            pushMatrix();
+            transformMatrix(mask);
+            mask.render(this, 0.0);
+            popMatrix();
+
+            finishQuadBatch();
+
+            context.setStencilReferenceValue(mMasks.length);
+            context.setStencilActions(Context3DTriangleFace.FRONT_AND_BACK,
+                    Context3DCompareMode.EQUAL, Context3DStencilAction.KEEP);
+        }
+
+        // optimized quad rendering
+
+        /** Adds a quad to the current batch of unrendered quads. If there is a state change,
+         *  all previous quads are rendered at once, and the batch is reset. */
+        public function batchQuad(quad:Quad, parentAlpha:Number,
+                                  texture:Texture=null, smoothing:String=null):void
+        {
+            if (mQuadBatches[mCurrentQuadBatchID].isStateChange(quad.tinted, parentAlpha, texture,
+                                                                smoothing, mBlendMode))
+            {
+                finishQuadBatch();
+            }
+
+            mQuadBatches[mCurrentQuadBatchID].addQuad(quad, parentAlpha, texture, smoothing,
+                                                      mModelViewMatrix, mBlendMode);
+        }
+
+        /** Adds a batch of quads to the current batch of unrendered quads. If there is a state
+         *  change, all previous quads are rendered at once.
+         *
+         *  <p>Note that you should call this method only for objects with a small number of quads
+         *  (we recommend no more than 16). Otherwise, the additional CPU effort will be more
+         *  expensive than what you save by avoiding the draw call.</p> */
+        public function batchQuadBatch(quadBatch:QuadBatch, parentAlpha:Number):void
+        {
+            if (mQuadBatches[mCurrentQuadBatchID].isStateChange(
+                quadBatch.tinted, parentAlpha, quadBatch.texture, quadBatch.smoothing, mBlendMode))
+            {
+                finishQuadBatch();
+            }
+
+            mQuadBatches[mCurrentQuadBatchID].addQuadBatch(quadBatch, parentAlpha,
+                                                           mModelViewMatrix, mBlendMode);
+        }
+
+        /** Renders the current quad batch and resets it. */
+        public function finishQuadBatch():void
+        {
+            var currentBatch:QuadBatch = mQuadBatches[mCurrentQuadBatchID];
+
+            if (currentBatch.numQuads != 0)
+            {
+                if (mMatrixStack3DSize == 0)
+                {
+                    currentBatch.renderCustom(mProjectionMatrix3D);
+                }
+                else
+                {
+                    mMvpMatrix3D.copyFrom(mProjectionMatrix3D);
+                    mMvpMatrix3D.prepend(mModelViewMatrix3D);
+                    currentBatch.renderCustom(mMvpMatrix3D);
+                }
+
+                currentBatch.reset();
+
+                ++mCurrentQuadBatchID;
+                ++mDrawCount;
+
+                if (mQuadBatches.length <= mCurrentQuadBatchID)
+                    mQuadBatches.push(new QuadBatch());
+            }
+        }
+
+        /** Resets matrix stack, blend mode, quad batch index, and draw count. */
+        public function nextFrame():void
+        {
+            resetMatrix();
+            trimQuadBatches();
+
+            mMasks.length = 0;
+            mCurrentQuadBatchID = 0;
+            mBlendMode = BlendMode.NORMAL;
+            mDrawCount = 0;
+        }
+
+        /** Disposes redundant quad batches if the number of allocated batches is more than
+         *  twice the number of used batches. Only executed when there are at least 16 batches. */
+        private function trimQuadBatches():void
+        {
+            var numUsedBatches:int  = mCurrentQuadBatchID + 1;
+            var numTotalBatches:int = mQuadBatches.length;
+
+            if (numTotalBatches >= 16 && numTotalBatches > 2*numUsedBatches)
+            {
+                var numToRemove:int = numTotalBatches - numUsedBatches;
+                for (var i:int=0; i<numToRemove; ++i)
+                    mQuadBatches.pop().dispose();
+            }
+        }
+
+        // other helper methods
+
+        /** Deprecated. Call 'setBlendFactors' instead. */
+        public static function setDefaultBlendFactors(premultipliedAlpha:Boolean):void
+        {
+            setBlendFactors(premultipliedAlpha);
+        }
+
+        /** Sets up the blending factors that correspond with a certain blend mode. */
+        public static function setBlendFactors(premultipliedAlpha:Boolean, blendMode:String="normal"):void
+        {
+            var blendFactors:Array = BlendMode.getBlendFactors(blendMode, premultipliedAlpha);
+            Starling.context.setBlendFactors(blendFactors[0], blendFactors[1]);
+        }
+
+        /** Clears the render context with a certain color and alpha value. */
+        public static function clear(rgb:uint=0, alpha:Number=0.0):void
+        {
+            Starling.context.clear(
+                Color.getRed(rgb)   / 255.0,
+                Color.getGreen(rgb) / 255.0,
+                Color.getBlue(rgb)  / 255.0,
+                alpha);
+        }
+
+        /** Clears the render context with a certain color and alpha value. */
+        public function clear(rgb:uint=0, alpha:Number=0.0):void
+        {
+            RenderSupport.clear(rgb, alpha);
+        }
+
+        /** Assembles fragment- and vertex-shaders, passed as Strings, to a Program3D. If you
+         *  pass a 'resultProgram', it will be uploaded to that program; otherwise, a new program
+         *  will be created on the current Stage3D context. */
+        public static function assembleAgal(vertexShader:String, fragmentShader:String,
+                                            resultProgram:Program3D=null):Program3D
+        {
+            if (resultProgram == null)
+            {
+                var context:Context3D = Starling.context;
+                if (context == null) throw new MissingContextError();
+                resultProgram = context.createProgram();
+            }
+
+            resultProgram.upload(
+                sAssembler.assemble(Context3DProgramType.VERTEX, vertexShader),
+                sAssembler.assemble(Context3DProgramType.FRAGMENT, fragmentShader));
+
+            return resultProgram;
+        }
+
+        /** Returns the flags that are required for AGAL texture lookup,
+         *  including the '&lt;' and '&gt;' delimiters. */
+        public static function getTextureLookupFlags(format:String, mipMapping:Boolean,
+                                                     repeat:Boolean=false,
+                                                     smoothing:String="bilinear"):String
+        {
+            var options:Array = ["2d", repeat ? "repeat" : "clamp"];
+
+            if (format == Context3DTextureFormat.COMPRESSED)
+                options.push("dxt1");
+            else if (format == "compressedAlpha")
+                options.push("dxt5");
+
+            if (smoothing == TextureSmoothing.NONE)
+                options.push("nearest", mipMapping ? "mipnearest" : "mipnone");
+            else if (smoothing == TextureSmoothing.BILINEAR)
+                options.push("linear", mipMapping ? "mipnearest" : "mipnone");
+            else
+                options.push("linear", mipMapping ? "miplinear" : "mipnone");
+
+            return "<" + options.join() + ">";
+        }
+
+        // statistics
+
+        /** Raises the draw count by a specific value. Call this method in custom render methods
+         *  to keep the statistics display in sync. */
+        public function raiseDrawCount(value:uint=1):void { mDrawCount += value; }
+
+        /** Indicates the number of stage3D draw calls. */
+        public function get drawCount():int { return mDrawCount; }
+    }
+}
+
+// =================================================================================================
+//
+//	Starling Framework
+//	Copyright 2011-2014 Gamua. All Rights Reserved.
+//
+//	This program is free software. You can redistribute and/or modify it
+//	in accordance with the terms of the accompanying license agreement.
+//
+// =================================================================================================
+
+package starling.display
+{
+    import flash.display.Bitmap;
+    import flash.geom.Matrix;
+    import flash.geom.Point;
+    import flash.geom.Rectangle;
+
+    import starling.core.RenderSupport;
+    import starling.textures.Texture;
+    import starling.textures.TextureSmoothing;
+    import starling.utils.VertexData;
+
+    /** An Image is a quad with a texture mapped onto it.
+     *
+     *  <p>The Image class is the Starling equivalent of Flash's Bitmap class. Instead of
+     *  BitmapData, Starling uses textures to represent the pixels of an image. To display a
+     *  texture, you have to map it onto a quad - and that's what the Image class is for.</p>
+     *
+     *  <p>As "Image" inherits from "Quad", you can give it a color. For each pixel, the resulting
+     *  color will be the result of the multiplication of the color of the texture with the color of
+     *  the quad. That way, you can easily tint textures with a certain color. Furthermore, images
+     *  allow the manipulation of texture coordinates. That way, you can move a texture inside an
+     *  image without changing any vertex coordinates of the quad. You can also use this feature
+     *  as a very efficient way to create a rectangular mask.</p>
+     *
+     *  @see starling.textures.Texture
+     *  @see Quad
+     */
+    public class Image extends Quad
+    {
+        private var mTexture:Texture;
+        private var mSmoothing:String;
+
+        private var mVertexDataCache:VertexData;
+        private var mVertexDataCacheInvalid:Boolean;
+
+        /** Creates a quad with a texture mapped onto it. */
+        public function Image(texture:Texture)
+        {
+            if (texture)
+            {
+                var frame:Rectangle = texture.frame;
+                var width:Number  = frame ? frame.width  : texture.width;
+                var height:Number = frame ? frame.height : texture.height;
+                var pma:Boolean = texture.premultipliedAlpha;
+
+                super(width, height, 0xffffff, pma);
+
+                mVertexData.setTexCoords(0, 0.0, 0.0);
+                mVertexData.setTexCoords(1, 1.0, 0.0);
+                mVertexData.setTexCoords(2, 0.0, 1.0);
+                mVertexData.setTexCoords(3, 1.0, 1.0);
+
+                mTexture = texture;
+                mSmoothing = TextureSmoothing.BILINEAR;
+                mVertexDataCache = new VertexData(4, pma);
+                mVertexDataCacheInvalid = true;
+            }
+            else
+            {
+                throw new ArgumentError("Texture cannot be null");
+            }
+        }
+
+        /** Creates an Image with a texture that is created from a bitmap object. */
+        public static function fromBitmap(bitmap:Bitmap, generateMipMaps:Boolean=true,
+                                          scale:Number=1):Image
+        {
+            return new Image(Texture.fromBitmap(bitmap, generateMipMaps, false, scale));
+        }
+
+        /** @inheritDoc */
+        protected override function onVertexDataChanged():void
+        {
+            mVertexDataCacheInvalid = true;
+        }
+
+        /** Readjusts the dimensions of the image according to its current texture. Call this method
+         *  to synchronize image and texture size after assigning a texture with a different size.*/
+        public function readjustSize():void
+        {
+            var frame:Rectangle = texture.frame;
+            var width:Number  = frame ? frame.width  : texture.width;
+            var height:Number = frame ? frame.height : texture.height;
+
+            mVertexData.setPosition(0, 0.0, 0.0);
+            mVertexData.setPosition(1, width, 0.0);
+            mVertexData.setPosition(2, 0.0, height);
+            mVertexData.setPosition(3, width, height);
+
+            onVertexDataChanged();
+        }
+
+        /** Sets the texture coordinates of a vertex. Coordinates are in the range [0, 1]. */
+        public function setTexCoords(vertexID:int, coords:Point):void
+        {
+            mVertexData.setTexCoords(vertexID, coords.x, coords.y);
+            onVertexDataChanged();
+        }
+
+        /** Sets the texture coordinates of a vertex. Coordinates are in the range [0, 1]. */
+        public function setTexCoordsTo(vertexID:int, u:Number, v:Number):void
+        {
+            mVertexData.setTexCoords(vertexID, u, v);
+            onVertexDataChanged();
+        }
+
+        /** Gets the texture coordinates of a vertex. Coordinates are in the range [0, 1].
+         *  If you pass a 'resultPoint', the result will be stored in this point instead of
+         *  creating a new object.*/
+        public function getTexCoords(vertexID:int, resultPoint:Point=null):Point
+        {
+            if (resultPoint == null) resultPoint = new Point();
+            mVertexData.getTexCoords(vertexID, resultPoint);
+            return resultPoint;
+        }
+
+        /** Copies the raw vertex data to a VertexData instance.
+         *  The texture coordinates are already in the format required for rendering. */
+        public override function copyVertexDataTo(targetData:VertexData, targetVertexID:int=0):void
+        {
+            copyVertexDataTransformedTo(targetData, targetVertexID, null);
+        }
+
+        /** Transforms the vertex positions of the raw vertex data by a certain matrix
+         *  and copies the result to another VertexData instance.
+         *  The texture coordinates are already in the format required for rendering. */
+        public override function copyVertexDataTransformedTo(targetData:VertexData,
+                                                             targetVertexID:int=0,
+                                                             matrix:Matrix=null):void
+        {
+            if (mVertexDataCacheInvalid)
+            {
+                mVertexDataCacheInvalid = false;
+                mVertexData.copyTo(mVertexDataCache);
+                mTexture.adjustVertexData(mVertexDataCache, 0, 4);
+            }
+
+            mVertexDataCache.copyTransformedTo(targetData, targetVertexID, matrix, 0, 4);
+        }
+
+        /** The texture that is displayed on the quad. */
+        public function get texture():Texture { return mTexture; }
+        public function set texture(value:Texture):void
+        {
+            if (value == null)
+            {
+                throw new ArgumentError("Texture cannot be null");
+            }
+            else if (value != mTexture)
+            {
+                mTexture = value;
+                mVertexData.setPremultipliedAlpha(mTexture.premultipliedAlpha);
+                mVertexDataCache.setPremultipliedAlpha(mTexture.premultipliedAlpha, false);
+                onVertexDataChanged();
+            }
+        }
+
+        /** The smoothing filter that is used for the texture.
+        *   @default bilinear
+        *   @see starling.textures.TextureSmoothing */
+        public function get smoothing():String { return mSmoothing; }
+        public function set smoothing(value:String):void
+        {
+            if (TextureSmoothing.isValid(value))
+                mSmoothing = value;
+            else
+                throw new ArgumentError("Invalid smoothing mode: " + value);
+        }
+
+        /** @inheritDoc */
+        public override function render(support:RenderSupport, parentAlpha:Number):void
+        {
+            support.batchQuad(this, parentAlpha, mTexture, mSmoothing);
+        }
+    }
+}
+
+// =================================================================================================
+//
+//	Starling Framework
+//	Copyright 2011-2014 Gamua. All Rights Reserved.
+//
+//	This program is free software. You can redistribute and/or modify it
+//	in accordance with the terms of the accompanying license agreement.
+//
+// =================================================================================================
+
+package starling.display
+{
+    import flash.geom.Rectangle;
+    import flash.ui.Mouse;
+    import flash.ui.MouseCursor;
+
+    import starling.events.Event;
+    import starling.events.Touch;
+    import starling.events.TouchEvent;
+    import starling.events.TouchPhase;
+    import starling.text.TextField;
+    import starling.textures.Texture;
+    import starling.utils.HAlign;
+    import starling.utils.VAlign;
+
+    /** Dispatched when the user triggers the button. Bubbles. */
+    [Event(name="triggered", type="starling.events.Event")]
+
+    /** A simple button composed of an image and, optionally, text.
+     *
+     *  <p>You can use different textures for various states of the button. If you're providing
+     *  only an up state, the button is simply scaled a little when it is touched.</p>
+     *
+     *  <p>In addition, you can overlay text on the button. To customize the text, you can use
+     *  properties equivalent to those of the TextField class. Move the text to a certain position
+     *  by updating the <code>textBounds</code> property.</p>
+     *
+     *  <p>To react on touches on a button, there is special <code>Event.TRIGGERED</code> event.
+     *  Use this event instead of normal touch events. That way, users can cancel button
+     *  activation by moving the mouse/finger away from the button before releasing.</p>
+     */
+    public class Button extends DisplayObjectContainer
+    {
+        private static const MAX_DRAG_DIST:Number = 50;
+
+        private var mUpState:Texture;
+        private var mDownState:Texture;
+        private var mOverState:Texture;
+        private var mDisabledState:Texture;
+
+        private var mContents:Sprite;
+        private var mBody:Image;
+        private var mTextField:TextField;
+        private var mTextBounds:Rectangle;
+        private var mOverlay:Sprite;
+
+        private var mScaleWhenDown:Number;
+        private var mScaleWhenOver:Number;
+        private var mAlphaWhenDisabled:Number;
+        private var mUseHandCursor:Boolean;
+        private var mEnabled:Boolean;
+        private var mState:String;
+        private var mTriggerBounds:Rectangle;
+
+        /** Creates a button with a set of state-textures and (optionally) some text.
+         *  Any state that is left 'null' will display the up-state texture. Beware that all
+         *  state textures should have the same dimensions. */
+        public function Button(upState:Texture, text:String="", downState:Texture=null,
+                               overState:Texture=null, disabledState:Texture=null)
+        {
+            if (upState == null) throw new ArgumentError("Texture 'upState' cannot be null");
+
+            mUpState = upState;
+            mDownState = downState;
+            mOverState = overState;
+            mDisabledState = disabledState;
+
+            mState = ButtonState.UP;
+            mBody = new Image(upState);
+            mScaleWhenDown = downState ? 1.0 : 0.9;
+            mScaleWhenOver = 1.0;
+            mAlphaWhenDisabled = disabledState ? 1.0: 0.5;
+            mEnabled = true;
+            mUseHandCursor = true;
+            mTextBounds = new Rectangle(0, 0, mBody.width, mBody.height);
+
+            mContents = new Sprite();
+            mContents.addChild(mBody);
+            addChild(mContents);
+            addEventListener(TouchEvent.TOUCH, onTouch);
+
+            this.touchGroup = true;
+            this.text = text;
+        }
+
+        /** @inheritDoc */
+        public override function dispose():void
+        {
+            // text field might be disconnected from parent, so we have to dispose it manually
+            if (mTextField)
+                mTextField.dispose();
+
+            super.dispose();
+        }
+
+        /** Readjusts the dimensions of the button according to its current state texture.
+         *  Call this method to synchronize button and texture size after assigning a texture
+         *  with a different size. Per default, this method also resets the bounds of the
+         *  button's text. */
+        public function readjustSize(resetTextBounds:Boolean=true):void
+        {
+            mBody.readjustSize();
+
+            if (resetTextBounds && mTextField != null)
+                textBounds = new Rectangle(0, 0, mBody.width, mBody.height);
+        }
+
+        private function createTextField():void
+        {
+            if (mTextField == null)
+            {
+                mTextField = new TextField(mTextBounds.width, mTextBounds.height, "");
+                mTextField.vAlign = VAlign.CENTER;
+                mTextField.hAlign = HAlign.CENTER;
+                mTextField.touchable = false;
+                mTextField.autoScale = true;
+                mTextField.batchable = true;
+            }
+
+            mTextField.width  = mTextBounds.width;
+            mTextField.height = mTextBounds.height;
+            mTextField.x = mTextBounds.x;
+            mTextField.y = mTextBounds.y;
+        }
+
+        private function onTouch(event:TouchEvent):void
+        {
+            Mouse.cursor = (mUseHandCursor && mEnabled && event.interactsWith(this)) ?
+                MouseCursor.BUTTON : MouseCursor.AUTO;
+
+            var touch:Touch = event.getTouch(this);
+            var isWithinBounds:Boolean;
+
+            if (!mEnabled)
+            {
+                return;
+            }
+            else if (touch == null)
+            {
+                state = ButtonState.UP;
+            }
+            else if (touch.phase == TouchPhase.HOVER)
+            {
+                state = ButtonState.OVER;
+            }
+            else if (touch.phase == TouchPhase.BEGAN && mState != ButtonState.DOWN)
+            {
+                mTriggerBounds = getBounds(stage, mTriggerBounds);
+                mTriggerBounds.inflate(MAX_DRAG_DIST, MAX_DRAG_DIST);
+
+                state = ButtonState.DOWN;
+            }
+            else if (touch.phase == TouchPhase.MOVED)
+            {
+                isWithinBounds = mTriggerBounds.contains(touch.globalX, touch.globalY);
+
+                if (mState == ButtonState.DOWN && !isWithinBounds)
+                {
+                    // reset button when finger is moved too far away ...
+                    state = ButtonState.UP;
+                }
+                else if (mState == ButtonState.UP && isWithinBounds)
+                {
+                    // ... and reactivate when the finger moves back into the bounds.
+                    state = ButtonState.DOWN;
+                }
+            }
+            else if (touch.phase == TouchPhase.ENDED && mState == ButtonState.DOWN)
+            {
+                state = ButtonState.UP;
+                dispatchEventWith(Event.TRIGGERED, true);
+            }
+        }
+
+        /** The current state of the button. The corresponding strings are found
+         *  in the ButtonState class. */
+        public function get state():String { return mState; }
+        public function set state(value:String):void
+        {
+            mState = value;
+            mContents.scaleX = mContents.scaleY = 1.0;
+
+            switch (mState)
+            {
+                case ButtonState.DOWN:
+                    setStateTexture(mDownState);
+                    mContents.scaleX = mContents.scaleY = mScaleWhenDown;
+                    mContents.x = (1.0 - mScaleWhenDown) / 2.0 * mBody.width;
+                    mContents.y = (1.0 - mScaleWhenDown) / 2.0 * mBody.height;
+                    break;
+                case ButtonState.UP:
+                    setStateTexture(mUpState);
+                    mContents.x = mContents.y = 0;
+                    break;
+                case ButtonState.OVER:
+                    setStateTexture(mOverState);
+                    mContents.scaleX = mContents.scaleY = mScaleWhenOver;
+                    mContents.x = (1.0 - mScaleWhenOver) / 2.0 * mBody.width;
+                    mContents.y = (1.0 - mScaleWhenOver) / 2.0 * mBody.height;
+                    break;
+                case ButtonState.DISABLED:
+                    setStateTexture(mDisabledState);
+                    mContents.x = mContents.y = 0;
+                    break;
+                default:
+                    throw new ArgumentError("Invalid button state: " + mState);
+            }
+        }
+
+        private function setStateTexture(texture:Texture):void
+        {
+            mBody.texture = texture ? texture : mUpState;
+        }
+
+        /** The scale factor of the button on touch. Per default, a button without a down state
+         *  texture will be made slightly smaller, while a button with a down state texture
+         *  remains unscaled. */
+        public function get scaleWhenDown():Number { return mScaleWhenDown; }
+        public function set scaleWhenDown(value:Number):void { mScaleWhenDown = value; }
+
+        /** The scale factor of the button while the mouse cursor hovers over it. @default 1.0 */
+        public function get scaleWhenOver():Number { return mScaleWhenOver; }
+        public function set scaleWhenOver(value:Number):void { mScaleWhenOver = value; }
+
+        /** The alpha value of the button when it is disabled. @default 0.5 */
+        public function get alphaWhenDisabled():Number { return mAlphaWhenDisabled; }
+        public function set alphaWhenDisabled(value:Number):void { mAlphaWhenDisabled = value; }
+
+        /** Indicates if the button can be triggered. */
+        public function get enabled():Boolean { return mEnabled; }
+        public function set enabled(value:Boolean):void
+        {
+            if (mEnabled != value)
+            {
+                mEnabled = value;
+                mContents.alpha = value ? 1.0 : mAlphaWhenDisabled;
+                state = value ? ButtonState.UP : ButtonState.DISABLED;
+            }
+        }
+
+        /** The text that is displayed on the button. */
+        public function get text():String { return mTextField ? mTextField.text : ""; }
+        public function set text(value:String):void
+        {
+            if (value.length == 0)
+            {
+                if (mTextField)
+                {
+                    mTextField.text = value;
+                    mTextField.removeFromParent();
+                }
+            }
+            else
+            {
+                createTextField();
+                mTextField.text = value;
+
+                if (mTextField.parent == null)
+                    mContents.addChild(mTextField);
+            }
+        }
+
+        /** The name of the font displayed on the button. May be a system font or a registered
+         *  bitmap font. */
+        public function get fontName():String { return mTextField ? mTextField.fontName : "Verdana"; }
+        public function set fontName(value:String):void
+        {
+            createTextField();
+            mTextField.fontName = value;
+        }
+
+        /** The size of the font. */
+        public function get fontSize():Number { return mTextField ? mTextField.fontSize : 12; }
+        public function set fontSize(value:Number):void
+        {
+            createTextField();
+            mTextField.fontSize = value;
+        }
+
+        /** The color of the font. */
+        public function get fontColor():uint { return mTextField ? mTextField.color : 0x0; }
+        public function set fontColor(value:uint):void
+        {
+            createTextField();
+            mTextField.color = value;
+        }
+
+        /** Indicates if the font should be bold. */
+        public function get fontBold():Boolean { return mTextField ? mTextField.bold : false; }
+        public function set fontBold(value:Boolean):void
+        {
+            createTextField();
+            mTextField.bold = value;
+        }
+
+        /** The texture that is displayed when the button is not being touched. */
+        public function get upState():Texture { return mUpState; }
+        public function set upState(value:Texture):void
+        {
+            if (value == null)
+                throw new ArgumentError("Texture 'upState' cannot be null");
+
+            if (mUpState != value)
+            {
+                mUpState = value;
+                if ( mState == ButtonState.UP ||
+                    (mState == ButtonState.DISABLED && mDisabledState == null) ||
+                    (mState == ButtonState.DOWN && mDownState == null) ||
+                    (mState == ButtonState.OVER && mOverState == null))
+                {
+                    setStateTexture(value);
+                }
+            }
+        }
+
+        /** The texture that is displayed while the button is touched. */
+        public function get downState():Texture { return mDownState; }
+        public function set downState(value:Texture):void
+        {
+            if (mDownState != value)
+            {
+                mDownState = value;
+                if (mState == ButtonState.DOWN) setStateTexture(value);
+            }
+        }
+
+        /** The texture that is displayed while mouse hovers over the button. */
+        public function get overState():Texture { return mOverState; }
+        public function set overState(value:Texture):void
+        {
+            if (mOverState != value)
+            {
+                mOverState = value;
+                if (mState == ButtonState.OVER) setStateTexture(value);
+            }
+        }
+
+        /** The texture that is displayed when the button is disabled. */
+        public function get disabledState():Texture { return mDisabledState; }
+        public function set disabledState(value:Texture):void
+        {
+            if (mDisabledState != value)
+            {
+                mDisabledState = value;
+                if (mState == ButtonState.DISABLED) setStateTexture(value);
+            }
+        }
+
+        /** The vertical alignment of the text on the button. */
+        public function get textVAlign():String
+        {
+            return mTextField ? mTextField.vAlign : VAlign.CENTER;
+        }
+
+        public function set textVAlign(value:String):void
+        {
+            createTextField();
+            mTextField.vAlign = value;
+        }
+
+        /** The horizontal alignment of the text on the button. */
+        public function get textHAlign():String
+        {
+            return mTextField ? mTextField.hAlign : HAlign.CENTER;
+        }
+
+        public function set textHAlign(value:String):void
+        {
+            createTextField();
+            mTextField.hAlign = value;
+        }
+
+        /** The bounds of the textfield on the button. Allows moving the text to a custom position. */
+        public function get textBounds():Rectangle { return mTextBounds.clone(); }
+        public function set textBounds(value:Rectangle):void
+        {
+            mTextBounds = value.clone();
+            createTextField();
+        }
+
+        /** The color of the button's state image. Just like every image object, each pixel's
+         *  color is multiplied with this value. @default white */
+        public function get color():uint { return mBody.color; }
+        public function set color(value:uint):void { mBody.color = value; }
+
+        /** The overlay sprite is displayed on top of the button contents. It scales with the
+         *  button when pressed. Use it to add additional objects to the button (e.g. an icon). */
+        public function get overlay():Sprite
+        {
+            if (mOverlay == null)
+                mOverlay = new Sprite();
+
+            mContents.addChild(mOverlay); // make sure it's always on top
+            return mOverlay;
+        }
+
+        /** Indicates if the mouse cursor should transform into a hand while it's over the button.
+         *  @default true */
+        public override function get useHandCursor():Boolean { return mUseHandCursor; }
+        public override function set useHandCursor(value:Boolean):void { mUseHandCursor = value; }
+    }
+}
+
+// =================================================================================================
+//
+//	Starling Framework
+//	Copyright 2011-2014 Gamua. All Rights Reserved.
+//
+//	This program is free software. You can redistribute and/or modify it
+//	in accordance with the terms of the accompanying license agreement.
+//
+// =================================================================================================
+
+package starling.display
+{
+    import flash.display3D.Context3DBlendFactor;
+
+    import starling.errors.AbstractClassError;
+
+    /** A class that provides constant values for visual blend mode effects.
+     *
+     *  @see flash.display3D.Context3DBlendFactor
+     */
+    public class BlendMode
+    {
+        private static var sBlendFactors:Array = [
+            // no premultiplied alpha
+            {
+                "none"     : [ Context3DBlendFactor.ONE, Context3DBlendFactor.ZERO ],
+                "normal"   : [ Context3DBlendFactor.SOURCE_ALPHA, Context3DBlendFactor.ONE_MINUS_SOURCE_ALPHA ],
+                "add"      : [ Context3DBlendFactor.SOURCE_ALPHA, Context3DBlendFactor.DESTINATION_ALPHA ],
+                "multiply" : [ Context3DBlendFactor.DESTINATION_COLOR, Context3DBlendFactor.ONE_MINUS_SOURCE_ALPHA ],
+                "screen"   : [ Context3DBlendFactor.SOURCE_ALPHA, Context3DBlendFactor.ONE ],
+                "erase"    : [ Context3DBlendFactor.ZERO, Context3DBlendFactor.ONE_MINUS_SOURCE_ALPHA ],
+                "below"    : [ Context3DBlendFactor.ONE_MINUS_DESTINATION_ALPHA, Context3DBlendFactor.DESTINATION_ALPHA ]
+            },
+            // premultiplied alpha
+            {
+                "none"     : [ Context3DBlendFactor.ONE, Context3DBlendFactor.ZERO ],
+                "normal"   : [ Context3DBlendFactor.ONE, Context3DBlendFactor.ONE_MINUS_SOURCE_ALPHA ],
+                "add"      : [ Context3DBlendFactor.ONE, Context3DBlendFactor.ONE ],
+                "multiply" : [ Context3DBlendFactor.DESTINATION_COLOR, Context3DBlendFactor.ONE_MINUS_SOURCE_ALPHA ],
+                "screen"   : [ Context3DBlendFactor.ONE, Context3DBlendFactor.ONE_MINUS_SOURCE_COLOR ],
+                "erase"    : [ Context3DBlendFactor.ZERO, Context3DBlendFactor.ONE_MINUS_SOURCE_ALPHA ],
+                "below"    : [ Context3DBlendFactor.ONE_MINUS_DESTINATION_ALPHA, Context3DBlendFactor.DESTINATION_ALPHA ]
+            }
+        ];
+
+        // predifined modes
+
+        /** @private */
+        public function BlendMode() { throw new AbstractClassError(); }
+
+        /** Inherits the blend mode from this display object's parent. */
+        public static const AUTO:String = "auto";
+
+        /** Deactivates blending, i.e. disabling any transparency. */
+        public static const NONE:String = "none";
+
+        /** The display object appears in front of the background. */
+        public static const NORMAL:String = "normal";
+
+        /** Adds the values of the colors of the display object to the colors of its background. */
+        public static const ADD:String = "add";
+
+        /** Multiplies the values of the display object colors with the the background color. */
+        public static const MULTIPLY:String = "multiply";
+
+        /** Multiplies the complement (inverse) of the display object color with the complement of
+          * the background color, resulting in a bleaching effect. */
+        public static const SCREEN:String = "screen";
+
+        /** Erases the background when drawn on a RenderTexture. */
+        public static const ERASE:String = "erase";
+
+		/** Draws under/below existing objects; useful especially on RenderTextures. */
+	    public static const BELOW:String = "below";
+
+        // accessing modes
+
+        /** Returns the blend factors that correspond with a certain mode and premultiplied alpha
+         *  value. Throws an ArgumentError if the mode does not exist. */
+        public static function getBlendFactors(mode:String, premultipliedAlpha:Boolean=true):Array
+        {
+            var modes:Object = sBlendFactors[int(premultipliedAlpha)];
+            if (mode in modes) return modes[mode];
+            else throw new ArgumentError("Invalid blend mode");
+        }
+
+        /** Registeres a blending mode under a certain name and for a certain premultiplied alpha
+         *  (pma) value. If the mode for the other pma value was not yet registered, the factors are
+         *  used for both pma settings. */
+        public static function register(name:String, sourceFactor:String, destFactor:String,
+                                        premultipliedAlpha:Boolean=true):void
+        {
+            var modes:Object = sBlendFactors[int(premultipliedAlpha)];
+            modes[name] = [sourceFactor, destFactor];
+
+            var otherModes:Object = sBlendFactors[int(!premultipliedAlpha)];
+            if (!(name in otherModes)) otherModes[name] = [sourceFactor, destFactor];
+        }
+    }
+}
+
+package com.adobe.air.crypto
+{
+	import com.adobe.crypto.SHA256;
+
+	import flash.data.EncryptedLocalStore;
+	import flash.utils.ByteArray;
+
+	/**
+	 * The EncryptionKeyGenerator class generates an encryption key value, such as you would use
+	 * to encrypt files or data. For example, the encryption key is suitable to use as
+	 * an encryption key for an encrypted AIR local SQL (SQLite) database.
+	 */
+	public class EncryptionKeyGenerator
+	{
+		// ------- Constants -------
+		/**
+		 * This constant matches the error ID (3138) of the SQLError error that occurs when
+		 * code that is attempting to open an encrypted database provides the wrong
+		 * encryption key.
+		 */
+		public static const ENCRYPTED_DB_PASSWORD_ERROR_ID:uint = 3138;
+
+		private static const STRONG_PASSWORD_PATTERN:RegExp = /(?=^.{8,32}$)((?=.*\d)|(?=.*\W+))(?![.\n])(?=.*[A-Z])(?=.*[a-z]).*$/;
+		private static const SALT_ELS_KEY:String = "com.adobe.air.crypto::EncryptedDBSalt$$$";
+
+
+		// ------- Constructor -------
+
+		/**
+		 * Creates a new EncryptionKeyGenerator instance.
+		 */
+		public function EncryptionKeyGenerator() {}
+
+
+		// ------- Public methods -------
+
+		/**
+		 * Checks a password and returns a value indicating whether the password is a "strong"
+		 * password.
+		 *
+		 * @param password The password to check
+		 *
+		 * @return A value indicating whether the password is a strong password (<code>true</code>)
+		 * or not (<code>false</code>).
+		 */
+		public function validateStrongPassword(password:String):Boolean
+		{
+			if (password == null || password.length <= 0)
+			{
+				return false;
+			}
+
+			return STRONG_PASSWORD_PATTERN.test(password);
+		}
+
+
+		/**
+		 * Uses a password to generate a 16-byte encryption key. The return value is suitable
+		 * to use as an encryption key for an encrypted AIR local SQL (SQLite) database.
+		 *
+		 * @param password	The password to use to generate the encryption key.
+		 * @param overrideSaltELSKey	The EncryptionKeyGenerator creates and stores a random value
+		 * 								(known as a <i>salt</i>) as part of the process of
+		 * 								generating the encryption key. The first time an application
+		 * 								calls the <code>getEncryptionKey()</code> method, the salt
+		 * 								value is created and stored in the AIR application's encrypted
+		 * 								local store (ELS). From then on, the salt value is loaded from the
+		 * 								ELS.
+		 * 								<p>If you wish to provide a custom String ELS key for storing
+		 * 								the salt value, specify a value for the <code>overrideSaltELSKey</code>
+		 * 								parameter. If the parameter is <code>null</code> (the default)
+		 * 								a default key name is used.</p>
+		 *
+		 * @return The generated encryption key, a 16-byte ByteArray object.
+		 *
+		 * @throws ArgumentError	If the specified password is not a "strong" password according to the
+		 * 							criteria explained in the <code>validateStrongPassword()</code>
+		 * 							method description
+		 *
+		 * @throws ArgumentError	If a non-<code>null</code> value is specified for the <code>overrideSaltELSKey</code>
+		 * 							parameter, and the value is an empty String (<code>""</code>)
+		 */
+		public function getEncryptionKey(password:String, overrideSaltELSKey:String=null):ByteArray
+		{
+			if (!validateStrongPassword(password))
+			{
+				throw new ArgumentError("The password must be a strong password. It must be 8-32 characters long. It must contain at least one uppercase letter, at least one lowercase letter, and at least one number or symbol.");
+			}
+
+			if (overrideSaltELSKey != null && overrideSaltELSKey.length <= 0)
+			{
+				throw new ArgumentError("If an overrideSaltELSKey parameter value is specified, it can't be an empty String.");
+			}
+
+			var concatenatedPassword:String = concatenatePassword(password);
+
+			var saltKey:String;
+			if (overrideSaltELSKey == null)
+			{
+				saltKey = SALT_ELS_KEY;
+			}
+			else
+			{
+				saltKey = overrideSaltELSKey;
+			}
+
+			var salt:ByteArray = EncryptedLocalStore.getItem(saltKey);
+			if (salt == null)
+			{
+				salt = makeSalt();
+				EncryptedLocalStore.setItem(saltKey, salt);
+			}
+
+			var unhashedKey:ByteArray = xorBytes(concatenatedPassword, salt);
+
+			var hashedKey:String = SHA256.hashBytes(unhashedKey);
+
+			var encryptionKey:ByteArray = generateEncryptionKey(hashedKey);
+
+			return encryptionKey;
+		}
+
+
+		// ------- Creating encryption key -------
+
+		private function concatenatePassword(pwd:String):String
+		{
+			var len:int = pwd.length;
+			var targetLength:int = 32;
+
+			if (len == targetLength)
+			{
+				return pwd;
+			}
+
+			var repetitions:int = Math.floor(targetLength / len);
+			var excess:int = targetLength % len;
+
+			var result:String = "";
+
+			for (var i:uint = 0; i < repetitions; i++)
+			{
+				result += pwd;
+			}
+
+			result += pwd.substr(0, excess);
+
+			return result;
+		}
+
+
+		private function makeSalt():ByteArray
+		{
+			var result:ByteArray = new ByteArray;
+
+			for (var i:uint = 0; i < 8; i++)
+			{
+				result.writeUnsignedInt(Math.round(Math.random() * uint.MAX_VALUE));
+			}
+
+			return result;
+		}
+
+
+		private function xorBytes(passwordString:String, salt:ByteArray):ByteArray
+		{
+			var result:ByteArray = new ByteArray();
+
+			for (var i:uint = 0; i < 32; i += 4)
+			{
+				// Extract 4 bytes from the password string and convert to a uint
+				var o1:uint = passwordString.charCodeAt(i) << 24;
+				o1 += passwordString.charCodeAt(i + 1) << 16;
+				o1 += passwordString.charCodeAt(i + 2) << 8;
+				o1 += passwordString.charCodeAt(i + 3);
+
+				salt.position = i;
+				var o2:uint = salt.readUnsignedInt();
+
+				var xor:uint = o1 ^ o2;
+				result.writeUnsignedInt(xor);
+			}
+
+			return result;
+		}
+
+
+		private function generateEncryptionKey(hash:String):ByteArray
+		{
+			var result:ByteArray = new ByteArray();
+
+			// select a range of 128 bits (32 hex characters) from the hash
+			// In this case, we'll use the bits starting from position 17
+			for (var i:uint = 0; i < 32; i += 2)
+			{
+				var position:uint = i + 17;
+				var hex:String = hash.substr(position, 2);
+				var byte:int = parseInt(hex, 16);
+				result.writeByte(byte);
+			}
+
+			return result;
+		}
+	}
+}
+
+package com.adobe.net
+{
+	import flash.utils.ByteArray;
+
+	/**
+	 * This class implements an efficient lookup table for URI
+	 * character escaping.  This class is only needed if you
+	 * create a derived class of URI to handle custom URI
+	 * syntax.  This class is used internally by URI.
+	 *
+	 * @langversion ActionScript 3.0
+	 * @playerversion Flash 9.0*
+	 */
+	public class URIEncodingBitmap extends ByteArray
+	{
+		/**
+		 * Constructor.  Creates an encoding bitmap using the given
+		 * string of characters as the set of characters that need
+		 * to be URI escaped.
+		 *
+		 * @langversion ActionScript 3.0
+		 * @playerversion Flash 9.0
+		 */
+		public function URIEncodingBitmap(charsToEscape:String) : void
+		{
+			var i:int;
+			var data:ByteArray = new ByteArray();
+
+			// Initialize our 128 bits (16 bytes) to zero
+			for (i = 0; i < 16; i++)
+				this.writeByte(0);
+
+			data.writeUTFBytes(charsToEscape);
+			data.position = 0;
+
+			while (data.bytesAvailable)
+			{
+				var c:int = data.readByte();
+
+				if (c > 0x7f)
+					continue;  // only escape low bytes
+
+				var enc:int;
+				this.position = (c >> 3);
+				enc = this.readByte();
+				enc |= 1 << (c & 0x7);
+				this.position = (c >> 3);
+				this.writeByte(enc);
+			}
+		}
+
+		/**
+		 * Based on the data table contained in this object, check
+		 * if the given character should be escaped.
+		 *
+		 * @param char	the character to be escaped.  Only the first
+		 * character in the string is used.  Any other characters
+		 * are ignored.
+		 *
+		 * @return	the integer value of the raw UTF8 character.  For
+		 * example, if '%' is given, the return value is 37 (0x25).
+		 * If the character given does not need to be escaped, the
+		 * return value is zero.
+		 *
+		 * @langversion ActionScript 3.0
+		 * @playerversion Flash 9.0
+		 */
+		public function ShouldEscape(char:String) : int
+		{
+			var data:ByteArray = new ByteArray();
+			var c:int, mask:int;
+
+			// write the character into a ByteArray so
+			// we can pull it out as a raw byte value.
+			data.writeUTFBytes(char);
+			data.position = 0;
+			c = data.readByte();
+
+			if (c & 0x80)
+			{
+				// don't escape high byte characters.  It can make international
+				// URI's unreadable.  We just want to escape characters that would
+				// make URI syntax ambiguous.
+				return 0;
+			}
+			else if ((c < 0x1f) || (c == 0x7f))
+			{
+				// control characters must be escaped.
+				return c;
+			}
+
+			this.position = (c >> 3);
+			mask = this.readByte();
+
+			if (mask & (1 << (c & 0x7)))
+			{
+				// we need to escape this, return the numeric value
+				// of the character
+				return c;
+			}
+			else
+			{
+				return 0;
+			}
+		}
+	}
+}
+
+package com.adobe.fileformats.vcard
+{
+	import mx.utils.Base64Decoder;
+	import mx.utils.StringUtil;
+
+	public class VCardParser
+	{
+		public static function parse(vcardStr:String):Array
+		{
+			var vcards:Array = new Array();
+			var lines:Array = vcardStr.split(/\r\n/);
+			var vcard:VCard;
+			var type:String;
+			var typeTmp:String;
+			var line:String;
+
+			for (var i:uint = 0; i < lines.length; ++i)
+			{
+				line = lines[i];
+				if (line == "BEGIN:VCARD")
+				{
+					vcard = new VCard();
+				}
+				else if (line == "END:VCARD")
+				{
+					if (vcard != null)
+					{
+						vcards.push(vcard);
+					}
+				}
+				else if(line.search(/^ORG/i) != -1)
+				{
+					var org:String = line.substring(4, line.length);
+					var orgArray:Array = org.split(";");
+					for each (var orgToken:String in orgArray)
+					{
+						if (StringUtil.trim(orgToken).length > 0)
+						{
+							vcard.orgs.push(orgToken);
+						}
+					}
+				}
+				else if(line.search(/^TITLE/i) != -1)
+				{
+					var title:String = line.substring(6, line.length);
+					vcard.title = title;
+				}
+				else if (line.search(/^FN:/i) != -1)
+				{
+					var fullName:String = line.substring(3, line.length);
+					vcard.fullName = fullName;
+				}
+				else if (line.search(/^TEL/i) != -1)
+				{
+					type = new String();
+					typeTmp = new String();
+					var phone:Phone = new Phone();
+					var number:String;
+					var phoneTokens:Array = line.split(";");
+					for each (var phoneToken:String in phoneTokens)
+					{
+						if (phoneToken.search(/^TYPE=/i) != -1)
+						{
+							if (phoneToken.indexOf(":") != -1)
+							{
+								typeTmp = phoneToken.substring(5, phoneToken.indexOf(":"));
+								number = phoneToken.substring(phoneToken.indexOf(":")+1, phoneToken.length);
+							}
+							else
+							{
+								typeTmp = phoneToken.substring(5, phoneToken.length);
+							}
+
+							typeTmp = typeTmp.toLocaleLowerCase();
+
+							if (typeTmp == "pref")
+							{
+								continue;
+							}
+							if (type.length != 0)
+							{
+								type += (" ");
+							}
+							type += typeTmp;
+						}
+					}
+					if (type.length > 0 && number != null)
+					{
+						phone.type = type;
+						phone.number = number;
+					}
+					vcard.phones.push(phone);
+				}
+				else if (line.search(/^EMAIL/i) != -1)
+				{
+					type = new String();
+					typeTmp = new String();
+					var email:Email = new Email();
+					var emailAddress:String;
+					var emailTokens:Array = line.split(";");
+					for each (var emailToken:String in emailTokens)
+					{
+						if (emailToken.search(/^TYPE=/i) != -1)
+						{
+							if (emailToken.indexOf(":") != -1)
+							{
+								typeTmp = emailToken.substring(5, emailToken.indexOf(":"));
+								emailAddress = emailToken.substring(emailToken.indexOf(":")+1, emailToken.length);
+							}
+							else
+							{
+								typeTmp = emailToken.substring(5, emailToken.length);
+							}
+
+							typeTmp = typeTmp.toLocaleLowerCase();
+
+							if (typeTmp == "pref" || typeTmp == "internet")
+							{
+								continue;
+							}
+							if (type.length != 0)
+							{
+								type += (" ");
+							}
+							type += typeTmp;
+						}
+					}
+					if (type.length > 0 && emailAddress != null)
+					{
+						email.type = type;
+						email.address = emailAddress;
+					}
+					vcard.emails.push(email);
+				}
+				else if (line.indexOf("ADR;") != -1)
+				{
+					var addressTokens:Array = line.split(";");
+					var address:Address = new Address();
+					for (var j:uint = 0; j < addressTokens.length; ++j)
+					{
+						var addressToken:String = addressTokens[j];
+						if (addressToken.search(/^home:+$/i) != -1) // For Outlook, which uses non-standard vCards.
+						{
+							address.type = "home";
+						}
+						else if (addressToken.search(/^work:+$/i) != -1) // For Outlook, which uses non-standard vCards.
+						{
+							address.type = "work";
+						}
+						if (addressToken.search(/^type=/i) != -1)  // The "type" parameter is the standard way (which Address Book uses)
+						{
+							// First, remove the optional ":" character.
+							addressToken = addressToken.replace(/:/,"");
+							var addressType:String = addressToken.substring(5, addressToken.length).toLowerCase();
+							if (addressType == "pref") // Not interested in which one is preferred.
+							{
+								continue;
+							}
+							else if (addressType.indexOf("home") != -1) // home
+							{
+								addressType = "home";
+							}
+							else if (addressType.indexOf("work") != -1) // work
+							{
+								addressType = "work";
+							}
+							else if (addressType.indexOf(",") != -1) // if the comma technique is used, just use the first one
+							{
+								var typeTokens:Array = addressType.split(",");
+								for each (var typeToken:String in typeTokens)
+								{
+									if (typeToken != "pref")
+									{
+										addressType = typeToken;
+										break;
+									}
+								}
+							}
+							address.type = addressType;
+						}
+						else if (addressToken.search(/^\d/) != -1 && address.street == null)
+						{
+							address.street = addressToken.replace(/\\n/, "");
+							address.city = addressTokens[j+1];
+							address.state = addressTokens[j+2];
+							address.postalCode = addressTokens[j+3];
+						}
+					}
+					if (address.type != null && address.street != null)
+					{
+						vcard.addresses.push(address);
+					}
+
+				}
+				else if (line.search(/^PHOTO;BASE64/i) != -1)
+				{
+					var imageStr:String = new String();
+					for (var k:uint = i+1; k < lines.length; ++k)
+					{
+						imageStr += lines[k];
+						//if (lines[k].search(/.+\=$/) != -1) // Very slow in Mac due to RegEx bug
+						if (lines[k].indexOf('=') != -1)
+						{
+							var decoder:Base64Decoder = new Base64Decoder();
+							decoder.decode(imageStr);
+							vcard.image = decoder.flush();
+							break;
+						}
+					}
+				}
+			}
+			return vcards;
+		}
+	}
+}
+
+package com.adobe.net.proxies
+{
+	import flash.events.Event;
+	import flash.events.IOErrorEvent;
+	import flash.events.ProgressEvent;
+	import flash.net.Socket;
+
+	/**
+	 * This class allows TCP socket connections through HTTP proxies in accordance with
+	 * RFC 2817:
+	 *
+	 * ftp://ftp.rfc-editor.org/in-notes/rfc2817.txt
+	 *
+	 * @author Christian Cantrell
+	 *
+	 **/
+	public class RFC2817Socket
+		extends Socket
+	{
+		private var proxyHost:String = null;
+		private var host:String = null;
+		private var proxyPort:int = 0;
+		private var port:int = 0;
+		private var deferredEventHandlers:Object = new Object();
+		private var buffer:String = new String();
+
+		/**
+		 * Construct a new RFC2817Socket object. If you pass in the host and the port,
+		 * no proxy will be used. If you want to use a proxy, instantiate with no
+		 * arguments, call setProxyInfo, then call connect.
+		 **/
+		public function RFC2817Socket(host:String = null, port:int = 0)
+		{
+			super(host, port);
+		}
+
+		/**
+		 * Set the proxy host and port number. Your connection will only proxied if
+		 * this function has been called.
+		 **/
+		public function setProxyInfo(host:String, port:int):void
+		{
+			this.proxyHost = host;
+			this.proxyPort = port;
+
+			var deferredSocketDataHandler:Object = this.deferredEventHandlers[ProgressEvent.SOCKET_DATA];
+			var deferredConnectHandler:Object = this.deferredEventHandlers[Event.CONNECT];
+
+			if (deferredSocketDataHandler != null)
+			{
+				super.removeEventListener(ProgressEvent.SOCKET_DATA, deferredSocketDataHandler.listener, deferredSocketDataHandler.useCapture);
+			}
+
+			if (deferredConnectHandler != null)
+			{
+				super.removeEventListener(Event.CONNECT, deferredConnectHandler.listener, deferredConnectHandler.useCapture);
+			}
+		}
+
+		/**
+		 * Connect to the specified host over the specified port. If you want your
+		 * connection proxied, call the setProxyInfo function first.
+		 **/
+		public override function connect(host:String, port:int):void
+		{
+			if (this.proxyHost == null)
+			{
+				this.redirectConnectEvent();
+				this.redirectSocketDataEvent();
+				super.connect(host, port);
+			}
+			else
+			{
+				this.host = host;
+				this.port = port;
+				super.addEventListener(Event.CONNECT, this.onConnect);
+				super.addEventListener(ProgressEvent.SOCKET_DATA, this.onSocketData);
+				super.connect(this.proxyHost, this.proxyPort);
+			}
+		}
+
+		private function onConnect(event:Event):void
+		{
+			this.writeUTFBytes("CONNECT "+this.host+":"+this.port+" HTTP/1.1\n\n");
+			this.flush();
+			this.redirectConnectEvent();
+		}
+
+		private function onSocketData(event:ProgressEvent):void
+		{
+			while (this.bytesAvailable != 0)
+			{
+				this.buffer += this.readUTFBytes(1);
+				if (this.buffer.search(/\r?\n\r?\n$/) != -1)
+				{
+					this.checkResponse(event);
+					break;
+				}
+			}
+		}
+
+		private function checkResponse(event:ProgressEvent):void
+		{
+			var responseCode:String = this.buffer.substr(this.buffer.indexOf(" ")+1, 3);
+
+			if (responseCode.search(/^2/) == -1)
+			{
+				var ioError:IOErrorEvent = new IOErrorEvent(IOErrorEvent.IO_ERROR);
+				ioError.text = "Error connecting to the proxy ["+this.proxyHost+"] on port ["+this.proxyPort+"]: " + this.buffer;
+				this.dispatchEvent(ioError);
+			}
+			else
+			{
+				this.redirectSocketDataEvent();
+				this.dispatchEvent(new Event(Event.CONNECT));
+				if (this.bytesAvailable > 0)
+				{
+					this.dispatchEvent(event);
+				}
+			}
+			this.buffer = null;
+		}
+
+		private function redirectConnectEvent():void
+		{
+			super.removeEventListener(Event.CONNECT, onConnect);
+			var deferredEventHandler:Object = this.deferredEventHandlers[Event.CONNECT];
+			if (deferredEventHandler != null)
+			{
+				super.addEventListener(Event.CONNECT, deferredEventHandler.listener, deferredEventHandler.useCapture, deferredEventHandler.priority, deferredEventHandler.useWeakReference);
+			}
+		}
+
+		private function redirectSocketDataEvent():void
+		{
+			super.removeEventListener(ProgressEvent.SOCKET_DATA, onSocketData);
+			var deferredEventHandler:Object = this.deferredEventHandlers[ProgressEvent.SOCKET_DATA];
+			if (deferredEventHandler != null)
+			{
+				super.addEventListener(ProgressEvent.SOCKET_DATA, deferredEventHandler.listener, deferredEventHandler.useCapture, deferredEventHandler.priority, deferredEventHandler.useWeakReference);
+			}
+		}
+
+		public override function addEventListener(type:String, listener:Function, useCapture:Boolean = false, priority:int=0.0, useWeakReference:Boolean=false):void
+		{
+			if (type == Event.CONNECT || type == ProgressEvent.SOCKET_DATA)
+			{
+				this.deferredEventHandlers[type] = {listener:listener,useCapture:useCapture, priority:priority, useWeakReference:useWeakReference};
+			}
+			else
+			{
+				super.addEventListener(type, listener, useCapture, priority, useWeakReference);
+			}
+		}
+	}
+}
+
+package com.adobe.images
+{
+	import flash.geom.*;
+	import flash.display.Bitmap;
+	import flash.display.BitmapData;
+	import flash.utils.ByteArray;
+
+	/**
+	 * Class that converts BitmapData into a valid PNG
+	 */
+	public class PNGEncoder
+	{
+		/**
+		 * Created a PNG image from the specified BitmapData
+		 *
+		 * @param image The BitmapData that will be converted into the PNG format.
+		 * @return a ByteArray representing the PNG encoded image data.
+		 * @langversion ActionScript 3.0
+		 * @playerversion Flash 9.0
+		 * @tiptext
+		 */
+	    public static function encode(img:BitmapData):ByteArray {
+	        // Create output byte array
+	        var png:ByteArray = new ByteArray();
+	        // Write PNG signature
+	        png.writeUnsignedInt(0x89504e47);
+	        png.writeUnsignedInt(0x0D0A1A0A);
+	        // Build IHDR chunk
+	        var IHDR:ByteArray = new ByteArray();
+	        IHDR.writeInt(img.width);
+	        IHDR.writeInt(img.height);
+	        IHDR.writeUnsignedInt(0x08060000); // 32bit RGBA
+	        IHDR.writeByte(0);
+	        writeChunk(png,0x49484452,IHDR);
+	        // Build IDAT chunk
+	        var IDAT:ByteArray= new ByteArray();
+	        for(var i:int=0;i < img.height;i++) {
+	            // no filter
+	            IDAT.writeByte(0);
+	            var p:uint;
+	            var j:int;
+	            if ( !img.transparent ) {
+	                for(j=0;j < img.width;j++) {
+	                    p = img.getPixel(j,i);
+	                    IDAT.writeUnsignedInt(
+	                        uint(((p&0xFFFFFF) << 8)|0xFF));
+	                }
+	            } else {
+	                for(j=0;j < img.width;j++) {
+	                    p = img.getPixel32(j,i);
+	                    IDAT.writeUnsignedInt(
+	                        uint(((p&0xFFFFFF) << 8)|
+	                        (p>>>24)));
+	                }
+	            }
+	        }
+	        IDAT.compress();
+	        writeChunk(png,0x49444154,IDAT);
+	        // Build IEND chunk
+	        writeChunk(png,0x49454E44,null);
+	        // return PNG
+	        return png;
+	    }
+
+	    private static var crcTable:Array;
+	    private static var crcTableComputed:Boolean = false;
+
+	    private static function writeChunk(png:ByteArray,
+	            type:uint, data:ByteArray):void {
+	        if (!crcTableComputed) {
+	            crcTableComputed = true;
+	            crcTable = [];
+	            var c:uint;
+	            for (var n:uint = 0; n < 256; n++) {
+	                c = n;
+	                for (var k:uint = 0; k < 8; k++) {
+	                    if (c & 1) {
+	                        c = uint(uint(0xedb88320) ^
+	                            uint(c >>> 1));
+	                    } else {
+	                        c = uint(c >>> 1);
+	                    }
+	                }
+	                crcTable[n] = c;
+	            }
+	        }
+	        var len:uint = 0;
+	        if (data != null) {
+	            len = data.length;
+	        }
+	        png.writeUnsignedInt(len);
+	        var p:uint = png.position;
+	        png.writeUnsignedInt(type);
+	        if ( data != null ) {
+	            png.writeBytes(data);
+	        }
+	        var e:uint = png.position;
+	        png.position = p;
+	        c = 0xffffffff;
+	        for (var i:int = 0; i < (e-p); i++) {
+	            c = uint(crcTable[
+	                (c ^ png.readUnsignedByte()) &
+	                uint(0xff)] ^ uint(c >>> 8));
+	        }
+	        c = uint(c^uint(0xffffffff));
+	        png.position = e;
+	        png.writeUnsignedInt(c);
+	    }
+	}
+}
+
+package com.adobe.serialization.json
+{
+
+	public class JSONDecoder
+	{
+
+		/**
+		 * Flag indicating if the parser should be strict about the format
+		 * of the JSON string it is attempting to decode.
+		 */
+		private var strict:Boolean;
+
+		/** The value that will get parsed from the JSON string */
+		private var value:*;
+
+		/** The tokenizer designated to read the JSON string */
+		private var tokenizer:JSONTokenizer;
+
+		/** The current token from the tokenizer */
+		private var token:JSONToken;
+
+		/**
+		 * Constructs a new JSONDecoder to parse a JSON string
+		 * into a native object.
+		 *
+		 * @param s The JSON string to be converted
+		 *		into a native object
+		 * @param strict Flag indicating if the JSON string needs to
+		 * 		strictly match the JSON standard or not.
+		 * @langversion ActionScript 3.0
+		 * @playerversion Flash 9.0
+		 * @tiptext
+		 */
+		public function JSONDecoder( s:String, strict:Boolean )
+		{
+			this.strict = strict;
+			tokenizer = new JSONTokenizer( s, strict );
+
+			nextToken();
+			value = parseValue();
+
+			// Make sure the input stream is empty
+			if ( strict && nextToken() != null )
+			{
+				tokenizer.parseError( "Unexpected characters left in input stream" );
+			}
+		}
+
+		/**
+		 * Gets the internal object that was created by parsing
+		 * the JSON string passed to the constructor.
+		 *
+		 * @return The internal object representation of the JSON
+		 * 		string that was passed to the constructor
+		 * @langversion ActionScript 3.0
+		 * @playerversion Flash 9.0
+		 * @tiptext
+		 */
+		public function getValue():*
+		{
+			return value;
+		}
+
+		/**
+		 * Returns the next token from the tokenzier reading
+		 * the JSON string
+		 */
+		private final function nextToken():JSONToken
+		{
+			return token = tokenizer.getNextToken();
+		}
+
+		/**
+		 * Returns the next token from the tokenizer reading
+		 * the JSON string and verifies that the token is valid.
+		 */
+		private final function nextValidToken():JSONToken
+		{
+			token = tokenizer.getNextToken();
+			checkValidToken();
+
+			return token;
+		}
+
+		/**
+		 * Verifies that the token is valid.
+		 */
+		private final function checkValidToken():void
+		{
+			// Catch errors when the input stream ends abruptly
+			if ( token == null )
+			{
+				tokenizer.parseError( "Unexpected end of input" );
+			}
+		}
+
+		/**
+		 * Attempt to parse an array.
+		 */
+		private final function parseArray():Array
+		{
+			// create an array internally that we're going to attempt
+			// to parse from the tokenizer
+			var a:Array = new Array();
+
+			// grab the next token from the tokenizer to move
+			// past the opening [
+			nextValidToken();
+
+			// check to see if we have an empty array
+			if ( token.type == JSONTokenType.RIGHT_BRACKET )
+			{
+				// we're done reading the array, so return it
+				return a;
+			}
+			// in non-strict mode an empty array is also a comma
+			// followed by a right bracket
+			else if ( !strict && token.type == JSONTokenType.COMMA )
+			{
+				// move past the comma
+				nextValidToken();
+
+				// check to see if we're reached the end of the array
+				if ( token.type == JSONTokenType.RIGHT_BRACKET )
+				{
+					return a;
+				}
+				else
+				{
+					tokenizer.parseError( "Leading commas are not supported.  Expecting ']' but found " + token.value );
+				}
+			}
+
+			// deal with elements of the array, and use an "infinite"
+			// loop because we could have any amount of elements
+			while ( true )
+			{
+				// read in the value and add it to the array
+				a.push( parseValue() );
+
+				// after the value there should be a ] or a ,
+				nextValidToken();
+
+				if ( token.type == JSONTokenType.RIGHT_BRACKET )
+				{
+					// we're done reading the array, so return it
+					return a;
+				}
+				else if ( token.type == JSONTokenType.COMMA )
+				{
+					// move past the comma and read another value
+					nextToken();
+
+					// Allow arrays to have a comma after the last element
+					// if the decoder is not in strict mode
+					if ( !strict )
+					{
+						checkValidToken();
+
+						// Reached ",]" as the end of the array, so return it
+						if ( token.type == JSONTokenType.RIGHT_BRACKET )
+						{
+							return a;
+						}
+					}
+				}
+				else
+				{
+					tokenizer.parseError( "Expecting ] or , but found " + token.value );
+				}
+			}
+
+			return null;
+		}
+
+		/**
+		 * Attempt to parse an object.
+		 */
+		private final function parseObject():Object
+		{
+			// create the object internally that we're going to
+			// attempt to parse from the tokenizer
+			var o:Object = new Object();
+
+			// store the string part of an object member so
+			// that we can assign it a value in the object
+			var key:String
+
+			// grab the next token from the tokenizer
+			nextValidToken();
+
+			// check to see if we have an empty object
+			if ( token.type == JSONTokenType.RIGHT_BRACE )
+			{
+				// we're done reading the object, so return it
+				return o;
+			}
+			// in non-strict mode an empty object is also a comma
+			// followed by a right bracket
+			else if ( !strict && token.type == JSONTokenType.COMMA )
+			{
+				// move past the comma
+				nextValidToken();
+
+				// check to see if we're reached the end of the object
+				if ( token.type == JSONTokenType.RIGHT_BRACE )
+				{
+					return o;
+				}
+				else
+				{
+					tokenizer.parseError( "Leading commas are not supported.  Expecting '}' but found " + token.value );
+				}
+			}
+
+			// deal with members of the object, and use an "infinite"
+			// loop because we could have any amount of members
+			while ( true )
+			{
+				if ( token.type == JSONTokenType.STRING )
+				{
+					// the string value we read is the key for the object
+					key = String( token.value );
+
+					// move past the string to see what's next
+					nextValidToken();
+
+					// after the string there should be a :
+					if ( token.type == JSONTokenType.COLON )
+					{
+						// move past the : and read/assign a value for the key
+						nextToken();
+						o[ key ] = parseValue();
+
+						// move past the value to see what's next
+						nextValidToken();
+
+						// after the value there's either a } or a ,
+						if ( token.type == JSONTokenType.RIGHT_BRACE )
+						{
+							// we're done reading the object, so return it
+							return o;
+						}
+						else if ( token.type == JSONTokenType.COMMA )
+						{
+							// skip past the comma and read another member
+							nextToken();
+
+							// Allow objects to have a comma after the last member
+							// if the decoder is not in strict mode
+							if ( !strict )
+							{
+								checkValidToken();
+
+								// Reached ",}" as the end of the object, so return it
+								if ( token.type == JSONTokenType.RIGHT_BRACE )
+								{
+									return o;
+								}
+							}
+						}
+						else
+						{
+							tokenizer.parseError( "Expecting } or , but found " + token.value );
+						}
+					}
+					else
+					{
+						tokenizer.parseError( "Expecting : but found " + token.value );
+					}
+				}
+				else
+				{
+					tokenizer.parseError( "Expecting string but found " + token.value );
+				}
+			}
+			return null;
+		}
+
+		/**
+		 * Attempt to parse a value
+		 */
+		private final function parseValue():Object
+		{
+			checkValidToken();
+
+			switch ( token.type )
+			{
+				case JSONTokenType.LEFT_BRACE:
+					return parseObject();
+
+				case JSONTokenType.LEFT_BRACKET:
+					return parseArray();
+
+				case JSONTokenType.STRING:
+				case JSONTokenType.NUMBER:
+				case JSONTokenType.TRUE:
+				case JSONTokenType.FALSE:
+				case JSONTokenType.NULL:
+					return token.value;
+
+				case JSONTokenType.NAN:
+					if ( !strict )
+					{
+						return token.value;
+					}
+					else
+					{
+						tokenizer.parseError( "Unexpected " + token.value );
+					}
+
+				default:
+					tokenizer.parseError( "Unexpected " + token.value );
+
+			}
+
+			return null;
+		}
+	}
+}
+
+package com.adobe.protocols.dict
+{
+	import com.adobe.protocols.dict.events.*;
+	import com.adobe.protocols.dict.util.*;
+
+	import flash.events.Event;
+	import flash.events.EventDispatcher;
+	import flash.events.IOErrorEvent;
+	import flash.events.ProgressEvent;
+	import flash.events.SecurityErrorEvent;
+	import flash.net.Socket;
+	import mx.rpc.http.HTTPService;
+	import mx.rpc.events.ResultEvent;
+	import mx.rpc.events.FaultEvent;
+	import flash.xml.XMLNode;
+	import mx.utils.StringUtil;
+
+	public class Dict
+		extends EventDispatcher
+	{
+		// Event type names.
+		//public static var CONNECTED:String = "connected";
+		//public static var DISCONNECTED:String = "disconnected";
+		public static var IO_ERROR:String = IOErrorEvent.IO_ERROR;
+		//public static var ERROR:String = "error";
+		//public static var SERVERS:String = "servers";
+		//public static var DATABASES:String = "databases";
+		//public static var MATCH_STRATEGIES:String = "matchStrategies";
+		//public static var DEFINITION:String = "definition";
+		//public static var DEFINITION_HEADER:String = "definitionHeader";
+		//public static var MATCH:String = "match";
+		//public static var NO_MATCH:String = "noMatch";
+
+		public static var FIRST_MATCH:uint = 0;
+		public static var ALL_DATABASES:uint = 1;
+
+		private var socket:SocketHelper;
+
+		private var dbShortList:Boolean;
+
+		public function Dict()
+		{
+			this.socket = new SocketHelper();
+			this.socket.addEventListener(Event.CONNECT, connected);
+			this.socket.addEventListener(Event.CLOSE, disconnected);
+			this.socket.addEventListener(SocketHelper.COMPLETE_RESPONSE, incomingData);
+			this.socket.addEventListener(IOErrorEvent.IO_ERROR, ioError);
+			this.socket.addEventListener(SecurityErrorEvent.SECURITY_ERROR, securityError);
+		}
+
+		public function connect(server:String, port:uint = 2628):void
+		{
+			if (this.socket.connected)
+			{
+				this.socket.close();
+			}
+			this.socket.connect(server, port);
+		}
+
+		public function connectThroughProxy(proxyServer:String,
+											proxyPort:int,
+											server:String,
+											port:uint = 2628):void
+		{
+			if (this.socket.connected)
+			{
+				this.socket.close();
+			}
+			this.socket.setProxyInfo(proxyServer, proxyPort);
+			this.socket.connect(server, port);
+		}
+
+		public function disconnect():void
+		{
+			this.socket.close();
+			this.disconnected(null);
+		}
+
+		public function getServers():void
+		{
+			var http:HTTPService = new HTTPService();
+			http.url = "http://luetzschena-stahmeln.de/dictd/xmllist.php";
+			http.addEventListener(ResultEvent.RESULT, incomingServerXML);
+			http.addEventListener(FaultEvent.FAULT, httpError);
+			http.resultFormat = HTTPService.RESULT_FORMAT_E4X;
+			http.send();
+		}
+
+		public function getDatabases(shortList:Boolean=true):void
+		{
+			this.dbShortList = shortList;
+			this.socket.writeUTFBytes("show db\r\n");
+			this.socket.flush();
+		}
+
+		public function getMatchStrategies():void
+		{
+			this.socket.writeUTFBytes("show strat\r\n");
+			this.socket.flush();
+		}
+
+		public function match(database:String, term:String, scope:String="prefix"):void
+		{
+			this.socket.writeUTFBytes("match " + database + " " + scope + " \"" + term + "\"\r\n");
+			this.socket.flush();
+		}
+
+		public function define(database:String, term:String):void
+		{
+			this.socket.writeUTFBytes("define " + database + " \"" + term + "\"\r\n");
+			this.socket.flush();
+		}
+
+		public function lookup(term:String, scope:uint):void
+		{
+			var flag:String;
+			if (scope == Dict.ALL_DATABASES)
+			{
+				flag = "*";
+			}
+			else if (scope == Dict.FIRST_MATCH)
+			{
+				flag = "!";
+			}
+			this.socket.writeUTFBytes("define " + flag + " \"" + term + "\"\r\n");
+			this.socket.flush();
+		}
+
+		//// Private functions ////
+
+		private function connected(event:Event):void
+		{
+        	// Wait to dispatch an event until we get the 220 response.
+    	}
+
+		private function disconnected(event:Event):void
+		{
+        	dispatchEvent(new DisconnectedEvent(DisconnectedEvent.DISCONNECTED));
+    	}
+
+		private function incomingServerXML(event:ResultEvent):void
+		{
+			var dictd:Namespace = new Namespace("http://www.luetzschena-stahmeln.de/dictd/");
+			var result:XML = event.result as XML;
+			var server:String, description:String;
+			var servers:Array = new Array();
+			for each (var serverNode:XML in result.dictd::server)
+			{
+				server = serverNode.dictd::dictdurl;
+				description = serverNode.dictd::description;
+				if (StringUtil.trim(server).length != 0 &&
+					StringUtil.trim(description).length != 0)
+				{
+					var dServer:DictionaryServer = new DictionaryServer();
+					dServer.server = server.replace("dict://", "");
+					dServer.description = description;
+					servers.push(dServer);
+				}
+			}
+			var dEvent:DictionaryServerEvent = new DictionaryServerEvent(DictionaryServerEvent.SERVERS);
+			dEvent.servers = servers;
+			dispatchEvent(dEvent);
+		}
+
+		private function incomingData(event:CompleteResponseEvent):void
+		{
+			var rawResponse:String = event.response;
+			var response:Response = this.parseRawResponse(rawResponse);
+			var responseCode:uint = response.code;
+			if (responseCode == 552) // no matches
+			{
+				throwNoMatchEvent(response);
+			}
+			else if (responseCode >= 400 && responseCode <= 599) // error
+			{
+				throwErrorEvent(response);
+			}
+			else if (responseCode == 220) // successful connection
+			{
+				dispatchEvent(new ConnectedEvent(ConnectedEvent.CONNECTED));
+			}
+			else if (responseCode == 110) // databases are being returned
+			{
+				throwDatabasesEvent(response);
+			}
+			else if (responseCode == 111) // matches strategies
+			{
+				throwMatchStrategiesEvent(response);
+			}
+			else if (responseCode == 152) // matches
+			{
+				throwMatchEvent(response);
+			}
+			else if (responseCode == 150)
+			{
+				throwDefinitionHeaderEvent(response);
+			}
+			else if (responseCode == 151)
+			{
+				throwDefinitionEvent(response);
+			}
+    	}
+
+    	private function ioError(event:IOErrorEvent):void
+    	{
+			dispatchEvent(event);
+    	}
+
+    	private function httpError(event:FaultEvent):void
+    	{
+    		trace("httpError!");
+    	}
+
+    	private function securityError(event:SecurityErrorEvent):void
+    	{
+    		trace("security error!");
+    		trace(event.text);
+    	}
+
+    	// Dispatch new events.
+
+    	private function throwDatabasesEvent(response:Response):void
+    	{
+			var databases:Array = new Array();
+			var responseArray:Array = response.body.split("\r\n");
+    		for each (var line:String in responseArray)
+    		{
+    			var name:String = line.substring(0, line.indexOf(" "));
+    			if (name == "--exit--")
+    			{
+    				if (this.dbShortList)
+    				{
+    					break;
+    				}
+    				continue;
+    			}
+    			var description:String = line.substring(line.indexOf(" ")+1, line.length).replace(/\"/g,"");
+    			databases.push(new Database(name, description));
+    		}
+    		var event:DatabaseEvent = new DatabaseEvent(DatabaseEvent.DATABASES);
+    		event.databases = databases;
+    		dispatchEvent(event);
+    	}
+
+    	private function throwMatchStrategiesEvent(response:Response):void
+    	{
+			var strategies:Array = new Array();
+			var responseArray:Array = response.body.split("\r\n");
+    		for each (var line:String in responseArray)
+    		{
+    			var name:String = line.substring(0, line.indexOf(" "));
+    			var description:String = line.substring(line.indexOf(" ")+1, line.length).replace(/\"/g,"");
+    			strategies.push(new MatchStrategy(name, description));
+    		}
+    		var event:MatchStrategiesEvent = new MatchStrategiesEvent(MatchStrategiesEvent.MATCH_STRATEGIES);
+    		event.strategies = strategies;
+    		dispatchEvent(event);
+    	}
+
+    	private function throwMatchEvent(response:Response):void
+    	{
+			var matches:Array = new Array();
+			var responseArray:Array = response.body.split("\r\n");
+    		for each (var line:String in responseArray)
+    		{
+    			var match:String = line.substring(line.indexOf(" ")+1, line.length).replace(/\"/g,"");
+    			matches.push(match);
+    		}
+    		var event:MatchEvent = new MatchEvent(MatchEvent.MATCH);
+    		event.matches = matches;
+    		dispatchEvent(event);
+    	}
+
+    	private function throwErrorEvent(response:Response):void
+    	{
+    		var event:ErrorEvent = new ErrorEvent(ErrorEvent.ERROR);
+    		event.code = response.code;
+    		event.message = response.headerText;
+			dispatchEvent(event);
+    	}
+
+    	private function throwNoMatchEvent(response:Response):void
+    	{
+			dispatchEvent(new NoMatchEvent(NoMatchEvent.NO_MATCH));
+    	}
+
+    	private function throwDefinitionHeaderEvent(response:Response):void
+    	{
+			var event:DefinitionHeaderEvent = new DefinitionHeaderEvent(DefinitionHeaderEvent.DEFINITION_HEADER);
+			event.definitionCount = uint(response.headerText.substring(0, response.headerText.indexOf(" ")));
+			dispatchEvent(event);
+    	}
+
+    	private function throwDefinitionEvent(response:Response):void
+    	{
+    		var event:DefinitionEvent = new DefinitionEvent(DefinitionEvent.DEFINITION);
+    		var def:Definition = new Definition();
+    		var headerText:String = response.headerText;
+    		var tokens:Array = headerText.match(/"[^"]+"/g);
+    		def.term = String(tokens[0]).replace(/"/g, "");
+    		def.database = String(tokens[1]).replace(/"/g, "");
+    		def.definition = response.body;
+    		event.definition = def;
+			dispatchEvent(event);
+    	}
+
+    	private function parseRawResponse(rawResponse:String):Response
+    	{
+    		var response:Response = new Response();
+    		var fullHeader:String;
+    		if (rawResponse.indexOf("\r\n") != -1)
+    		{
+	    		fullHeader = rawResponse.substring(0, rawResponse.indexOf("\r\n"));
+    		}
+    		else
+    		{
+    			fullHeader = rawResponse;
+    		}
+      		var responseCodeMatch:Array = fullHeader.match(/^\d{3}/);
+    		response.code = uint(responseCodeMatch[0]);
+    		response.headerText = fullHeader.substring(fullHeader.indexOf(" ")+1, fullHeader.length);
+			var body:String = rawResponse.substring(rawResponse.indexOf("\r\n")+2, rawResponse.length);
+			body = body.replace(/\r\n\.\./, "\r\n.");
+			response.body = body;
+    		return response;
+    	}
+	}
+}
+
+package com.adobe.protocols.dict
+{
+	public class Definition
+	{
+		private var _definition:String;
+		private var _database:String;
+		private var _term:String;
+
+		public function set definition(definition:String):void
+		{
+			this._definition = definition;
+		}
+
+		public function get definition():String
+		{
+			return this._definition;
+		}
+
+		public function set database(database:String):void
+		{
+			this._database = database;
+		}
+
+		public function get database():String
+		{
+			return this._database;
+		}
+
+		public function set term(term:String):void
+		{
+			this._term = term;
+		}
+
+		public function get term():String
+		{
+			return this._term;
+		}
+	}
+}
+
+package com.adobe.protocols.dict.util
+{
+	import com.adobe.net.proxies.RFC2817Socket;
+	import flash.events.ProgressEvent;
+
+	public class SocketHelper
+		extends RFC2817Socket
+	{
+		private var terminator:String = "\r\n.\r\n";
+		private var buffer:String;
+		public static var COMPLETE_RESPONSE:String = "completeResponse";
+
+		public function SocketHelper()
+		{
+			super();
+			buffer = new String();
+			addEventListener(ProgressEvent.SOCKET_DATA, incomingData);
+		}
+
+		private function incomingData(event:ProgressEvent):void
+		{
+			buffer += readUTFBytes(bytesAvailable);
+			buffer = buffer.replace(/250[^\r\n]+\r\n/, ""); // Get rid of all 250s. Don't need them.
+			var codeStr:String = buffer.substring(0, 3);
+			if (!isNaN(parseInt(codeStr)))
+			{
+				var code:uint = uint(codeStr);
+				if (code == 150 || code >= 200)
+				{
+					buffer = buffer.replace("\r\n", this.terminator);
+				}
+			}
+
+			while (buffer.indexOf(this.terminator) != -1)
+			{
+				var chunk:String = buffer.substring(0, buffer.indexOf(this.terminator));
+				buffer = buffer.substring(chunk.length + this.terminator.length, buffer.length);
+				throwResponseEvent(chunk);
+			}
+		}
+
+		private function throwResponseEvent(response:String):void
+		{
+			var responseEvent:CompleteResponseEvent = new CompleteResponseEvent(CompleteResponseEvent.COMPLETE_RESPONSE);
+			responseEvent.response = response;
+			dispatchEvent(responseEvent);
+		}
+	}
+}
+
+package com.adobe.protocols.dict.util
+{
+	import flash.events.Event;
+
+	public class CompleteResponseEvent extends Event
+	{
+		private var _sfsdf:String;
+
+		public static const COMPLETE_PONSE:String = "completeResponse"
+
+		public function CompleteResponseEvent()
+		{
+			super(type, bubbles, cancelable);
+		}
+
+		public override function clone():Event
+		{
+			var out:CompleteResponseEvent = new CompleteResponseEvent(type,
+															bubbles, cancelable);
+			out.response = _response;
+
+			return out;
+		}
+	}
+}

@@ -1,0 +1,6390 @@
+/* vi:set ts=8 sts=4 sw=4:
+ *
+ * VIM - Vi IMproved	by Bram Moolenaar
+ *
+ * Do ":help uganda"  in Vim to read copying and usage conditions.
+ * Do ":help credits" in Vim to see a list of people who contributed.
+ * See README.txt for an overview of the Vim source code.
+ */
+
+#include "vim.h"
+
+#ifdef FEAT_LINEBREAK
+static int win_chartabsize __ARGS((win_T *wp, char_u *p, colnr_T col));
+#endif
+
+#ifdef FEAT_MBYTE
+# if defined(HAVE_WCHAR_H)
+#  include <wchar.h>	    /* for towupper() and towlower() */
+# endif
+static int win_nolbr_chartabsize __ARGS((win_T *wp, char_u *s, colnr_T col, int *headp));
+#endif
+
+static unsigned nr2hex __ARGS((unsigned c));
+
+static int    chartab_initialized = FALSE;
+
+/* b_chartab[] is an array of 32 bytes, each bit representing one of the
+ * characters 0-255. */
+#define SET_CHARTAB(buf, c) (buf)->b_chartab[(unsigned)(c) >> 3] |= (1 << ((c) & 0x7))
+#define RESET_CHARTAB(buf, c) (buf)->b_chartab[(unsigned)(c) >> 3] &= ~(1 << ((c) & 0x7))
+#define GET_CHARTAB(buf, c) ((buf)->b_chartab[(unsigned)(c) >> 3] & (1 << ((c) & 0x7)))
+
+/*
+ * Fill chartab[].  Also fills curbuf->b_chartab[] with flags for keyword
+ * characters for current buffer.
+ *
+ * Depends on the option settings 'iskeyword', 'isident', 'isfname',
+ * 'isprint' and 'encoding'.
+ *
+ * The index in chartab[] depends on 'encoding':
+ * - For non-multi-byte index with the byte (same as the character).
+ * - For DBCS index with the first byte.
+ * - For UTF-8 index with the character (when first byte is up to 0x80 it is
+ *   the same as the character, if the first byte is 0x80 and above it depends
+ *   on further bytes).
+ *
+ * The contents of chartab[]:
+ * - The lower two bits, masked by CT_CELL_MASK, give the number of display
+ *   cells the character occupies (1 or 2).  Not valid for UTF-8 above 0x80.
+ * - CT_PRINT_CHAR bit is set when the character is printable (no need to
+ *   translate the character before displaying it).  Note that only DBCS
+ *   characters can have 2 display cells and still be printable.
+ * - CT_FNAME_CHAR bit is set when the character can be in a file name.
+ * - CT_ID_CHAR bit is set when the character can be in an identifier.
+ *
+ * Return FAIL if 'iskeyword', 'isident', 'isfname' or 'isprint' option has an
+ * error, OK otherwise.
+ */
+    int
+init_chartab()
+{
+    return buf_init_chartab(curbuf, TRUE);
+}
+
+    int
+buf_init_chartab(buf, global)
+    buf_T	*buf;
+    int		global;		/* FALSE: only set buf->b_chartab[] */
+{
+    int		c;
+    int		c2;
+    char_u	*p;
+    int		i;
+    int		tilde;
+    int		do_isalpha;
+
+    if (global)
+    {
+	/*
+	 * Set the default size for printable characters:
+	 * From <Space> to '~' is 1 (printable), others are 2 (not printable).
+	 * This also inits all 'isident' and 'isfname' flags to FALSE.
+	 *
+	 * EBCDIC: all chars below ' ' are not printable, all others are
+	 * printable.
+	 */
+	c = 0;
+	while (c < ' ')
+	    chartab[c++] = (dy_flags & DY_UHEX) ? 4 : 2;
+#ifdef EBCDIC
+	while (c < 255)
+#else
+	while (c <= '~')
+#endif
+	    chartab[c++] = 1 + CT_PRINT_CHAR;
+#ifdef FEAT_FKMAP
+	if (p_altkeymap)
+	{
+	    while (c < YE)
+		chartab[c++] = 1 + CT_PRINT_CHAR;
+	}
+#endif
+	while (c < 256)
+	{
+#ifdef FEAT_MBYTE
+	    /* UTF-8: bytes 0xa0 - 0xff are printable (latin1) */
+	    if (enc_utf8 && c >= 0xa0)
+		chartab[c++] = CT_PRINT_CHAR + 1;
+	    /* euc-jp characters starting with 0x8e are single width */
+	    else if (enc_dbcs == DBCS_JPNU && c == 0x8e)
+		chartab[c++] = CT_PRINT_CHAR + 1;
+	    /* other double-byte chars can be printable AND double-width */
+	    else if (enc_dbcs != 0 && MB_BYTE2LEN(c) == 2)
+		chartab[c++] = CT_PRINT_CHAR + 2;
+	    else
+#endif
+		/* the rest is unprintable by default */
+		chartab[c++] = (dy_flags & DY_UHEX) ? 4 : 2;
+	}
+
+#ifdef FEAT_MBYTE
+	/* Assume that every multi-byte char is a filename character. */
+	for (c = 1; c < 256; ++c)
+	    if ((enc_dbcs != 0 && MB_BYTE2LEN(c) > 1)
+		    || (enc_dbcs == DBCS_JPNU && c == 0x8e)
+		    || (enc_utf8 && c >= 0xa0))
+		chartab[c] |= CT_FNAME_CHAR;
+#endif
+    }
+
+    /*
+     * Init word char flags all to FALSE
+     */
+    vim_memset(buf->b_chartab, 0, (size_t)32);
+#ifdef FEAT_MBYTE
+    if (enc_dbcs != 0)
+	for (c = 0; c < 256; ++c)
+	{
+	    /* double-byte characters are probably word characters */
+	    if (MB_BYTE2LEN(c) == 2)
+		SET_CHARTAB(buf, c);
+	}
+#endif
+
+#ifdef FEAT_LISP
+    /*
+     * In lisp mode the '-' character is included in keywords.
+     */
+    if (buf->b_p_lisp)
+	SET_CHARTAB(buf, '-');
+#endif
+
+    /* Walk through the 'isident', 'iskeyword', 'isfname' and 'isprint'
+     * options Each option is a list of characters, character numbers or
+     * ranges, separated by commas, e.g.: "200-210,x,#-178,-"
+     */
+    for (i = global ? 0 : 3; i <= 3; ++i)
+    {
+	if (i == 0)
+	    p = p_isi;		/* first round: 'isident' */
+	else if (i == 1)
+	    p = p_isp;		/* second round: 'isprint' */
+	else if (i == 2)
+	    p = p_isf;		/* third round: 'isfname' */
+	else	/* i == 3 */
+	    p = buf->b_p_isk;	/* fourth round: 'iskeyword' */
+
+	while (*p)
+	{
+	    tilde = FALSE;
+	    do_isalpha = FALSE;
+	    if (*p == '^' && p[1] != NUL)
+	    {
+		tilde = TRUE;
+		++p;
+	    }
+	    if (VIM_ISDIGIT(*p))
+		c = getdigits(&p);
+	    else
+#ifdef FEAT_MBYTE
+		 if (has_mbyte)
+		c = mb_ptr2char_adv(&p);
+	    else
+#endif
+		c = *p++;
+	    c2 = -1;
+	    if (*p == '-' && p[1] != NUL)
+	    {
+		++p;
+		if (VIM_ISDIGIT(*p))
+		    c2 = getdigits(&p);
+		else
+#ifdef FEAT_MBYTE
+		     if (has_mbyte)
+		    c2 = mb_ptr2char_adv(&p);
+		else
+#endif
+		    c2 = *p++;
+	    }
+	    if (c <= 0 || c >= 256 || (c2 < c && c2 != -1) || c2 >= 256
+						 || !(*p == NUL || *p == ','))
+		return FAIL;
+
+	    if (c2 == -1)	/* not a range */
+	    {
+		/*
+		 * A single '@' (not "@-@"):
+		 * Decide on letters being ID/printable/keyword chars with
+		 * standard function isalpha(). This takes care of locale for
+		 * single-byte characters).
+		 */
+		if (c == '@')
+		{
+		    do_isalpha = TRUE;
+		    c = 1;
+		    c2 = 255;
+		}
+		else
+		    c2 = c;
+	    }
+	    while (c <= c2)
+	    {
+		/* Use the MB_ functions here, because isalpha() doesn't
+		 * work properly when 'encoding' is "latin1" and the locale is
+		 * "C".  */
+		if (!do_isalpha || MB_ISLOWER(c) || MB_ISUPPER(c)
+#ifdef FEAT_FKMAP
+			|| (p_altkeymap && (F_isalpha(c) || F_isdigit(c)))
+#endif
+			    )
+		{
+		    if (i == 0)			/* (re)set ID flag */
+		    {
+			if (tilde)
+			    chartab[c] &= ~CT_ID_CHAR;
+			else
+			    chartab[c] |= CT_ID_CHAR;
+		    }
+		    else if (i == 1)		/* (re)set printable */
+		    {
+			if ((c < ' '
+#ifndef EBCDIC
+				    || c > '~'
+#endif
+#ifdef FEAT_FKMAP
+				    || (p_altkeymap
+					&& (F_isalpha(c) || F_isdigit(c)))
+#endif
+			    )
+#ifdef FEAT_MBYTE
+				/* For double-byte we keep the cell width, so
+				 * that we can detect it from the first byte. */
+				&& !(enc_dbcs && MB_BYTE2LEN(c) == 2)
+#endif
+			   )
+			{
+			    if (tilde)
+			    {
+				chartab[c] = (chartab[c] & ~CT_CELL_MASK)
+					     + ((dy_flags & DY_UHEX) ? 4 : 2);
+				chartab[c] &= ~CT_PRINT_CHAR;
+			    }
+			    else
+			    {
+				chartab[c] = (chartab[c] & ~CT_CELL_MASK) + 1;
+				chartab[c] |= CT_PRINT_CHAR;
+			    }
+			}
+		    }
+		    else if (i == 2)		/* (re)set fname flag */
+		    {
+			if (tilde)
+			    chartab[c] &= ~CT_FNAME_CHAR;
+			else
+			    chartab[c] |= CT_FNAME_CHAR;
+		    }
+		    else /* i == 3 */		/* (re)set keyword flag */
+		    {
+			if (tilde)
+			    RESET_CHARTAB(buf, c);
+			else
+			    SET_CHARTAB(buf, c);
+		    }
+		}
+		++c;
+	    }
+
+	    c = *p;
+	    p = skip_to_option_part(p);
+	    if (c == ',' && *p == NUL)
+		/* Trailing comma is not allowed. */
+		return FAIL;
+	}
+    }
+    chartab_initialized = TRUE;
+    return OK;
+}
+
+/*
+ * Translate any special characters in buf[bufsize] in-place.
+ * The result is a string with only printable characters, but if there is not
+ * enough room, not all characters will be translated.
+ */
+    void
+trans_characters(buf, bufsize)
+    char_u	*buf;
+    int		bufsize;
+{
+    int		len;		/* length of string needing translation */
+    int		room;		/* room in buffer after string */
+    char_u	*trs;		/* translated character */
+    int		trs_len;	/* length of trs[] */
+
+    len = (int)STRLEN(buf);
+    room = bufsize - len;
+    while (*buf != 0)
+    {
+# ifdef FEAT_MBYTE
+	/* Assume a multi-byte character doesn't need translation. */
+	if (has_mbyte && (trs_len = (*mb_ptr2len)(buf)) > 1)
+	    len -= trs_len;
+	else
+# endif
+	{
+	    trs = transchar_byte(*buf);
+	    trs_len = (int)STRLEN(trs);
+	    if (trs_len > 1)
+	    {
+		room -= trs_len - 1;
+		if (room <= 0)
+		    return;
+		mch_memmove(buf + trs_len, buf + 1, (size_t)len);
+	    }
+	    mch_memmove(buf, trs, (size_t)trs_len);
+	    --len;
+	}
+	buf += trs_len;
+    }
+}
+
+#if defined(FEAT_EVAL) || defined(FEAT_TITLE) || defined(FEAT_INS_EXPAND) \
+	|| defined(PROTO)
+/*
+ * Translate a string into allocated memory, replacing special chars with
+ * printable chars.  Returns NULL when out of memory.
+ */
+    char_u *
+transstr(s)
+    char_u	*s;
+{
+    char_u	*res;
+    char_u	*p;
+#ifdef FEAT_MBYTE
+    int		l, len, c;
+    char_u	hexbuf[11];
+#endif
+
+#ifdef FEAT_MBYTE
+    if (has_mbyte)
+    {
+	/* Compute the length of the result, taking account of unprintable
+	 * multi-byte characters. */
+	len = 0;
+	p = s;
+	while (*p != NUL)
+	{
+	    if ((l = (*mb_ptr2len)(p)) > 1)
+	    {
+		c = (*mb_ptr2char)(p);
+		p += l;
+		if (vim_isprintc(c))
+		    len += l;
+		else
+		{
+		    transchar_hex(hexbuf, c);
+		    len += (int)STRLEN(hexbuf);
+		}
+	    }
+	    else
+	    {
+		l = byte2cells(*p++);
+		if (l > 0)
+		    len += l;
+		else
+		    len += 4;	/* illegal byte sequence */
+	    }
+	}
+	res = alloc((unsigned)(len + 1));
+    }
+    else
+#endif
+	res = alloc((unsigned)(vim_strsize(s) + 1));
+    if (res != NULL)
+    {
+	*res = NUL;
+	p = s;
+	while (*p != NUL)
+	{
+#ifdef FEAT_MBYTE
+	    if (has_mbyte && (l = (*mb_ptr2len)(p)) > 1)
+	    {
+		c = (*mb_ptr2char)(p);
+		if (vim_isprintc(c))
+		    STRNCAT(res, p, l);	/* append printable multi-byte char */
+		else
+		    transchar_hex(res + STRLEN(res), c);
+		p += l;
+	    }
+	    else
+#endif
+		STRCAT(res, transchar_byte(*p++));
+	}
+    }
+    return res;
+}
+#endif
+
+#if defined(FEAT_SYN_HL) || defined(FEAT_INS_EXPAND) || defined(PROTO)
+/*
+ * Convert the string "str[orglen]" to do ignore-case comparing.  Uses the
+ * current locale.
+ * When "buf" is NULL returns an allocated string (NULL for out-of-memory).
+ * Otherwise puts the result in "buf[buflen]".
+ */
+    char_u *
+str_foldcase(str, orglen, buf, buflen)
+    char_u	*str;
+    int		orglen;
+    char_u	*buf;
+    int		buflen;
+{
+    garray_T	ga;
+    int		i;
+    int		len = orglen;
+
+#define GA_CHAR(i)  ((char_u *)ga.ga_data)[i]
+#define GA_PTR(i)   ((char_u *)ga.ga_data + i)
+#define STR_CHAR(i)  (buf == NULL ? GA_CHAR(i) : buf[i])
+#define STR_PTR(i)   (buf == NULL ? GA_PTR(i) : buf + i)
+
+    /* Copy "str" into "buf" or allocated memory, unmodified. */
+    if (buf == NULL)
+    {
+	ga_init2(&ga, 1, 10);
+	if (ga_grow(&ga, len + 1) == FAIL)
+	    return NULL;
+	mch_memmove(ga.ga_data, str, (size_t)len);
+	ga.ga_len = len;
+    }
+    else
+    {
+	if (len >= buflen)	    /* Ugly! */
+	    len = buflen - 1;
+	mch_memmove(buf, str, (size_t)len);
+    }
+    if (buf == NULL)
+	GA_CHAR(len) = NUL;
+    else
+	buf[len] = NUL;
+
+    /* Make each character lower case. */
+    i = 0;
+    while (STR_CHAR(i) != NUL)
+    {
+#ifdef FEAT_MBYTE
+	if (enc_utf8 || (has_mbyte && MB_BYTE2LEN(STR_CHAR(i)) > 1))
+	{
+	    if (enc_utf8)
+	    {
+		int	c = utf_ptr2char(STR_PTR(i));
+		int	olen = utf_ptr2len(STR_PTR(i));
+		int	lc = utf_tolower(c);
+
+		/* Only replace the character when it is not an invalid
+		 * sequence (ASCII character or more than one byte) and
+		 * utf_tolower() doesn't return the original character. */
+		if ((c < 0x80 || olen > 1) && c != lc)
+		{
+		    int	    nlen = utf_char2len(lc);
+
+		    /* If the byte length changes need to shift the following
+		     * characters forward or backward. */
+		    if (olen != nlen)
+		    {
+			if (nlen > olen)
+			{
+			    if (buf == NULL
+				    ? ga_grow(&ga, nlen - olen + 1) == FAIL
+				    : len + nlen - olen >= buflen)
+			    {
+				/* out of memory, keep old char */
+				lc = c;
+				nlen = olen;
+			    }
+			}
+			if (olen != nlen)
+			{
+			    if (buf == NULL)
+			    {
+				STRMOVE(GA_PTR(i) + nlen, GA_PTR(i) + olen);
+				ga.ga_len += nlen - olen;
+			    }
+			    else
+			    {
+				STRMOVE(buf + i + nlen, buf + i + olen);
+				len += nlen - olen;
+			    }
+			}
+		    }
+		    (void)utf_char2bytes(lc, STR_PTR(i));
+		}
+	    }
+	    /* skip to next multi-byte char */
+	    i += (*mb_ptr2len)(STR_PTR(i));
+	}
+	else
+#endif
+	{
+	    if (buf == NULL)
+		GA_CHAR(i) = TOLOWER_LOC(GA_CHAR(i));
+	    else
+		buf[i] = TOLOWER_LOC(buf[i]);
+	    ++i;
+	}
+    }
+
+    if (buf == NULL)
+	return (char_u *)ga.ga_data;
+    return buf;
+}
+#endif
+
+/*
+ * Catch 22: chartab[] can't be initialized before the options are
+ * initialized, and initializing options may cause transchar() to be called!
+ * When chartab_initialized == FALSE don't use chartab[].
+ * Does NOT work for multi-byte characters, c must be <= 255.
+ * Also doesn't work for the first byte of a multi-byte, "c" must be a
+ * character!
+ */
+static char_u	transchar_buf[7];
+
+    char_u *
+transchar(c)
+    int		c;
+{
+    int			i;
+
+    i = 0;
+    if (IS_SPECIAL(c))	    /* special key code, display as ~@ char */
+    {
+	transchar_buf[0] = '~';
+	transchar_buf[1] = '@';
+	i = 2;
+	c = K_SECOND(c);
+    }
+
+    if ((!chartab_initialized && (
+#ifdef EBCDIC
+		    (c >= 64 && c < 255)
+#else
+		    (c >= ' ' && c <= '~')
+#endif
+#ifdef FEAT_FKMAP
+			|| F_ischar(c)
+#endif
+		)) || (c < 256 && vim_isprintc_strict(c)))
+    {
+	/* printable character */
+	transchar_buf[i] = c;
+	transchar_buf[i + 1] = NUL;
+    }
+    else
+	transchar_nonprint(transchar_buf + i, c);
+    return transchar_buf;
+}
+
+#if defined(FEAT_MBYTE) || defined(PROTO)
+/*
+ * Like transchar(), but called with a byte instead of a character.  Checks
+ * for an illegal UTF-8 byte.
+ */
+    char_u *
+transchar_byte(c)
+    int		c;
+{
+    if (enc_utf8 && c >= 0x80)
+    {
+	transchar_nonprint(transchar_buf, c);
+	return transchar_buf;
+    }
+    return transchar(c);
+}
+#endif
+
+/*
+ * Convert non-printable character to two or more printable characters in
+ * "buf[]".  "buf" needs to be able to hold five bytes.
+ * Does NOT work for multi-byte characters, c must be <= 255.
+ */
+    void
+transchar_nonprint(buf, c)
+    char_u	*buf;
+    int		c;
+{
+    if (c == NL)
+	c = NUL;		/* we use newline in place of a NUL */
+    else if (c == CAR && get_fileformat(curbuf) == EOL_MAC)
+	c = NL;			/* we use CR in place of  NL in this case */
+
+    if (dy_flags & DY_UHEX)		/* 'display' has "uhex" */
+	transchar_hex(buf, c);
+
+#ifdef EBCDIC
+    /* For EBCDIC only the characters 0-63 and 255 are not printable */
+    else if (CtrlChar(c) != 0 || c == DEL)
+#else
+    else if (c <= 0x7f)				/* 0x00 - 0x1f and 0x7f */
+#endif
+    {
+	buf[0] = '^';
+#ifdef EBCDIC
+	if (c == DEL)
+	    buf[1] = '?';		/* DEL displayed as ^? */
+	else
+	    buf[1] = CtrlChar(c);
+#else
+	buf[1] = c ^ 0x40;		/* DEL displayed as ^? */
+#endif
+
+	buf[2] = NUL;
+    }
+#ifdef FEAT_MBYTE
+    else if (enc_utf8 && c >= 0x80)
+    {
+	transchar_hex(buf, c);
+    }
+#endif
+#ifndef EBCDIC
+    else if (c >= ' ' + 0x80 && c <= '~' + 0x80)    /* 0xa0 - 0xfe */
+    {
+	buf[0] = '|';
+	buf[1] = c - 0x80;
+	buf[2] = NUL;
+    }
+#else
+    else if (c < 64)
+    {
+	buf[0] = '~';
+	buf[1] = MetaChar(c);
+	buf[2] = NUL;
+    }
+#endif
+    else					    /* 0x80 - 0x9f and 0xff */
+    {
+	/*
+	 * TODO: EBCDIC I don't know what to do with this chars, so I display
+	 * them as '~?' for now
+	 */
+	buf[0] = '~';
+#ifdef EBCDIC
+	buf[1] = '?';			/* 0xff displayed as ~? */
+#else
+	buf[1] = (c - 0x80) ^ 0x40;	/* 0xff displayed as ~? */
+#endif
+	buf[2] = NUL;
+    }
+}
+
+    void
+transchar_hex(buf, c)
+    char_u	*buf;
+    int		c;
+{
+    int		i = 0;
+
+    buf[0] = '<';
+#ifdef FEAT_MBYTE
+    if (c > 255)
+    {
+	buf[++i] = nr2hex((unsigned)c >> 12);
+	buf[++i] = nr2hex((unsigned)c >> 8);
+    }
+#endif
+    buf[++i] = nr2hex((unsigned)c >> 4);
+    buf[++i] = nr2hex((unsigned)c);
+    buf[++i] = '>';
+    buf[++i] = NUL;
+}
+
+/*
+ * Convert the lower 4 bits of byte "c" to its hex character.
+ * Lower case letters are used to avoid the confusion of <F1> being 0xf1 or
+ * function key 1.
+ */
+    static unsigned
+nr2hex(c)
+    unsigned	c;
+{
+    if ((c & 0xf) <= 9)
+	return (c & 0xf) + '0';
+    return (c & 0xf) - 10 + 'a';
+}
+
+/*
+ * Return number of display cells occupied by byte "b".
+ * Caller must make sure 0 <= b <= 255.
+ * For multi-byte mode "b" must be the first byte of a character.
+ * A TAB is counted as two cells: "^I".
+ * For UTF-8 mode this will return 0 for bytes >= 0x80, because the number of
+ * cells depends on further bytes.
+ */
+    int
+byte2cells(b)
+    int		b;
+{
+#ifdef FEAT_MBYTE
+    if (enc_utf8 && b >= 0x80)
+	return 0;
+#endif
+    return (chartab[b] & CT_CELL_MASK);
+}
+
+/*
+ * Return number of display cells occupied by character "c".
+ * "c" can be a special key (negative number) in which case 3 or 4 is returned.
+ * A TAB is counted as two cells: "^I" or four: "<09>".
+ */
+    int
+char2cells(c)
+    int		c;
+{
+    if (IS_SPECIAL(c))
+	return char2cells(K_SECOND(c)) + 2;
+#ifdef FEAT_MBYTE
+    if (c >= 0x80)
+    {
+	/* UTF-8: above 0x80 need to check the value */
+	if (enc_utf8)
+	    return utf_char2cells(c);
+	/* DBCS: double-byte means double-width, except for euc-jp with first
+	 * byte 0x8e */
+	if (enc_dbcs != 0 && c >= 0x100)
+	{
+	    if (enc_dbcs == DBCS_JPNU && ((unsigned)c >> 8) == 0x8e)
+		return 1;
+	    return 2;
+	}
+    }
+#endif
+    return (chartab[c & 0xff] & CT_CELL_MASK);
+}
+
+/*
+ * Return number of display cells occupied by character at "*p".
+ * A TAB is counted as two cells: "^I" or four: "<09>".
+ */
+    int
+ptr2cells(p)
+    char_u	*p;
+{
+#ifdef FEAT_MBYTE
+    /* For UTF-8 we need to look at more bytes if the first byte is >= 0x80. */
+    if (enc_utf8 && *p >= 0x80)
+	return utf_ptr2cells(p);
+    /* For DBCS we can tell the cell count from the first byte. */
+#endif
+    return (chartab[*p] & CT_CELL_MASK);
+}
+
+/*
+ * Return the number of character cells string "s" will take on the screen,
+ * counting TABs as two characters: "^I".
+ */
+    int
+vim_strsize(s)
+    char_u	*s;
+{
+    return vim_strnsize(s, (int)MAXCOL);
+}
+
+/*
+ * Return the number of character cells string "s[len]" will take on the
+ * screen, counting TABs as two characters: "^I".
+ */
+    int
+vim_strnsize(s, len)
+    char_u	*s;
+    int		len;
+{
+    int		size = 0;
+
+    while (*s != NUL && --len >= 0)
+    {
+#ifdef FEAT_MBYTE
+	if (has_mbyte)
+	{
+	    int	    l = (*mb_ptr2len)(s);
+
+	    size += ptr2cells(s);
+	    s += l;
+	    len -= l - 1;
+	}
+	else
+#endif
+	    size += byte2cells(*s++);
+    }
+    return size;
+}
+
+/*
+ * Return the number of characters 'c' will take on the screen, taking
+ * into account the size of a tab.
+ * Use a define to make it fast, this is used very often!!!
+ * Also see getvcol() below.
+ */
+
+#define RET_WIN_BUF_CHARTABSIZE(wp, buf, p, col) \
+    if (*(p) == TAB && (!(wp)->w_p_list || lcs_tab1)) \
+    { \
+	int ts; \
+	ts = (buf)->b_p_ts; \
+	return (int)(ts - (col % ts)); \
+    } \
+    else \
+	return ptr2cells(p);
+
+#if defined(FEAT_VREPLACE) || defined(FEAT_EX_EXTRA) || defined(FEAT_GUI) \
+	|| defined(FEAT_VIRTUALEDIT) || defined(PROTO)
+    int
+chartabsize(p, col)
+    char_u	*p;
+    colnr_T	col;
+{
+    RET_WIN_BUF_CHARTABSIZE(curwin, curbuf, p, col)
+}
+#endif
+
+#ifdef FEAT_LINEBREAK
+    static int
+win_chartabsize(wp, p, col)
+    win_T	*wp;
+    char_u	*p;
+    colnr_T	col;
+{
+    RET_WIN_BUF_CHARTABSIZE(wp, wp->w_buffer, p, col)
+}
+#endif
+
+/*
+ * Return the number of characters the string 's' will take on the screen,
+ * taking into account the size of a tab.
+ */
+    int
+linetabsize(s)
+    char_u	*s;
+{
+    return linetabsize_col(0, s);
+}
+
+/*
+ * Like linetabsize(), but starting at column "startcol".
+ */
+    int
+linetabsize_col(startcol, s)
+    int		startcol;
+    char_u	*s;
+{
+    colnr_T	col = startcol;
+    char_u	*line = s; /* pointer to start of line, for breakindent */
+
+    while (*s != NUL)
+	col += lbr_chartabsize_adv(line, &s, col);
+    return (int)col;
+}
+
+/*
+ * Like linetabsize(), but for a given window instead of the current one.
+ */
+    int
+win_linetabsize(wp, line, len)
+    win_T	*wp;
+    char_u	*line;
+    colnr_T	len;
+{
+    colnr_T	col = 0;
+    char_u	*s;
+
+    for (s = line; *s != NUL && (len == MAXCOL || s < line + len);
+								mb_ptr_adv(s))
+	col += win_lbr_chartabsize(wp, line, s, col, NULL);
+    return (int)col;
+}
+
+/*
+ * Return TRUE if 'c' is a normal identifier character:
+ * Letters and characters from the 'isident' option.
+ */
+    int
+vim_isIDc(c)
+    int c;
+{
+    return (c > 0 && c < 0x100 && (chartab[c] & CT_ID_CHAR));
+}
+
+/*
+ * return TRUE if 'c' is a keyword character: Letters and characters from
+ * 'iskeyword' option for current buffer.
+ * For multi-byte characters mb_get_class() is used (builtin rules).
+ */
+    int
+vim_iswordc(c)
+    int c;
+{
+    return vim_iswordc_buf(c, curbuf);
+}
+
+    int
+vim_iswordc_buf(c, buf)
+    int		c;
+    buf_T	*buf;
+{
+#ifdef FEAT_MBYTE
+    if (c >= 0x100)
+    {
+	if (enc_dbcs != 0)
+	    return dbcs_class((unsigned)c >> 8, (unsigned)(c & 0xff)) >= 2;
+	if (enc_utf8)
+	    return utf_class(c) >= 2;
+    }
+#endif
+    return (c > 0 && c < 0x100 && GET_CHARTAB(buf, c) != 0);
+}
+
+/*
+ * Just like vim_iswordc() but uses a pointer to the (multi-byte) character.
+ */
+    int
+vim_iswordp(p)
+    char_u *p;
+{
+#ifdef FEAT_MBYTE
+    if (has_mbyte && MB_BYTE2LEN(*p) > 1)
+	return mb_get_class(p) >= 2;
+#endif
+    return GET_CHARTAB(curbuf, *p) != 0;
+}
+
+    int
+vim_iswordp_buf(p, buf)
+    char_u	*p;
+    buf_T	*buf;
+{
+#ifdef FEAT_MBYTE
+    if (has_mbyte && MB_BYTE2LEN(*p) > 1)
+	return mb_get_class(p) >= 2;
+#endif
+    return (GET_CHARTAB(buf, *p) != 0);
+}
+
+/*
+ * return TRUE if 'c' is a valid file-name character
+ * Assume characters above 0x100 are valid (multi-byte).
+ */
+    int
+vim_isfilec(c)
+    int	c;
+{
+    return (c >= 0x100 || (c > 0 && (chartab[c] & CT_FNAME_CHAR)));
+}
+
+/*
+ * return TRUE if 'c' is a valid file-name character or a wildcard character
+ * Assume characters above 0x100 are valid (multi-byte).
+ * Explicitly interpret ']' as a wildcard character as mch_has_wildcard("]")
+ * returns false.
+ */
+    int
+vim_isfilec_or_wc(c)
+    int c;
+{
+    char_u buf[2];
+
+    buf[0] = (char_u)c;
+    buf[1] = NUL;
+    return vim_isfilec(c) || c == ']' || mch_has_wildcard(buf);
+}
+
+/*
+ * return TRUE if 'c' is a printable character
+ * Assume characters above 0x100 are printable (multi-byte), except for
+ * Unicode.
+ */
+    int
+vim_isprintc(c)
+    int c;
+{
+#ifdef FEAT_MBYTE
+    if (enc_utf8 && c >= 0x100)
+	return utf_printable(c);
+#endif
+    return (c >= 0x100 || (c > 0 && (chartab[c] & CT_PRINT_CHAR)));
+}
+
+/*
+ * Strict version of vim_isprintc(c), don't return TRUE if "c" is the head
+ * byte of a double-byte character.
+ */
+    int
+vim_isprintc_strict(c)
+    int	c;
+{
+#ifdef FEAT_MBYTE
+    if (enc_dbcs != 0 && c < 0x100 && MB_BYTE2LEN(c) > 1)
+	return FALSE;
+    if (enc_utf8 && c >= 0x100)
+	return utf_printable(c);
+#endif
+    return (c >= 0x100 || (c > 0 && (chartab[c] & CT_PRINT_CHAR)));
+}
+
+/*
+ * like chartabsize(), but also check for line breaks on the screen
+ */
+    int
+lbr_chartabsize(line, s, col)
+    char_u		*line UNUSED; /* start of the line */
+    unsigned char	*s;
+    colnr_T		col;
+{
+#ifdef FEAT_LINEBREAK
+    if (!curwin->w_p_lbr && *p_sbr == NUL && !curwin->w_p_bri)
+    {
+#endif
+#ifdef FEAT_MBYTE
+	if (curwin->w_p_wrap)
+	    return win_nolbr_chartabsize(curwin, s, col, NULL);
+#endif
+	RET_WIN_BUF_CHARTABSIZE(curwin, curbuf, s, col)
+#ifdef FEAT_LINEBREAK
+    }
+    return win_lbr_chartabsize(curwin, line == NULL ? s : line, s, col, NULL);
+#endif
+}
+
+/*
+ * Call lbr_chartabsize() and advance the pointer.
+ */
+    int
+lbr_chartabsize_adv(line, s, col)
+    char_u	*line; /* start of the line */
+    char_u	**s;
+    colnr_T	col;
+{
+    int		retval;
+
+    retval = lbr_chartabsize(line, *s, col);
+    mb_ptr_adv(*s);
+    return retval;
+}
+
+/*
+ * This function is used very often, keep it fast!!!!
+ *
+ * If "headp" not NULL, set *headp to the size of what we for 'showbreak'
+ * string at start of line.  Warning: *headp is only set if it's a non-zero
+ * value, init to 0 before calling.
+ */
+    int
+win_lbr_chartabsize(wp, line, s, col, headp)
+    win_T	*wp;
+    char_u	*line UNUSED; /* start of the line */
+    char_u	*s;
+    colnr_T	col;
+    int		*headp UNUSED;
+{
+#ifdef FEAT_LINEBREAK
+    int		c;
+    int		size;
+    colnr_T	col2;
+    colnr_T	col_adj = 0; /* col + screen size of tab */
+    colnr_T	colmax;
+    int		added;
+# ifdef FEAT_MBYTE
+    int		mb_added = 0;
+# else
+#  define mb_added 0
+# endif
+    int		numberextra;
+    char_u	*ps;
+    int		tab_corr = (*s == TAB);
+    int		n;
+
+    /*
+     * No 'linebreak', 'showbreak' and 'breakindent': return quickly.
+     */
+    if (!wp->w_p_lbr && !wp->w_p_bri && *p_sbr == NUL)
+#endif
+    {
+#ifdef FEAT_MBYTE
+	if (wp->w_p_wrap)
+	    return win_nolbr_chartabsize(wp, s, col, headp);
+#endif
+	RET_WIN_BUF_CHARTABSIZE(wp, wp->w_buffer, s, col)
+    }
+
+#ifdef FEAT_LINEBREAK
+    /*
+     * First get normal size, without 'linebreak'
+     */
+    size = win_chartabsize(wp, s, col);
+    c = *s;
+    if (tab_corr)
+	col_adj = size - 1;
+
+    /*
+     * If 'linebreak' set check at a blank before a non-blank if the line
+     * needs a break here
+     */
+    if (wp->w_p_lbr
+	    && vim_isbreak(c)
+	    && !vim_isbreak(s[1])
+	    && wp->w_p_wrap
+# ifdef FEAT_VERTSPLIT
+	    && wp->w_width != 0
+# endif
+       )
+    {
+	/*
+	 * Count all characters from first non-blank after a blank up to next
+	 * non-blank after a blank.
+	 */
+	numberextra = win_col_off(wp);
+	col2 = col;
+	colmax = (colnr_T)(W_WIDTH(wp) - numberextra - col_adj);
+	if (col >= colmax)
+	{
+	    colmax += col_adj;
+	    n = colmax +  win_col_off2(wp);
+	    if (n > 0)
+		colmax += (((col - colmax) / n) + 1) * n - col_adj;
+	}
+
+	for (;;)
+	{
+	    ps = s;
+	    mb_ptr_adv(s);
+	    c = *s;
+	    if (!(c != NUL
+		    && (vim_isbreak(c)
+			|| (!vim_isbreak(c)
+			    && (col2 == col || !vim_isbreak(*ps))))))
+		break;
+
+	    col2 += win_chartabsize(wp, s, col2);
+	    if (col2 >= colmax)		/* doesn't fit */
+	    {
+		size = colmax - col + col_adj;
+		tab_corr = FALSE;
+		break;
+	    }
+	}
+    }
+# ifdef FEAT_MBYTE
+    else if (has_mbyte && size == 2 && MB_BYTE2LEN(*s) > 1
+				    && wp->w_p_wrap && in_win_border(wp, col))
+    {
+	++size;		/* Count the ">" in the last column. */
+	mb_added = 1;
+    }
+# endif
+
+    /*
+     * May have to add something for 'breakindent' and/or 'showbreak'
+     * string at start of line.
+     * Set *headp to the size of what we add.
+     */
+    added = 0;
+    if ((*p_sbr != NUL || wp->w_p_bri) && wp->w_p_wrap && col != 0)
+    {
+	numberextra = win_col_off(wp);
+	col += numberextra + mb_added;
+	if (col >= (colnr_T)W_WIDTH(wp))
+	{
+	    col -= W_WIDTH(wp);
+	    numberextra = W_WIDTH(wp) - (numberextra - win_col_off2(wp));
+	    if (numberextra > 0)
+		col = col % numberextra;
+	}
+	if (col == 0 || col + size > (colnr_T)W_WIDTH(wp))
+	{
+	    added = 0;
+	    if (*p_sbr != NUL)
+		added += vim_strsize(p_sbr);
+	    if (wp->w_p_bri)
+		added += get_breakindent_win(wp, line);
+
+	    if (tab_corr)
+		size += (added / wp->w_buffer->b_p_ts) * wp->w_buffer->b_p_ts;
+	    else
+		size += added;
+	    if (col != 0)
+		added = 0;
+	}
+    }
+    if (headp != NULL)
+	*headp = added + mb_added;
+    return size;
+#endif
+}
+
+#if defined(FEAT_MBYTE) || defined(PROTO)
+/*
+ * Like win_lbr_chartabsize(), except that we know 'linebreak' is off and
+ * 'wrap' is on.  This means we need to check for a double-byte character that
+ * doesn't fit at the end of the screen line.
+ */
+    static int
+win_nolbr_chartabsize(wp, s, col, headp)
+    win_T	*wp;
+    char_u	*s;
+    colnr_T	col;
+    int		*headp;
+{
+    int		n;
+
+    if (*s == TAB && (!wp->w_p_list || lcs_tab1))
+    {
+	n = wp->w_buffer->b_p_ts;
+	return (int)(n - (col % n));
+    }
+    n = ptr2cells(s);
+    /* Add one cell for a double-width character in the last column of the
+     * window, displayed with a ">". */
+    if (n == 2 && MB_BYTE2LEN(*s) > 1 && in_win_border(wp, col))
+    {
+	if (headp != NULL)
+	    *headp = 1;
+	return 3;
+    }
+    return n;
+}
+
+/*
+ * Return TRUE if virtual column "vcol" is in the rightmost column of window
+ * "wp".
+ */
+    int
+in_win_border(wp, vcol)
+    win_T	*wp;
+    colnr_T	vcol;
+{
+    int		width1;		/* width of first line (after line number) */
+    int		width2;		/* width of further lines */
+
+#ifdef FEAT_VERTSPLIT
+    if (wp->w_width == 0)	/* there is no border */
+	return FALSE;
+#endif
+    width1 = W_WIDTH(wp) - win_col_off(wp);
+    if ((int)vcol < width1 - 1)
+	return FALSE;
+    if ((int)vcol == width1 - 1)
+	return TRUE;
+    width2 = width1 + win_col_off2(wp);
+    if (width2 <= 0)
+	return FALSE;
+    return ((vcol - width1) % width2 == width2 - 1);
+}
+#endif /* FEAT_MBYTE */
+
+/*
+ * Get virtual column number of pos.
+ *  start: on the first position of this character (TAB, ctrl)
+ * cursor: where the cursor is on this character (first char, except for TAB)
+ *    end: on the last position of this character (TAB, ctrl)
+ *
+ * This is used very often, keep it fast!
+ */
+    void
+getvcol(wp, pos, start, cursor, end)
+    win_T	*wp;
+    pos_T	*pos;
+    colnr_T	*start;
+    colnr_T	*cursor;
+    colnr_T	*end;
+{
+    colnr_T	vcol;
+    char_u	*ptr;		/* points to current char */
+    char_u	*posptr;	/* points to char at pos->col */
+    char_u	*line;		/* start of the line */
+    int		incr;
+    int		head;
+    int		ts = wp->w_buffer->b_p_ts;
+    int		c;
+
+    vcol = 0;
+    line = ptr = ml_get_buf(wp->w_buffer, pos->lnum, FALSE);
+    if (pos->col == MAXCOL)
+	posptr = NULL;  /* continue until the NUL */
+    else
+	posptr = ptr + pos->col;
+
+    /*
+     * This function is used very often, do some speed optimizations.
+     * When 'list', 'linebreak', 'showbreak' and 'breakindent' are not set
+     * use a simple loop.
+     * Also use this when 'list' is set but tabs take their normal size.
+     */
+    if ((!wp->w_p_list || lcs_tab1 != NUL)
+#ifdef FEAT_LINEBREAK
+	    && !wp->w_p_lbr && *p_sbr == NUL && !wp->w_p_bri
+#endif
+       )
+    {
+#ifndef FEAT_MBYTE
+	head = 0;
+#endif
+	for (;;)
+	{
+#ifdef FEAT_MBYTE
+	    head = 0;
+#endif
+	    c = *ptr;
+	    /* make sure we don't go past the end of the line */
+	    if (c == NUL)
+	    {
+		incr = 1;	/* NUL at end of line only takes one column */
+		break;
+	    }
+	    /* A tab gets expanded, depending on the current column */
+	    if (c == TAB)
+		incr = ts - (vcol % ts);
+	    else
+	    {
+#ifdef FEAT_MBYTE
+		if (has_mbyte)
+		{
+		    /* For utf-8, if the byte is >= 0x80, need to look at
+		     * further bytes to find the cell width. */
+		    if (enc_utf8 && c >= 0x80)
+			incr = utf_ptr2cells(ptr);
+		    else
+			incr = CHARSIZE(c);
+
+		    /* If a double-cell char doesn't fit at the end of a line
+		     * it wraps to the next line, it's like this char is three
+		     * cells wide. */
+		    if (incr == 2 && wp->w_p_wrap && MB_BYTE2LEN(*ptr) > 1
+			    && in_win_border(wp, vcol))
+		    {
+			++incr;
+			head = 1;
+		    }
+		}
+		else
+#endif
+		    incr = CHARSIZE(c);
+	    }
+
+	    if (posptr != NULL && ptr >= posptr) /* character at pos->col */
+		break;
+
+	    vcol += incr;
+	    mb_ptr_adv(ptr);
+	}
+    }
+    else
+    {
+	for (;;)
+	{
+	    /* A tab gets expanded, depending on the current column */
+	    head = 0;
+	    incr = win_lbr_chartabsize(wp, line, ptr, vcol, &head);
+	    /* make sure we don't go past the end of the line */
+	    if (*ptr == NUL)
+	    {
+		incr = 1;	/* NUL at end of line only takes one column */
+		break;
+	    }
+
+	    if (posptr != NULL && ptr >= posptr) /* character at pos->col */
+		break;
+
+	    vcol += incr;
+	    mb_ptr_adv(ptr);
+	}
+    }
+    if (start != NULL)
+	*start = vcol + head;
+    if (end != NULL)
+	*end = vcol + incr - 1;
+    if (cursor != NULL)
+    {
+	if (*ptr == TAB
+		&& (State & NORMAL)
+		&& !wp->w_p_list
+		&& !virtual_active()
+		&& !(VIsual_active && (*p_sel == 'e' || ltoreq(*pos, VIsual)))
+		)
+	    *cursor = vcol + incr - 1;	    /* cursor at end */
+	else
+	    *cursor = vcol + head;	    /* cursor at start */
+    }
+}
+
+/*
+ * Get virtual cursor column in the current window, pretending 'list' is off.
+ */
+    colnr_T
+getvcol_nolist(posp)
+    pos_T	*posp;
+{
+    int		list_save = curwin->w_p_list;
+    colnr_T	vcol;
+
+    curwin->w_p_list = FALSE;
+    getvcol(curwin, posp, NULL, &vcol, NULL);
+    curwin->w_p_list = list_save;
+    return vcol;
+}
+
+#if defined(FEAT_VIRTUALEDIT) || defined(PROTO)
+/*
+ * Get virtual column in virtual mode.
+ */
+    void
+getvvcol(wp, pos, start, cursor, end)
+    win_T	*wp;
+    pos_T	*pos;
+    colnr_T	*start;
+    colnr_T	*cursor;
+    colnr_T	*end;
+{
+    colnr_T	col;
+    colnr_T	coladd;
+    colnr_T	endadd;
+# ifdef FEAT_MBYTE
+    char_u	*ptr;
+# endif
+
+    if (virtual_active())
+    {
+	/* For virtual mode, only want one value */
+	getvcol(wp, pos, &col, NULL, NULL);
+
+	coladd = pos->coladd;
+	endadd = 0;
+# ifdef FEAT_MBYTE
+	/* Cannot put the cursor on part of a wide character. */
+	ptr = ml_get_buf(wp->w_buffer, pos->lnum, FALSE);
+	if (pos->col < (colnr_T)STRLEN(ptr))
+	{
+	    int c = (*mb_ptr2char)(ptr + pos->col);
+
+	    if (c != TAB && vim_isprintc(c))
+	    {
+		endadd = (colnr_T)(char2cells(c) - 1);
+		if (coladd > endadd)	/* past end of line */
+		    endadd = 0;
+		else
+		    coladd = 0;
+	    }
+	}
+# endif
+	col += coladd;
+	if (start != NULL)
+	    *start = col;
+	if (cursor != NULL)
+	    *cursor = col;
+	if (end != NULL)
+	    *end = col + endadd;
+    }
+    else
+	getvcol(wp, pos, start, cursor, end);
+}
+#endif
+
+/*
+ * Get the leftmost and rightmost virtual column of pos1 and pos2.
+ * Used for Visual block mode.
+ */
+    void
+getvcols(wp, pos1, pos2, left, right)
+    win_T	*wp;
+    pos_T	*pos1, *pos2;
+    colnr_T	*left, *right;
+{
+    colnr_T	from1, from2, to1, to2;
+
+    if (ltp(pos1, pos2))
+    {
+	getvvcol(wp, pos1, &from1, NULL, &to1);
+	getvvcol(wp, pos2, &from2, NULL, &to2);
+    }
+    else
+    {
+	getvvcol(wp, pos2, &from1, NULL, &to1);
+	getvvcol(wp, pos1, &from2, NULL, &to2);
+    }
+    if (from2 < from1)
+	*left = from2;
+    else
+	*left = from1;
+    if (to2 > to1)
+    {
+	if (*p_sel == 'e' && from2 - 1 >= to1)
+	    *right = from2 - 1;
+	else
+	    *right = to2;
+    }
+    else
+	*right = to1;
+}
+
+/*
+ * skipwhite: skip over ' ' and '\t'.
+ */
+    char_u *
+skipwhite(q)
+    char_u	*q;
+{
+    char_u	*p = q;
+
+    while (vim_iswhite(*p)) /* skip to next non-white */
+	++p;
+    return p;
+}
+
+/*
+ * skip over digits
+ */
+    char_u *
+skipdigits(q)
+    char_u	*q;
+{
+    char_u	*p = q;
+
+    while (VIM_ISDIGIT(*p))	/* skip to next non-digit */
+	++p;
+    return p;
+}
+
+#if defined(FEAT_SYN_HL) || defined(FEAT_SPELL) || defined(PROTO)
+/*
+ * skip over digits and hex characters
+ */
+    char_u *
+skiphex(q)
+    char_u	*q;
+{
+    char_u	*p = q;
+
+    while (vim_isxdigit(*p))	/* skip to next non-digit */
+	++p;
+    return p;
+}
+#endif
+
+#if defined(FEAT_EX_EXTRA) || defined(PROTO)
+/*
+ * skip to digit (or NUL after the string)
+ */
+    char_u *
+skiptodigit(q)
+    char_u	*q;
+{
+    char_u	*p = q;
+
+    while (*p != NUL && !VIM_ISDIGIT(*p))	/* skip to next digit */
+	++p;
+    return p;
+}
+
+/*
+ * skip to hex character (or NUL after the string)
+ */
+    char_u *
+skiptohex(q)
+    char_u	*q;
+{
+    char_u	*p = q;
+
+    while (*p != NUL && !vim_isxdigit(*p))	/* skip to next digit */
+	++p;
+    return p;
+}
+#endif
+
+/*
+ * Variant of isdigit() that can handle characters > 0x100.
+ * We don't use isdigit() here, because on some systems it also considers
+ * superscript 1 to be a digit.
+ * Use the VIM_ISDIGIT() macro for simple arguments.
+ */
+    int
+vim_isdigit(c)
+    int		c;
+{
+    return (c >= '0' && c <= '9');
+}
+
+/*
+ * Variant of isxdigit() that can handle characters > 0x100.
+ * We don't use isxdigit() here, because on some systems it also considers
+ * superscript 1 to be a digit.
+ */
+    int
+vim_isxdigit(c)
+    int		c;
+{
+    return (c >= '0' && c <= '9')
+	|| (c >= 'a' && c <= 'f')
+	|| (c >= 'A' && c <= 'F');
+}
+
+#if defined(FEAT_MBYTE) || defined(PROTO)
+/*
+ * Vim's own character class functions.  These exist because many library
+ * islower()/toupper() etc. do not work properly: they crash when used with
+ * invalid values or can't handle latin1 when the locale is C.
+ * Speed is most important here.
+ */
+#define LATIN1LOWER 'l'
+#define LATIN1UPPER 'U'
+
+static char_u latin1flags[257] = "                                                                 UUUUUUUUUUUUUUUUUUUUUUUUUU      llllllllllllllllllllllllll                                                                     UUUUUUUUUUUUUUUUUUUUUUU UUUUUUUllllllllllllllllllllllll llllllll";
+static char_u latin1upper[257] = "                                 !\"#$%&'()*+,-./0123456789:;<=>?@ABCDEFGHIJKLMNOPQRSTUVWXYZ[\\]^_`ABCDEFGHIJKLMNOPQRSTUVWXYZ{|}~\x7f\x80\x81\x82\x83\x84\x85\x86\x87\x88\x89\x8a\x8b\x8c\x8d\x8e\x8f\x90\x91\x92\x93\x94\x95\x96\x97\x98\x99\x9a\x9b\x9c\x9d\x9e\x9f\xa0\xa1\xa2\xa3\xa4\xa5\xa6\xa7\xa8\xa9\xaa\xab\xac\xad\xae\xaf\xb0\xb1\xb2\xb3\xb4\xb5\xb6\xb7\xb8\xb9\xba\xbb\xbc\xbd\xbe\xbf\xc0\xc1\xc2\xc3\xc4\xc5\xc6\xc7\xc8\xc9\xca\xcb\xcc\xcd\xce\xcf\xd0\xd1\xd2\xd3\xd4\xd5\xd6\xd7\xd8\xd9\xda\xdb\xdc\xdd\xde\xdf\xc0\xc1\xc2\xc3\xc4\xc5\xc6\xc7\xc8\xc9\xca\xcb\xcc\xcd\xce\xcf\xd0\xd1\xd2\xd3\xd4\xd5\xd6\xf7\xd8\xd9\xda\xdb\xdc\xdd\xde\xff";
+static char_u latin1lower[257] = "                                 !\"#$%&'()*+,-./0123456789:;<=>?@abcdefghijklmnopqrstuvwxyz[\\]^_`abcdefghijklmnopqrstuvwxyz{|}~\x7f\x80\x81\x82\x83\x84\x85\x86\x87\x88\x89\x8a\x8b\x8c\x8d\x8e\x8f\x90\x91\x92\x93\x94\x95\x96\x97\x98\x99\x9a\x9b\x9c\x9d\x9e\x9f\xa0\xa1\xa2\xa3\xa4\xa5\xa6\xa7\xa8\xa9\xaa\xab\xac\xad\xae\xaf\xb0\xb1\xb2\xb3\xb4\xb5\xb6\xb7\xb8\xb9\xba\xbb\xbc\xbd\xbe\xbf\xe0\xe1\xe2\xe3\xe4\xe5\xe6\xe7\xe8\xe9\xea\xeb\xec\xed\xee\xef\xf0\xf1\xf2\xf3\xf4\xf5\xf6\xd7\xf8\xf9\xfa\xfb\xfc\xfd\xfe\xdf\xe0\xe1\xe2\xe3\xe4\xe5\xe6\xe7\xe8\xe9\xea\xeb\xec\xed\xee\xef\xf0\xf1\xf2\xf3\xf4\xf5\xf6\xf7\xf8\xf9\xfa\xfb\xfc\xfd\xfe\xff";
+
+    int
+vim_islower(c)
+    int	    c;
+{
+    if (c <= '@')
+	return FALSE;
+    if (c >= 0x80)
+    {
+	if (enc_utf8)
+	    return utf_islower(c);
+	if (c >= 0x100)
+	{
+#ifdef HAVE_ISWLOWER
+	    if (has_mbyte)
+		return iswlower(c);
+#endif
+	    /* islower() can't handle these chars and may crash */
+	    return FALSE;
+	}
+	if (enc_latin1like)
+	    return (latin1flags[c] & LATIN1LOWER) == LATIN1LOWER;
+    }
+    return islower(c);
+}
+
+    int
+vim_isupper(c)
+    int	    c;
+{
+    if (c <= '@')
+	return FALSE;
+    if (c >= 0x80)
+    {
+	if (enc_utf8)
+	    return utf_isupper(c);
+	if (c >= 0x100)
+	{
+#ifdef HAVE_ISWUPPER
+	    if (has_mbyte)
+		return iswupper(c);
+#endif
+	    /* islower() can't handle these chars and may crash */
+	    return FALSE;
+	}
+	if (enc_latin1like)
+	    return (latin1flags[c] & LATIN1UPPER) == LATIN1UPPER;
+    }
+    return isupper(c);
+}
+
+    int
+vim_toupper(c)
+    int	    c;
+{
+    if (c <= '@')
+	return c;
+    if (c >= 0x80)
+    {
+	if (enc_utf8)
+	    return utf_toupper(c);
+	if (c >= 0x100)
+	{
+#ifdef HAVE_TOWUPPER
+	    if (has_mbyte)
+		return towupper(c);
+#endif
+	    /* toupper() can't handle these chars and may crash */
+	    return c;
+	}
+	if (enc_latin1like)
+	    return latin1upper[c];
+    }
+    return TOUPPER_LOC(c);
+}
+
+    int
+vim_tolower(c)
+    int	    c;
+{
+    if (c <= '@')
+	return c;
+    if (c >= 0x80)
+    {
+	if (enc_utf8)
+	    return utf_tolower(c);
+	if (c >= 0x100)
+	{
+#ifdef HAVE_TOWLOWER
+	    if (has_mbyte)
+		return towlower(c);
+#endif
+	    /* tolower() can't handle these chars and may crash */
+	    return c;
+	}
+	if (enc_latin1like)
+	    return latin1lower[c];
+    }
+    return TOLOWER_LOC(c);
+}
+#endif
+
+/*
+ * skiptowhite: skip over text until ' ' or '\t' or NUL.
+ */
+    char_u *
+skiptowhite(p)
+    char_u	*p;
+{
+    while (*p != ' ' && *p != '\t' && *p != NUL)
+	++p;
+    return p;
+}
+
+#if defined(FEAT_LISTCMDS) || defined(FEAT_SIGNS) || defined(FEAT_SNIFF) \
+	|| defined(PROTO)
+/*
+ * skiptowhite_esc: Like skiptowhite(), but also skip escaped chars
+ */
+    char_u *
+skiptowhite_esc(p)
+    char_u	*p;
+{
+    while (*p != ' ' && *p != '\t' && *p != NUL)
+    {
+	if ((*p == '\\' || *p == Ctrl_V) && *(p + 1) != NUL)
+	    ++p;
+	++p;
+    }
+    return p;
+}
+#endif
+
+/*
+ * Getdigits: Get a number from a string and skip over it.
+ * Note: the argument is a pointer to a char_u pointer!
+ */
+    long
+getdigits(pp)
+    char_u **pp;
+{
+    char_u	*p;
+    long	retval;
+
+    p = *pp;
+    retval = atol((char *)p);
+    if (*p == '-')		/* skip negative sign */
+	++p;
+    p = skipdigits(p);		/* skip to next non-digit */
+    *pp = p;
+    return retval;
+}
+
+/*
+ * Return TRUE if "lbuf" is empty or only contains blanks.
+ */
+    int
+vim_isblankline(lbuf)
+    char_u	*lbuf;
+{
+    char_u	*p;
+
+    p = skipwhite(lbuf);
+    return (*p == NUL || *p == '\r' || *p == '\n');
+}
+
+/*
+ * Convert a string into a long and/or unsigned long, taking care of
+ * hexadecimal and octal numbers.  Accepts a '-' sign.
+ * If "hexp" is not NULL, returns a flag to indicate the type of the number:
+ *  0	    decimal
+ *  '0'	    octal
+ *  'X'	    hex
+ *  'x'	    hex
+ * If "len" is not NULL, the length of the number in characters is returned.
+ * If "nptr" is not NULL, the signed result is returned in it.
+ * If "unptr" is not NULL, the unsigned result is returned in it.
+ * If "dooct" is non-zero recognize octal numbers, when > 1 always assume
+ * octal number.
+ * If "dohex" is non-zero recognize hex numbers, when > 1 always assume
+ * hex number.
+ */
+    void
+vim_str2nr(start, hexp, len, dooct, dohex, nptr, unptr)
+    char_u		*start;
+    int			*hexp;	    /* return: type of number 0 = decimal, 'x'
+				       or 'X' is hex, '0' = octal */
+    int			*len;	    /* return: detected length of number */
+    int			dooct;	    /* recognize octal number */
+    int			dohex;	    /* recognize hex number */
+    long		*nptr;	    /* return: signed result */
+    unsigned long	*unptr;	    /* return: unsigned result */
+{
+    char_u	    *ptr = start;
+    int		    hex = 0;		/* default is decimal */
+    int		    negative = FALSE;
+    unsigned long   un = 0;
+    int		    n;
+
+    if (ptr[0] == '-')
+    {
+	negative = TRUE;
+	++ptr;
+    }
+
+    /* Recognize hex and octal. */
+    if (ptr[0] == '0' && ptr[1] != '8' && ptr[1] != '9')
+    {
+	hex = ptr[1];
+	if (dohex && (hex == 'X' || hex == 'x') && vim_isxdigit(ptr[2]))
+	    ptr += 2;			/* hexadecimal */
+	else
+	{
+	    hex = 0;			/* default is decimal */
+	    if (dooct)
+	    {
+		/* Don't interpret "0", "08" or "0129" as octal. */
+		for (n = 1; VIM_ISDIGIT(ptr[n]); ++n)
+		{
+		    if (ptr[n] > '7')
+		    {
+			hex = 0;	/* can't be octal */
+			break;
+		    }
+		    if (ptr[n] >= '0')
+			hex = '0';	/* assume octal */
+		}
+	    }
+	}
+    }
+
+    /*
+     * Do the string-to-numeric conversion "manually" to avoid sscanf quirks.
+     */
+    if (hex == '0' || dooct > 1)
+    {
+	/* octal */
+	while ('0' <= *ptr && *ptr <= '7')
+	{
+	    un = 8 * un + (unsigned long)(*ptr - '0');
+	    ++ptr;
+	}
+    }
+    else if (hex != 0 || dohex > 1)
+    {
+	/* hex */
+	while (vim_isxdigit(*ptr))
+	{
+	    un = 16 * un + (unsigned long)hex2nr(*ptr);
+	    ++ptr;
+	}
+    }
+    else
+    {
+	/* decimal */
+	while (VIM_ISDIGIT(*ptr))
+	{
+	    un = 10 * un + (unsigned long)(*ptr - '0');
+	    ++ptr;
+	}
+    }
+
+    if (hexp != NULL)
+	*hexp = hex;
+    if (len != NULL)
+	*len = (int)(ptr - start);
+    if (nptr != NULL)
+    {
+	if (negative)   /* account for leading '-' for decimal numbers */
+	    *nptr = -(long)un;
+	else
+	    *nptr = (long)un;
+    }
+    if (unptr != NULL)
+	*unptr = un;
+}
+
+/*
+ * Return the value of a single hex character.
+ * Only valid when the argument is '0' - '9', 'A' - 'F' or 'a' - 'f'.
+ */
+    int
+hex2nr(c)
+    int		c;
+{
+    if (c >= 'a' && c <= 'f')
+	return c - 'a' + 10;
+    if (c >= 'A' && c <= 'F')
+	return c - 'A' + 10;
+    return c - '0';
+}
+
+#if defined(FEAT_TERMRESPONSE) \
+	|| (defined(FEAT_GUI_GTK) && defined(FEAT_WINDOWS)) || defined(PROTO)
+/*
+ * Convert two hex characters to a byte.
+ * Return -1 if one of the characters is not hex.
+ */
+    int
+hexhex2nr(p)
+    char_u	*p;
+{
+    if (!vim_isxdigit(p[0]) || !vim_isxdigit(p[1]))
+	return -1;
+    return (hex2nr(p[0]) << 4) + hex2nr(p[1]);
+}
+#endif
+
+/*
+ * Return TRUE if "str" starts with a backslash that should be removed.
+ * For MS-DOS, WIN32 and OS/2 this is only done when the character after the
+ * backslash is not a normal file name character.
+ * '$' is a valid file name character, we don't remove the backslash before
+ * it.  This means it is not possible to use an environment variable after a
+ * backslash.  "C:\$VIM\doc" is taken literally, only "$VIM\doc" works.
+ * Although "\ name" is valid, the backslash in "Program\ files" must be
+ * removed.  Assume a file name doesn't start with a space.
+ * For multi-byte names, never remove a backslash before a non-ascii
+ * character, assume that all multi-byte characters are valid file name
+ * characters.
+ */
+    int
+rem_backslash(str)
+    char_u  *str;
+{
+#ifdef BACKSLASH_IN_FILENAME
+    return (str[0] == '\\'
+# ifdef FEAT_MBYTE
+	    && str[1] < 0x80
+# endif
+	    && (str[1] == ' '
+		|| (str[1] != NUL
+		    && str[1] != '*'
+		    && str[1] != '?'
+		    && !vim_isfilec(str[1]))));
+#else
+    return (str[0] == '\\' && str[1] != NUL);
+#endif
+}
+
+/*
+ * Halve the number of backslashes in a file name argument.
+ * For MS-DOS we only do this if the character after the backslash
+ * is not a normal file character.
+ */
+    void
+backslash_halve(p)
+    char_u	*p;
+{
+    for ( ; *p; ++p)
+	if (rem_backslash(p))
+	    STRMOVE(p, p + 1);
+}
+
+/*
+ * backslash_halve() plus save the result in allocated memory.
+ */
+    char_u *
+backslash_halve_save(p)
+    char_u	*p;
+{
+    char_u	*res;
+
+    res = vim_strsave(p);
+    if (res == NULL)
+	return p;
+    backslash_halve(res);
+    return res;
+}
+
+#if (defined(EBCDIC) && defined(FEAT_POSTSCRIPT)) || defined(PROTO)
+/*
+ * Table for EBCDIC to ASCII conversion unashamedly taken from xxd.c!
+ * The first 64 entries have been added to map control characters defined in
+ * ascii.h
+ */
+static char_u ebcdic2ascii_tab[256] =
+{
+    0000, 0001, 0002, 0003, 0004, 0011, 0006, 0177,
+    0010, 0011, 0012, 0013, 0014, 0015, 0016, 0017,
+    0020, 0021, 0022, 0023, 0024, 0012, 0010, 0027,
+    0030, 0031, 0032, 0033, 0033, 0035, 0036, 0037,
+    0040, 0041, 0042, 0043, 0044, 0045, 0046, 0047,
+    0050, 0051, 0052, 0053, 0054, 0055, 0056, 0057,
+    0060, 0061, 0062, 0063, 0064, 0065, 0066, 0067,
+    0070, 0071, 0072, 0073, 0074, 0075, 0076, 0077,
+    0040, 0240, 0241, 0242, 0243, 0244, 0245, 0246,
+    0247, 0250, 0325, 0056, 0074, 0050, 0053, 0174,
+    0046, 0251, 0252, 0253, 0254, 0255, 0256, 0257,
+    0260, 0261, 0041, 0044, 0052, 0051, 0073, 0176,
+    0055, 0057, 0262, 0263, 0264, 0265, 0266, 0267,
+    0270, 0271, 0313, 0054, 0045, 0137, 0076, 0077,
+    0272, 0273, 0274, 0275, 0276, 0277, 0300, 0301,
+    0302, 0140, 0072, 0043, 0100, 0047, 0075, 0042,
+    0303, 0141, 0142, 0143, 0144, 0145, 0146, 0147,
+    0150, 0151, 0304, 0305, 0306, 0307, 0310, 0311,
+    0312, 0152, 0153, 0154, 0155, 0156, 0157, 0160,
+    0161, 0162, 0136, 0314, 0315, 0316, 0317, 0320,
+    0321, 0345, 0163, 0164, 0165, 0166, 0167, 0170,
+    0171, 0172, 0322, 0323, 0324, 0133, 0326, 0327,
+    0330, 0331, 0332, 0333, 0334, 0335, 0336, 0337,
+    0340, 0341, 0342, 0343, 0344, 0135, 0346, 0347,
+    0173, 0101, 0102, 0103, 0104, 0105, 0106, 0107,
+    0110, 0111, 0350, 0351, 0352, 0353, 0354, 0355,
+    0175, 0112, 0113, 0114, 0115, 0116, 0117, 0120,
+    0121, 0122, 0356, 0357, 0360, 0361, 0362, 0363,
+    0134, 0237, 0123, 0124, 0125, 0126, 0127, 0130,
+    0131, 0132, 0364, 0365, 0366, 0367, 0370, 0371,
+    0060, 0061, 0062, 0063, 0064, 0065, 0066, 0067,
+    0070, 0071, 0372, 0373, 0374, 0375, 0376, 0377
+};
+
+/*
+ * Convert a buffer worth of characters from EBCDIC to ASCII.  Only useful if
+ * wanting 7-bit ASCII characters out the other end.
+ */
+    void
+ebcdic2ascii(buffer, len)
+    char_u	*buffer;
+    int		len;
+{
+    int		i;
+
+    for (i = 0; i < len; i++)
+	buffer[i] = ebcdic2ascii_tab[buffer[i]];
+}
+#endif
+
+#include "main.h"
+#include "os/os.h"
+#include "globals.h"
+#include "splash.h"
+#include "core/register_core_types.h"
+#include "scene/register_scene_types.h"
+#include "drivers/register_driver_types.h"
+#include "servers/register_server_types.h"
+#include "modules/register_module_types.h"
+#include "script_debugger_local.h"
+#include "script_debugger_remote.h"
+#include "message_queue.h"
+#include "path_remap.h"
+#include "input_map.h"
+#include "io/resource_loader.h"
+#include "scene/main/scene_main_loop.h"
+
+
+#include "script_language.h"
+#include "io/resource_loader.h"
+
+#include "bin/tests/test_main.h"
+#include "os/dir_access.h"
+#include "core/io/ip.h"
+#include "scene/resources/packed_scene.h"
+#include "scene/main/viewport.h"
+
+#ifdef TOOLS_ENABLED
+#include "tools/editor/editor_node.h"
+#include "tools/editor/project_manager.h"
+#include "tools/editor/console.h"
+#include "tools/pck/pck_packer.h"
+#endif
+
+#include "io/file_access_network.h"
+#include "tools/doc/doc_data.h"
+
+
+#include "servers/spatial_sound_server.h"
+#include "servers/spatial_sound_2d_server.h"
+#include "servers/physics_2d_server.h"
+
+
+#include "core/io/stream_peer_tcp.h"
+#include "core/os/thread.h"
+#include "core/io/file_access_pack.h"
+#include "core/io/file_access_zip.h"
+#include "translation.h"
+#include "version.h"
+
+#include "performance.h"
+
+static Globals *globals=NULL;
+static InputMap *input_map=NULL;
+static bool _start_success=false;
+static ScriptDebugger *script_debugger=NULL;
+
+static MessageQueue *message_queue=NULL;
+static Performance *performance = NULL;
+static PathRemap *path_remap;
+static PackedData *packed_data=NULL;
+static FileAccessNetworkClient *file_access_network_client=NULL;
+static TranslationServer *translation_server = NULL;
+
+static OS::VideoMode video_mode;
+static int video_driver_idx=-1;
+static int audio_driver_idx=-1;
+static String locale;
+
+static String unescape_cmdline(const String& p_str) {
+
+	return p_str.replace("%20"," ");
+}
+
+
+//#define DEBUG_INIT
+
+#ifdef DEBUG_INIT
+#define MAIN_PRINT(m_txt) print_line(m_txt)
+#else
+#define MAIN_PRINT(m_txt)
+#endif
+
+void Main::print_help(const char* p_binary) {
+
+	OS::get_singleton()->print(VERSION_FULL_NAME" (c) 2008-2015 Juan Linietsky, Ariel Manzur.\n");
+	OS::get_singleton()->print("Usage: %s [options] [scene]\n",p_binary);
+	OS::get_singleton()->print("Options:\n");
+	OS::get_singleton()->print("\t-path [dir] : Path to a game, containing engine.cfg\n");
+#ifdef TOOLS_ENABLED
+	OS::get_singleton()->print("\t-e,-editor : Bring up the editor instead of running the scene.\n");
+#endif
+	OS::get_singleton()->print("\t-test [test] : Run a test.\n");
+	OS::get_singleton()->print("\t\t(");
+	const char **test_names=tests_get_names();
+	const char* coma = "";
+	while(*test_names) {
+
+		OS::get_singleton()->print("%s%s", coma, *test_names);
+		test_names++;
+		coma = ", ";
+	}
+	OS::get_singleton()->print(")\n");
+
+	OS::get_singleton()->print("\t-r WIDTHxHEIGHT\t : Request Screen Resolution\n");
+	OS::get_singleton()->print("\t-f\t\t : Request Fullscreen\n");
+	OS::get_singleton()->print("\t-vd DRIVER\t : Video Driver (");
+	for (int i=0;i<OS::get_singleton()->get_video_driver_count();i++) {
+
+		if (i!=0)
+			OS::get_singleton()->print(", ");
+		OS::get_singleton()->print("%s",OS::get_singleton()->get_video_driver_name(i));
+	}
+	OS::get_singleton()->print(")\n");
+	OS::get_singleton()->print("\t-ad DRIVER\t : Audio Driver (");
+	for (int i=0;i<OS::get_singleton()->get_audio_driver_count();i++) {
+
+		if (i!=0)
+			OS::get_singleton()->print(", ");
+		OS::get_singleton()->print("%s",OS::get_singleton()->get_audio_driver_name(i));
+	}
+    OS::get_singleton()->print(")\n");
+	OS::get_singleton()->print("\t-rthread <mode>\t : Render Thread Mode ('unsafe', 'safe', 'separate).");
+	OS::get_singleton()->print(")\n");
+	OS::get_singleton()->print("\t-s,-script [script] : Run a script.\n");
+	OS::get_singleton()->print("\t-d,-debug : Debug (local stdout debugger).\n");
+	OS::get_singleton()->print("\t-rdebug ADDRESS : Remote debug (<ip>:<port> host address).\n");
+	OS::get_singleton()->print("\t-fdelay [msec]: Simulate high CPU load (delay each frame by [msec]).\n");
+	OS::get_singleton()->print("\t-timescale [msec]: Simulate high CPU load (delay each frame by [msec]).\n");
+	OS::get_singleton()->print("\t-bp : breakpoint list as source::line comma separated pairs, no spaces (%%20,%%2C,etc instead).\n");
+	OS::get_singleton()->print("\t-v : Verbose stdout mode\n");
+	OS::get_singleton()->print("\t-lang [locale]: Use a specific locale\n");
+	OS::get_singleton()->print("\t-rfs <host/ip>[:<port>] : Remote FileSystem.\n");
+	OS::get_singleton()->print("\t-rfs_pass <password> : Password for Remote FileSystem.\n");
+#ifdef TOOLS_ENABLED
+	OS::get_singleton()->print("\t-doctool FILE: Dump the whole engine api to FILE in XML format. If FILE exists, it will be merged.\n");
+	OS::get_singleton()->print("\t-nodocbase: Disallow dump the base types (used with -doctool).\n");
+	OS::get_singleton()->print("\t-optimize FILE Save an optimized copy of scene to FILE.\n");
+	OS::get_singleton()->print("\t-optimize_preset [preset] Use a given preset for optimization.\n");
+	OS::get_singleton()->print("\t-export [target] Export the project using given export target.\n");
+#endif
+}
+
+
+Error Main::setup(const char *execpath,int argc, char *argv[],bool p_second_phase) {
+
+	RID_OwnerBase::init_rid();
+
+	OS::get_singleton()->initialize_core();
+	ObjectTypeDB::init();
+
+	MAIN_PRINT("Main: Initialize CORE");
+
+	register_core_types();
+	register_core_driver_types();
+
+	MAIN_PRINT("Main: Initialize Globals");
+
+
+	Thread::_main_thread_id = Thread::get_caller_ID();
+
+	globals = memnew( Globals );
+	input_map = memnew( InputMap );
+
+
+	path_remap = memnew( PathRemap );
+	translation_server = memnew( TranslationServer );
+	performance = memnew( Performance );
+	globals->add_singleton(Globals::Singleton("Performance",performance));
+
+	MAIN_PRINT("Main: Parse CMDLine");
+
+	/* argument parsing and main creation */
+	List<String> args;
+	List<String> main_args;
+
+	for(int i=0;i<argc;i++) {
+
+		args.push_back(String::utf8(argv[i]));
+	}
+
+	List<String>::Element *I=args.front();
+
+	I=args.front();
+
+	while (I) {
+
+		I->get()=unescape_cmdline(I->get().strip_escapes());
+//		print_line("CMD: "+I->get());
+		I=I->next();
+	}
+
+	I=args.front();
+
+	video_mode = OS::get_singleton()->get_default_video_mode();
+
+	String video_driver="";
+	String audio_driver="";
+	String game_path=".";
+	String debug_mode;
+	String debug_host;
+	String main_pack;
+	bool quiet_stdout=false;
+	int rtm=-1;
+
+	String remotefs;
+	String remotefs_pass;
+
+	String screen = "";
+
+	List<String> pack_list;
+	Vector<String> breakpoints;
+	bool use_custom_res=true;
+	bool force_res=false;
+
+	I=args.front();
+
+	packed_data = PackedData::get_singleton();
+	if (!packed_data)
+		packed_data = memnew(PackedData);
+
+#ifdef MINIZIP_ENABLED
+	packed_data->add_pack_source(ZipArchive::get_singleton());
+#endif
+
+	bool editor=false;
+
+	while(I) {
+
+		List<String>::Element *N=I->next();
+
+		if (I->get() == "-noop") {
+
+			// no op
+		} else if (I->get()=="-h" || I->get()=="--help" || I->get()=="/?") { // resolution
+
+			goto error;
+
+
+		} else if (I->get()=="-r") { // resolution
+
+			if (I->next()) {
+
+				String vm=I->next()->get();
+
+				if (vm.find("x")==-1) { // invalid parameter format
+
+					goto error;
+
+
+				}
+
+				int w=vm.get_slice("x",0).to_int();
+				int h=vm.get_slice("x",1).to_int();
+
+				if (w==0 || h==0) {
+
+					goto error;
+
+				}
+
+				video_mode.width=w;
+				video_mode.height=h;
+				force_res=true;
+
+				N=I->next()->next();
+			} else {
+				goto error;
+
+
+			}
+
+		} else if (I->get()=="-vd") { // video driver
+
+			if (I->next()) {
+
+				video_driver=I->next()->get();
+				N=I->next()->next();
+			} else {
+				goto error;
+
+			}
+		} else if (I->get()=="-lang") { // language
+
+			if (I->next()) {
+
+				locale=I->next()->get();
+				N=I->next()->next();
+			} else {
+				goto error;
+
+			}
+		} else if (I->get()=="-rfs") { // language
+
+			if (I->next()) {
+
+				remotefs=I->next()->get();
+				N=I->next()->next();
+			} else {
+				goto error;
+
+			}
+		} else if (I->get()=="-rfs_pass") { // language
+
+			if (I->next()) {
+
+				remotefs_pass=I->next()->get();
+				N=I->next()->next();
+			} else {
+				goto error;
+
+			}
+		} else if (I->get()=="-rthread") { // language
+
+			if (I->next()) {
+
+				if (I->next()->get()=="safe")
+					rtm=OS::RENDER_THREAD_SAFE;
+				else if (I->next()->get()=="unsafe")
+					rtm=OS::RENDER_THREAD_UNSAFE;
+				else if (I->next()->get()=="separate")
+					rtm=OS::RENDER_SEPARATE_THREAD;
+
+
+				N=I->next()->next();
+			} else {
+				goto error;
+
+			}
+
+		} else if (I->get()=="-ad") { // video driver
+
+			if (I->next()) {
+
+				audio_driver=I->next()->get();
+				N=I->next()->next();
+			} else {
+				goto error;
+
+			}
+
+		} else if (I->get()=="-f") { // fullscreen
+
+			video_mode.fullscreen=true;
+		} else if (I->get()=="-e" || I->get()=="-editor") { // fonud editor
+
+			editor=true;
+
+		} else if (I->get()=="-nowindow") { // fullscreen
+
+			OS::get_singleton()->set_no_window_mode(true);
+		} else if (I->get()=="-quiet") { // fullscreen
+
+			quiet_stdout=true;
+		} else if (I->get()=="-v") { // fullscreen
+			OS::get_singleton()->_verbose_stdout=true;
+		} else if (I->get()=="-path") { // resolution
+
+			if (I->next()) {
+
+				String p = I->next()->get();
+				if (OS::get_singleton()->set_cwd(p)==OK) {
+					//nothing
+				} else {
+					game_path=I->next()->get(); //use game_path instead
+				}
+
+				N=I->next()->next();
+			} else {
+				goto error;
+
+			}
+		} else if (I->get()=="-bp") { // /breakpoints
+
+			if (I->next()) {
+
+				String bplist = I->next()->get();
+				breakpoints= bplist.split(",");
+				N=I->next()->next();
+			} else {
+				goto error;
+
+			}
+
+
+		} else if (I->get()=="-fdelay") { // resolution
+
+			if (I->next()) {
+
+				OS::get_singleton()->set_frame_delay(I->next()->get().to_int());
+				N=I->next()->next();
+			} else {
+				goto error;
+
+			}
+
+		} else if (I->get()=="-timescale") { // resolution
+
+			if (I->next()) {
+
+				OS::get_singleton()->set_time_scale(I->next()->get().to_double());
+				N=I->next()->next();
+			} else {
+				goto error;
+
+			}
+
+
+		} else if (I->get() == "-pack") {
+
+			if (I->next()) {
+
+				pack_list.push_back(I->next()->get());
+				N = I->next()->next();
+			} else {
+
+				goto error;
+			};
+
+		} else if (I->get() == "-main_pack") {
+
+			if (I->next()) {
+
+				main_pack=I->next()->get();
+				N = I->next()->next();
+			} else {
+
+				goto error;
+			};
+
+		} else if (I->get()=="-debug" || I->get()=="-d") {
+			debug_mode="local";
+		} else if (I->get()=="-editor_scene") {
+
+			if (I->next()) {
+
+				Globals::get_singleton()->set("editor_scene",game_path=I->next()->get());
+			} else {
+				goto error;
+
+			}
+
+		} else if (I->get()=="-rdebug") {
+			if (I->next()) {
+
+				debug_mode="remote";
+				debug_host=I->next()->get();
+				if (debug_host.find(":")==-1) //wrong host
+					goto error;
+				N=I->next()->next();
+			} else {
+				goto error;
+
+			}
+		} else {
+
+			//test for game path
+			bool gpfound=false;
+
+			if (!I->get().begins_with("-") && game_path=="") {
+				DirAccess* da = DirAccess::open(I->get());
+				if (da!=NULL) {
+					game_path=I->get();
+					gpfound=true;
+					memdelete(da);
+				}
+
+			}
+
+			if (!gpfound) {
+				main_args.push_back(I->get());
+			}
+		}
+
+		I=N;
+	}
+
+
+
+	if (debug_mode == "remote") {
+
+		ScriptDebuggerRemote *sdr = memnew( ScriptDebuggerRemote );
+		uint16_t debug_port = GLOBAL_DEF("debug/remote_port",6007);
+		if (debug_host.find(":")!=-1) {
+		    debug_port=debug_host.get_slice(":",1).to_int();
+		    debug_host=debug_host.get_slice(":",0);
+		}
+		Error derr = sdr->connect_to_host(debug_host,debug_port);
+
+		if (derr!=OK) {
+			memdelete(sdr);
+		} else {
+			script_debugger=sdr;
+
+		}
+	} else if (debug_mode=="local") {
+
+		script_debugger = memnew( ScriptDebuggerLocal );
+	}
+
+
+	if (remotefs!="") {
+
+		file_access_network_client=memnew(FileAccessNetworkClient);
+		int port;
+		if (remotefs.find(":")!=-1) {
+			port=remotefs.get_slice(":",1).to_int();
+			remotefs=remotefs.get_slice(":",0);
+		} else {
+			port=6010;
+		}
+
+		Error err = file_access_network_client->connect(remotefs,port,remotefs_pass);
+		if (err) {
+			OS::get_singleton()->printerr("Could not connect to remotefs: %s:%i\n",remotefs.utf8().get_data(),port);
+			goto error;
+		}
+
+		FileAccess::make_default<FileAccessNetwork>(FileAccess::ACCESS_RESOURCES);
+	}
+	if (script_debugger) {
+		//there is a debugger, parse breakpoints
+
+		for(int i=0;i<breakpoints.size();i++) {
+
+			String bp = breakpoints[i];
+			int sp=bp.find_last(":");
+			if (sp==-1) {
+				ERR_EXPLAIN("Invalid breakpoint: '"+bp+"', expected file:line format.");
+				ERR_CONTINUE(sp==-1);
+			}
+
+			script_debugger->insert_breakpoint(bp.substr(sp+1,bp.length()).to_int(),bp.substr(0,sp));
+		}
+	}
+
+
+#ifdef TOOLS_ENABLED
+	if (editor) {
+		packed_data->set_disabled(true);
+		globals->set_disable_platform_override(true);
+	}
+
+#endif
+
+
+	if (globals->setup(game_path,main_pack)!=OK) {
+
+#ifdef TOOLS_ENABLED
+		editor=false;
+#else
+		OS::get_singleton()->print("error: Couldn't load game path '%s'\n",game_path.ascii().get_data());
+
+		goto error;
+#endif
+	}
+
+	if (editor) {
+		main_args.push_back("-editor");
+		use_custom_res=false;
+	}
+
+	if (bool(Globals::get_singleton()->get("application/disable_stdout"))) {
+		quiet_stdout=true;
+	}
+
+	if (quiet_stdout)
+		_print_line_enabled=false;
+
+	OS::get_singleton()->set_cmdline(execpath, main_args);
+
+#ifdef TOOLS_ENABLED
+
+	if (main_args.size()==0 && (!Globals::get_singleton()->has("application/main_loop_type")) && (!Globals::get_singleton()->has("application/main_scene") || String(Globals::get_singleton()->get("application/main_scene"))==""))
+		use_custom_res=false; //project manager (run without arguments)
+
+#endif
+
+	input_map->load_from_globals();
+
+	if (video_driver=="") // specified in engine.cfg
+		video_driver=_GLOBAL_DEF("display/driver",Variant((const char*)OS::get_singleton()->get_video_driver_name(0)));
+
+	if (!force_res && use_custom_res && globals->has("display/width"))
+		video_mode.width=globals->get("display/width");
+	if (!force_res &&use_custom_res && globals->has("display/height"))
+		video_mode.height=globals->get("display/height");
+	if (use_custom_res && globals->has("display/fullscreen"))
+		video_mode.fullscreen=globals->get("display/fullscreen");
+	if (use_custom_res && globals->has("display/resizable"))
+		video_mode.resizable=globals->get("display/resizable");
+
+	if (!force_res && use_custom_res && globals->has("display/test_width") && globals->has("display/test_height")) {
+		int tw = globals->get("display/test_width");
+		int th = globals->get("display/test_height");
+		if (tw>0 && th>0) {
+			video_mode.width=tw;
+			video_mode.height=th;
+		}
+	}
+
+
+	GLOBAL_DEF("display/width",video_mode.width);
+	GLOBAL_DEF("display/height",video_mode.height);
+	GLOBAL_DEF("display/fullscreen",video_mode.fullscreen);
+	GLOBAL_DEF("display/resizable",video_mode.resizable);
+	GLOBAL_DEF("display/test_width",0);
+	GLOBAL_DEF("display/test_height",0);
+	if (rtm==-1) {
+		rtm=GLOBAL_DEF("render/thread_model",OS::RENDER_THREAD_SAFE);
+	}
+
+	if (rtm>=0 && rtm<3)
+		OS::get_singleton()->_render_thread_mode=OS::RenderThreadMode(rtm);
+
+
+
+	/* Determine Video Driver */
+
+	if (audio_driver=="") // specified in engine.cfg
+		audio_driver=GLOBAL_DEF("audio/driver",OS::get_singleton()->get_audio_driver_name(0));
+
+
+	for (int i=0;i<OS::get_singleton()->get_video_driver_count();i++) {
+
+		if (video_driver==OS::get_singleton()->get_video_driver_name(i)) {
+
+			video_driver_idx=i;
+			break;
+		}
+	}
+
+	if (video_driver_idx<0) {
+
+		OS::get_singleton()->alert( "Invalid Video Driver: "+video_driver );
+		video_driver_idx = 0;
+		//goto error;
+	}
+
+	for (int i=0;i<OS::get_singleton()->get_audio_driver_count();i++) {
+
+		if (audio_driver==OS::get_singleton()->get_audio_driver_name(i)) {
+
+			audio_driver_idx=i;
+			break;
+		}
+	}
+
+	if (audio_driver_idx<0) {
+
+		OS::get_singleton()->alert( "Invalid Audio Driver: "+audio_driver );
+		goto error;
+	}
+
+	{
+		String orientation = GLOBAL_DEF("display/orientation","landscape");
+
+		if (orientation=="portrait")
+			OS::get_singleton()->set_screen_orientation(OS::SCREEN_PORTRAIT);
+		else if (orientation=="reverse_landscape")
+			OS::get_singleton()->set_screen_orientation(OS::SCREEN_REVERSE_LANDSCAPE);
+		else if (orientation=="reverse_portrait")
+			OS::get_singleton()->set_screen_orientation(OS::SCREEN_REVERSE_PORTRAIT);
+		else if (orientation=="sensor_landscape")
+			OS::get_singleton()->set_screen_orientation(OS::SCREEN_SENSOR_LANDSCAPE);
+		else if (orientation=="sensor_portrait")
+			OS::get_singleton()->set_screen_orientation(OS::SCREEN_SENSOR_PORTRAIT);
+		else if (orientation=="sensor")
+			OS::get_singleton()->set_screen_orientation(OS::SCREEN_SENSOR);
+		else
+			OS::get_singleton()->set_screen_orientation(OS::SCREEN_LANDSCAPE);
+	}
+
+	OS::get_singleton()->set_iterations_per_second(GLOBAL_DEF("physics/fixed_fps",60));
+	OS::get_singleton()->set_target_fps(GLOBAL_DEF("application/target_fps",0));
+
+	if (!OS::get_singleton()->_verbose_stdout) //overrided
+		OS::get_singleton()->_verbose_stdout=GLOBAL_DEF("debug/verbose_stdout",false);
+
+	message_queue = memnew( MessageQueue );
+
+	Globals::get_singleton()->register_global_defaults();
+
+	if (p_second_phase)
+		return setup2();
+
+	return OK;
+
+	error:
+
+	video_driver="";
+	audio_driver="";
+	game_path="";
+
+	args.clear();
+	main_args.clear();
+
+	print_help(execpath);
+
+
+	if (performance)
+		memdelete(performance);
+	if (input_map)
+		memdelete(input_map);
+	if (translation_server)
+		memdelete( translation_server );
+	if (globals)
+		memdelete(globals);
+	if (script_debugger)
+		memdelete(script_debugger);
+	if (packed_data)
+		memdelete(packed_data);
+	if (file_access_network_client)
+		memdelete(file_access_network_client);
+	unregister_core_types();
+
+	OS::get_singleton()->_cmdline.clear();
+
+	if (message_queue)
+		memdelete( message_queue);
+	OS::get_singleton()->finalize_core();
+	locale=String();
+
+	return ERR_INVALID_PARAMETER;
+}
+
+Error Main::setup2() {
+
+
+	OS::get_singleton()->initialize(video_mode,video_driver_idx,audio_driver_idx);
+
+	register_core_singletons();
+
+	MAIN_PRINT("Main: Setup Logo");
+
+	bool show_logo=true;
+#ifdef JAVASCRIPT_ENABLED
+	show_logo=false;
+#endif
+
+	if (show_logo) { //boot logo!
+		Image boot_logo=GLOBAL_DEF("application/boot_logo",Image());
+
+		if (!boot_logo.empty()) {
+			Color clear = GLOBAL_DEF("render/default_clear_color",Color(0.3,0.3,0.3));
+			VisualServer::get_singleton()->set_default_clear_color(clear);
+			Color boot_bg = GLOBAL_DEF("application/boot_bg_color", clear);
+			VisualServer::get_singleton()->set_boot_image(boot_logo, boot_bg);
+#ifndef TOOLS_ENABLED
+			//no tools, so free the boot logo (no longer needed)
+			Globals::get_singleton()->set("application/boot_logo",Image());
+#endif
+
+		} else {
+#ifndef NO_DEFAULT_BOOT_LOGO
+
+			MAIN_PRINT("Main: Create botsplash");
+			Image splash(boot_splash_png);
+
+			MAIN_PRINT("Main: ClearColor");
+			VisualServer::get_singleton()->set_default_clear_color(boot_splash_bg_color);
+			MAIN_PRINT("Main: Image");
+			VisualServer::get_singleton()->set_boot_image(splash, boot_splash_bg_color);
+#endif
+			MAIN_PRINT("Main: DCC");
+			VisualServer::get_singleton()->set_default_clear_color(GLOBAL_DEF("render/default_clear_color",Color(0.3,0.3,0.3)));
+			MAIN_PRINT("Main: END");
+		}
+
+		Image icon(app_icon_png);
+		OS::get_singleton()->set_icon(icon);
+	}
+	GLOBAL_DEF("application/icon",String());
+	Globals::get_singleton()->set_custom_property_info("application/icon",PropertyInfo(Variant::STRING,"application/icon",PROPERTY_HINT_FILE,"*.png,*.webp"));
+
+	MAIN_PRINT("Main: Load Remaps");
+
+	path_remap->load_remaps();
+
+	MAIN_PRINT("Main: Load Scene Types");
+
+	register_scene_types();
+	register_server_types();
+
+#ifdef TOOLS_ENABLED
+	EditorNode::register_editor_types();
+	ObjectTypeDB::register_type<PCKPacker>(); // todo: move somewhere else
+#endif
+
+	MAIN_PRINT("Main: Load Scripts, Modules, Drivers");
+
+	register_module_types();
+	register_driver_types();
+
+	ScriptServer::init_languages();
+
+	MAIN_PRINT("Main: Load Translations");
+
+	translation_server->setup(); //register translations, load them, etc.
+	if (locale!="") {
+
+		translation_server->set_locale(locale);
+	}
+	translation_server->load_translations();
+
+
+
+	_start_success=true;
+	locale=String();
+
+	MAIN_PRINT("Main: Done");
+
+	return OK;
+
+}
+
+
+
+bool Main::start() {
+
+	ERR_FAIL_COND_V(!_start_success,false);
+
+	bool editor=false;
+	String doc_tool;
+	bool doc_base=true;
+	String game_path;
+	String script;
+	String test;
+	String screen;
+	String optimize;
+	String optimize_preset;
+	String _export_platform;
+	String _import;
+	String _import_script;
+	String dumpstrings;
+	bool noquit=false;
+	bool convert_old=false;
+	bool export_debug=false;
+	List<String> args = OS::get_singleton()->get_cmdline_args();
+	for (int i=0;i<args.size();i++) {
+
+
+		if (args[i]=="-doctool" && i <(args.size()-1)) {
+
+			doc_tool=args[i+1];
+			i++;
+		}else if (args[i]=="-nodocbase") {
+
+			doc_base=false;
+		} else if ((args[i]=="-script" || args[i]=="-s") && i <(args.size()-1)) {
+
+			script=args[i+1];
+			i++;
+		} else if ((args[i]=="-level" || args[i]=="-l") && i <(args.size()-1)) {
+
+			OS::get_singleton()->_custom_level=args[i+1];
+			i++;
+		} else if (args[i]=="-test" && i <(args.size()-1)) {
+			test=args[i+1];
+			i++;
+		} else if (args[i]=="-optimize" && i <(args.size()-1)) {
+			optimize=args[i+1];
+			i++;
+		} else if (args[i]=="-optimize_preset" && i <(args.size()-1)) {
+			optimize_preset=args[i+1];
+			i++;
+		} else if (args[i]=="-export" && i <(args.size()-1)) {
+			editor=true; //needs editor
+			_export_platform=args[i+1];
+			i++;
+		} else if (args[i]=="-export_debug" && i <(args.size()-1)) {
+			editor=true; //needs editor
+			_export_platform=args[i+1];
+			export_debug=true;
+			i++;
+		} else if (args[i]=="-import" && i <(args.size()-1)) {
+			editor=true; //needs editor
+			_import=args[i+1];
+			i++;
+		} else if (args[i]=="-import_script" && i <(args.size()-1)) {
+			editor=true; //needs editor
+			_import_script=args[i+1];
+			i++;
+		} else if (args[i]=="-noquit" ) {
+			noquit=true;
+		} else if (args[i]=="-dumpstrings" && i <(args.size()-1)) {
+			editor=true; //needs editor
+			dumpstrings=args[i+1];
+			i++;
+		} else if (args[i]=="-editor" || args[i]=="-e") {
+			editor=true;
+		} else if (args[i]=="-convert_old") {
+			convert_old=true;
+		} else if (args[i].length() && args[i][0] != '-' && game_path == "") {
+
+			game_path=args[i];
+		}
+	}
+
+	if (editor)
+		Globals::get_singleton()->set("editor_active",true);
+
+
+	String main_loop_type;
+#ifdef TOOLS_ENABLED
+	if(doc_tool!="") {
+
+		DocData doc;
+		doc.generate(doc_base);
+
+		DocData docsrc;
+		if (docsrc.load(doc_tool)==OK) {
+			print_line("Doc exists. Merging..");
+			doc.merge_from(docsrc);
+		} else {
+			print_line("No Doc exists. Generating empty.");
+
+		}
+
+		doc.save(doc_tool);
+
+		return false;
+	}
+
+	if (optimize!="")
+		editor=true; //need editor
+
+
+
+#endif
+
+	if(script=="" && game_path=="" && !editor && String(GLOBAL_DEF("application/main_scene",""))!="") {
+		game_path=GLOBAL_DEF("application/main_scene","");
+	}
+
+
+	MainLoop *main_loop=NULL;
+	if (editor) {
+		main_loop = memnew(SceneTree);
+	};
+
+	if (test!="") {
+#ifdef DEBUG_ENABLED
+		main_loop = test_main(test,args);
+
+		if (!main_loop)
+			return false;
+
+#endif
+
+	} else if (script!="") {
+
+		Ref<Script> script_res = ResourceLoader::load(script);
+		ERR_EXPLAIN("Can't load script: "+script);
+		ERR_FAIL_COND_V(script_res.is_null(),false);
+
+		if( script_res->can_instance() /*&& script_res->inherits_from("SceneTreeScripted")*/) {
+
+
+			StringName instance_type=script_res->get_instance_base_type();
+			Object *obj = ObjectTypeDB::instance(instance_type);
+			MainLoop *script_loop = obj?obj->cast_to<MainLoop>():NULL;
+			if (!script_loop) {
+				if (obj)
+					memdelete(obj);
+				ERR_EXPLAIN("Can't load script '"+script+"', it does not inherit from a MainLoop type");
+				ERR_FAIL_COND_V(!script_loop,false);
+			}
+
+
+			script_loop->set_init_script(script_res);
+			main_loop=script_loop;
+		} else {
+
+			return false;
+		}
+
+	} else {
+		main_loop_type=GLOBAL_DEF("application/main_loop_type","");
+	}
+
+	if (!main_loop && main_loop_type=="")
+		main_loop_type="SceneTree";
+
+	if (!main_loop) {
+		if (!ObjectTypeDB::type_exists(main_loop_type)) {
+			OS::get_singleton()->alert("godot: error: MainLoop type doesn't exist: "+main_loop_type);
+			return false;
+		} else {
+
+			Object *ml = ObjectTypeDB::instance(main_loop_type);
+			if (!ml) {
+				ERR_EXPLAIN("Can't instance MainLoop type");
+				ERR_FAIL_V(false);
+			}
+
+			main_loop=ml->cast_to<MainLoop>();
+			if (!main_loop) {
+
+				memdelete(ml);
+				ERR_EXPLAIN("Invalid MainLoop type");
+				ERR_FAIL_V(false);
+
+			}
+		}
+	}
+
+	if (main_loop->is_type("SceneTree")) {
+
+		SceneTree *sml = main_loop->cast_to<SceneTree>();
+
+#ifdef TOOLS_ENABLED
+
+		EditorNode *editor_node=NULL;
+		if (editor) {
+
+			editor_node = memnew( EditorNode );
+			sml->get_root()->add_child(editor_node);
+
+			//root_node->set_editor(editor);
+			//startup editor
+
+			if (_export_platform!="") {
+
+				editor_node->export_platform(_export_platform,game_path,export_debug,"",true);
+				game_path=""; //no load anything
+			}
+		}
+#endif
+
+		if (!editor) {
+			//standard helpers that can be changed from main config
+
+			String stretch_mode = GLOBAL_DEF("display/stretch_mode","disabled");
+			String stretch_aspect = GLOBAL_DEF("display/stretch_aspect","ignore");
+			Size2i stretch_size = Size2(GLOBAL_DEF("display/width",0),GLOBAL_DEF("display/height",0));
+
+			SceneTree::StretchMode sml_sm=SceneTree::STRETCH_MODE_DISABLED;
+			if (stretch_mode=="2d")
+				sml_sm=SceneTree::STRETCH_MODE_2D;
+			else if (stretch_mode=="viewport")
+				sml_sm=SceneTree::STRETCH_MODE_VIEWPORT;
+
+			SceneTree::StretchAspect sml_aspect=SceneTree::STRETCH_ASPECT_IGNORE;
+			if (stretch_aspect=="keep")
+				sml_aspect=SceneTree::STRETCH_ASPECT_KEEP;
+			else if (stretch_aspect=="keep_width")
+				sml_aspect=SceneTree::STRETCH_ASPECT_KEEP_WIDTH;
+			else if (stretch_aspect=="keep_height")
+				sml_aspect=SceneTree::STRETCH_ASPECT_KEEP_HEIGHT;
+
+			sml->set_screen_stretch(sml_sm,sml_aspect,stretch_size);
+
+			sml->set_auto_accept_quit(GLOBAL_DEF("application/auto_accept_quit",true));
+			String appname = Globals::get_singleton()->get("application/name");
+			appname = TranslationServer::get_singleton()->translate(appname);
+			OS::get_singleton()->set_window_title(appname);
+
+
+		} else {
+			GLOBAL_DEF("display/stretch_mode","disabled");
+			Globals::get_singleton()->set_custom_property_info("display/stretch_mode",PropertyInfo(Variant::STRING,"display/stretch_mode",PROPERTY_HINT_ENUM,"disabled,2d,viewport"));
+			GLOBAL_DEF("display/stretch_aspect","ignore");
+			Globals::get_singleton()->set_custom_property_info("display/stretch_aspect",PropertyInfo(Variant::STRING,"display/stretch_aspect",PROPERTY_HINT_ENUM,"ignore,keep,keep_width,keep_height"));
+			sml->set_auto_accept_quit(GLOBAL_DEF("application/auto_accept_quit",true));
+
+
+		}
+
+
+		if (game_path!="") {
+
+			String local_game_path=game_path.replace("\\","/");
+
+			if (!local_game_path.begins_with("res://")) {
+				bool absolute=(local_game_path.size()>1) && (local_game_path[0]=='/' || local_game_path[1]==':');
+
+				if (!absolute) {
+
+					if (Globals::get_singleton()->is_using_datapack()) {
+
+						local_game_path="res://"+local_game_path;
+
+					} else {
+						int sep=local_game_path.find_last("/");
+
+						if (sep==-1) {
+							DirAccess *da = DirAccess::create(DirAccess::ACCESS_FILESYSTEM);
+							local_game_path=da->get_current_dir()+"/"+local_game_path;
+							memdelete(da)						;
+						} else {
+
+							DirAccess *da = DirAccess::open(local_game_path.substr(0,sep));
+							if (da) {
+								local_game_path=da->get_current_dir()+"/"+local_game_path.substr(sep+1,local_game_path.length());;
+								memdelete(da);
+							}
+						}
+					}
+
+				}
+			}
+
+			local_game_path=Globals::get_singleton()->localize_path(local_game_path);
+
+#ifdef TOOLS_ENABLED
+			if (editor) {
+
+
+				if (_import!="") {
+
+					//editor_node->import_scene(_import,local_game_path,_import_script);
+					if (!noquit)
+						sml->quit();
+					game_path=""; //no load anything
+				} else {
+
+					Error serr = editor_node->load_scene(local_game_path);
+
+					if (serr==OK) {
+
+						if (optimize!="") {
+
+							editor_node->save_optimized_copy(optimize,optimize_preset);
+							if (!noquit)
+								sml->quit();
+						}
+
+						if (dumpstrings!="") {
+
+							editor_node->save_translatable_strings(dumpstrings);
+							if (!noquit)
+								sml->quit();
+						}
+					}
+				}
+
+				//editor_node->set_edited_scene(game);
+			} else {
+#endif
+
+				{
+					//autoload
+					List<PropertyInfo> props;
+					Globals::get_singleton()->get_property_list(&props);
+					for(List<PropertyInfo>::Element *E=props.front();E;E=E->next()) {
+
+						String s = E->get().name;
+						if (!s.begins_with("autoload/"))
+							continue;
+						String name = s.get_slice("/",1);
+						String path = Globals::get_singleton()->get(s);
+						RES res = ResourceLoader::load(path);
+						ERR_EXPLAIN("Can't autoload: "+path);
+						ERR_CONTINUE(res.is_null());
+						Node *n=NULL;
+						if (res->is_type("PackedScene")) {
+							Ref<PackedScene> ps = res;
+							n=ps->instance();
+						} else if (res->is_type("Script")) {
+							Ref<Script> s = res;
+							StringName ibt = s->get_instance_base_type();
+							ERR_EXPLAIN("Script does not inherit a Node: "+path);
+							ERR_CONTINUE( !ObjectTypeDB::is_type(ibt,"Node") );
+
+							Object *obj = ObjectTypeDB::instance(ibt);
+
+							ERR_EXPLAIN("Cannot instance node for autoload type: "+String(ibt));
+							ERR_CONTINUE( obj==NULL );
+
+							n = obj->cast_to<Node>();
+							n->set_script(s.get_ref_ptr());
+						}
+
+						ERR_EXPLAIN("Path in autoload not a node or script: "+path);
+						ERR_CONTINUE(!n);
+						n->set_name(name);
+						sml->get_root()->add_child(n);
+					}
+
+				}
+
+				Node *scene=NULL;
+				Ref<PackedScene> scenedata = ResourceLoader::load(local_game_path);
+				if (scenedata.is_valid())
+					scene=scenedata->instance();
+
+				ERR_EXPLAIN("Failed loading scene: "+local_game_path);
+				ERR_FAIL_COND_V(!scene,false)
+				sml->get_root()->add_child(scene);
+
+				String iconpath = GLOBAL_DEF("application/icon","Variant()""");
+				if (iconpath!="") {
+					Image icon;
+					if (icon.load(iconpath)==OK)
+						OS::get_singleton()->set_icon(icon);
+				}
+
+
+				//singletons
+#ifdef TOOLS_ENABLED
+			}
+#endif
+		}
+
+#ifdef TOOLS_ENABLED
+
+		/*if (_export_platform!="") {
+			sml->quit();
+		}*/
+
+		/*
+		if (sml->get_root_node()) {
+			Console *console = memnew( Console );
+			sml->get_root_node()->cast_to<RootNode>()->set_console(console);
+			if (GLOBAL_DEF("console/visible_default",false).operator bool()) {
+				console->show();
+			} else {P
+				console->hide();
+			};
+		}
+*/
+		if (script=="" && test=="" && game_path=="" && !editor) {
+
+			ProjectManager *pmanager = memnew( ProjectManager );
+			sml->get_root()->add_child(pmanager);
+		}
+
+#endif
+	}
+
+	OS::get_singleton()->set_main_loop( main_loop );
+
+	return true;
+}
+
+uint64_t Main::last_ticks=0;
+uint64_t Main::target_ticks=0;
+float Main::time_accum=0;
+uint32_t Main::frames=0;
+uint32_t Main::frame=0;
+bool Main::force_redraw_requested = false;
+
+static uint64_t fixed_process_max=0;
+static uint64_t idle_process_max=0;
+
+
+bool Main::iteration() {
+
+	uint64_t ticks=OS::get_singleton()->get_ticks_usec();
+	uint64_t ticks_elapsed=ticks-last_ticks;
+
+	frame+=ticks_elapsed;
+
+	last_ticks=ticks;
+	double step=(double)ticks_elapsed / 1000000.0;
+
+	float frame_slice=1.0/OS::get_singleton()->get_iterations_per_second();
+
+	if (step>frame_slice*8)
+		step=frame_slice*8;
+
+	time_accum+=step;
+
+	float time_scale = OS::get_singleton()->get_time_scale();
+
+	bool exit=false;
+
+
+	int iters = 0;
+
+	while(time_accum>frame_slice) {
+
+		uint64_t fixed_begin = OS::get_singleton()->get_ticks_usec();
+
+		PhysicsServer::get_singleton()->sync();
+		PhysicsServer::get_singleton()->flush_queries();
+
+		Physics2DServer::get_singleton()->sync();
+		Physics2DServer::get_singleton()->flush_queries();
+
+		if (OS::get_singleton()->get_main_loop()->iteration( frame_slice*time_scale )) {
+			exit=true;
+			break;
+		}
+
+		message_queue->flush();
+
+		PhysicsServer::get_singleton()->step(frame_slice*time_scale);
+		Physics2DServer::get_singleton()->step(frame_slice*time_scale);
+
+		time_accum-=frame_slice;
+		message_queue->flush();
+		//if (AudioServer::get_singleton())
+		//	AudioServer::get_singleton()->update();
+
+		fixed_process_max=MAX(OS::get_singleton()->get_ticks_usec()-fixed_begin,fixed_process_max);
+		iters++;
+	}
+
+	uint64_t idle_begin = OS::get_singleton()->get_ticks_usec();
+
+	OS::get_singleton()->get_main_loop()->idle( step*time_scale );
+	message_queue->flush();
+
+	if (SpatialSoundServer::get_singleton())
+		SpatialSoundServer::get_singleton()->update( step*time_scale );
+	if (SpatialSound2DServer::get_singleton())
+		SpatialSound2DServer::get_singleton()->update( step*time_scale );
+
+
+	if (OS::get_singleton()->can_draw()) {
+
+		if ((!force_redraw_requested) && OS::get_singleton()->is_in_low_processor_usage_mode()) {
+			if (VisualServer::get_singleton()->has_changed()) {
+				VisualServer::get_singleton()->draw(); // flush visual commands
+				OS::get_singleton()->frames_drawn++;
+			}
+		} else {
+			VisualServer::get_singleton()->draw(); // flush visual commands
+			OS::get_singleton()->frames_drawn++;
+			force_redraw_requested = false;
+		}
+	} else {
+		VisualServer::get_singleton()->flush(); // flush visual commands
+	}
+
+	if (AudioServer::get_singleton())
+		AudioServer::get_singleton()->update();
+
+	for(int i=0;i<ScriptServer::get_language_count();i++) {
+		ScriptServer::get_language(i)->frame();
+	}
+
+	idle_process_max=MAX(OS::get_singleton()->get_ticks_usec()-idle_begin,idle_process_max);
+
+	if (script_debugger)
+		script_debugger->idle_poll();
+
+
+	//	x11_delay_usec(10000);
+	frames++;
+
+	if (frame>1000000) {
+
+		if (GLOBAL_DEF("debug/print_fps", OS::get_singleton()->is_stdout_verbose())) {
+			print_line("FPS: "+itos(frames));
+		};
+
+		OS::get_singleton()->_fps=frames;
+		performance->set_process_time(idle_process_max/1000000.0);
+		performance->set_fixed_process_time(fixed_process_max/1000000.0);
+		idle_process_max=0;
+		fixed_process_max=0;
+
+		if (GLOBAL_DEF("debug/print_metrics", false)) {
+
+			//PerformanceMetrics::print();
+		};
+
+		frame%=1000000;
+		frames=0;
+	}
+
+	if (OS::get_singleton()->is_in_low_processor_usage_mode() || !OS::get_singleton()->can_draw())
+		OS::get_singleton()->delay_usec(25000); //apply some delay to force idle time
+	else {
+		uint32_t frame_delay = OS::get_singleton()->get_frame_delay();
+		if (frame_delay)
+			OS::get_singleton()->delay_usec( OS::get_singleton()->get_frame_delay()*1000 );
+	}
+
+	int taret_fps = OS::get_singleton()->get_target_fps();
+	if (taret_fps>0) {
+		uint64_t time_step = 1000000L/taret_fps;
+		target_ticks += time_step;
+		uint64_t current_ticks = OS::get_singleton()->get_ticks_usec();
+		if (current_ticks<target_ticks) OS::get_singleton()->delay_usec(target_ticks-current_ticks);
+		current_ticks = OS::get_singleton()->get_ticks_usec();
+		target_ticks = MIN(MAX(target_ticks,current_ticks-time_step),current_ticks+time_step);
+	}
+
+	return exit;
+}
+
+void Main::force_redraw() {
+
+	force_redraw_requested = true;
+};
+
+
+void Main::cleanup() {
+
+	ERR_FAIL_COND(!_start_success);
+
+	if (script_debugger)
+		memdelete(script_debugger);
+
+	OS::get_singleton()->delete_main_loop();
+
+	OS::get_singleton()->_cmdline.clear();
+	OS::get_singleton()->_execpath="";
+	OS::get_singleton()->_local_clipboard="";
+
+#ifdef TOOLS_ENABLED
+	EditorNode::unregister_editor_types();
+#endif
+
+	unregister_driver_types();
+	unregister_module_types();
+	unregister_scene_types();
+	unregister_server_types();
+
+	OS::get_singleton()->finalize();
+
+	if (packed_data)
+		memdelete(packed_data);
+	if (file_access_network_client)
+		memdelete(file_access_network_client);
+	if (performance)
+		memdelete(performance);
+	if (input_map)
+		memdelete(input_map);
+	if (translation_server)
+		memdelete( translation_server );
+	if (path_remap)
+		memdelete(path_remap);
+	if (globals)
+		memdelete(globals);
+
+	memdelete( message_queue );
+
+	unregister_core_driver_types();
+	unregister_core_types();
+
+	//PerformanceMetrics::finish();
+	OS::get_singleton()->clear_last_error();
+	OS::get_singleton()->finalize_core();
+
+}
+
+#ifndef MAIN_H
+#define MAIN_H
+
+/**
+	@author Juan Linietsky <reduzio@gmail.com>
+*/
+
+#include "error_list.h"
+#include "typedefs.h"
+
+
+class Main {
+
+	static void print_help(const char* p_binary);
+	static uint64_t last_ticks;
+	static uint64_t target_ticks;
+	static float time_accum;
+	static uint32_t frames;
+	static uint32_t frame;
+	static bool force_redraw_requested;
+public:
+
+	static Error setup(const char *execpath,int argc, char *argv[],bool p_second_phase=true);
+	static Error setup2();
+	static bool start();
+	static bool iteration();
+	static void cleanup();
+	static void force_redraw();
+};
+
+#endif
+
+#include "os_unix.h"
+
+#ifdef UNIX_ENABLED
+
+#include "memory_pool_static_malloc.h"
+#include "os/memory_pool_dynamic_static.h"
+#include "thread_posix.h"
+#include "semaphore_posix.h"
+#include "mutex_posix.h"
+#include "core/os/thread_dummy.h"
+
+//#include "core/io/file_access_buffered_fa.h"
+#include "file_access_unix.h"
+#include "dir_access_unix.h"
+#include "tcp_server_posix.h"
+#include "stream_peer_tcp_posix.h"
+#include "packet_peer_udp_posix.h"
+
+#ifdef __FreeBSD__
+#include <sys/param.h>
+#endif
+#include <stdarg.h>
+#include <sys/time.h>
+#include <sys/wait.h>
+#include <stdlib.h>
+#include <signal.h>
+#include <string.h>
+#include <poll.h>
+#include <errno.h>
+#include <assert.h>
+#include "globals.h"
+void OS_Unix::print_error(const char* p_function,const char* p_file,int p_line,const char *p_code,const char*p_rationale,ErrorType p_type) {
+
+	if (p_rationale && p_rationale[0]) {
+
+		print("\E[1;31;40mERROR: %s: \E[1;37;40m%s\n",p_function,p_rationale);
+		print("\E[0;31;40m   At: %s:%i.\E[0;0;37m\n",p_file,p_line);
+
+	} else {
+		print("\E[1;31;40mERROR: %s: \E[1;37;40m%s\n",p_function,p_code);
+		print("\E[0;31;40m   At: %s:%i.\E[0;0;37m\n",p_file,p_line);
+
+	}
+}
+
+
+void OS_Unix::debug_break() {
+
+	assert(false);
+};
+
+int OS_Unix::get_audio_driver_count() const {
+
+	return 1;
+
+}
+const char * OS_Unix::get_audio_driver_name(int p_driver) const {
+
+	return "dummy";
+}
+
+int OS_Unix::unix_initialize_audio(int p_audio_driver) {
+
+	return 0;
+}
+
+static MemoryPoolStaticMalloc *mempool_static=NULL;
+static MemoryPoolDynamicStatic *mempool_dynamic=NULL;
+
+
+void OS_Unix::initialize_core() {
+
+#ifdef NO_PTHREADS
+	ThreadDummy::make_default();
+	SemaphoreDummy::make_default();
+	MutexDummy::make_default();
+#else
+	ThreadPosix::make_default();
+	SemaphorePosix::make_default();
+	MutexPosix::make_default();
+#endif
+	FileAccess::make_default<FileAccessUnix>(FileAccess::ACCESS_RESOURCES);
+	FileAccess::make_default<FileAccessUnix>(FileAccess::ACCESS_USERDATA);
+	FileAccess::make_default<FileAccessUnix>(FileAccess::ACCESS_FILESYSTEM);
+	//FileAccessBufferedFA<FileAccessUnix>::make_default();
+	DirAccess::make_default<DirAccessUnix>(DirAccess::ACCESS_RESOURCES);
+	DirAccess::make_default<DirAccessUnix>(DirAccess::ACCESS_USERDATA);
+	DirAccess::make_default<DirAccessUnix>(DirAccess::ACCESS_FILESYSTEM);
+
+#ifndef NO_NETWORK
+	TCPServerPosix::make_default();
+	StreamPeerTCPPosix::make_default();
+	PacketPeerUDPPosix::make_default();
+	IP_Unix::make_default();
+#endif
+	mempool_static = new MemoryPoolStaticMalloc;
+	mempool_dynamic = memnew( MemoryPoolDynamicStatic );
+
+	ticks_start=0;
+	ticks_start=get_ticks_usec();
+}
+
+void OS_Unix::finalize_core() {
+
+
+	if (mempool_dynamic)
+		memdelete( mempool_dynamic );
+	if (mempool_static)
+		delete mempool_static;
+
+}
+
+
+void OS_Unix::vprint(const char* p_format, va_list p_list,bool p_stder) {
+
+	if (p_stder) {
+
+		vfprintf(stderr,p_format,p_list);
+		fflush(stderr);
+	} else {
+
+		vprintf(p_format,p_list);
+		fflush(stdout);
+	}
+}
+
+void OS_Unix::print(const char *p_format, ... ) {
+
+	va_list argp;
+	va_start(argp, p_format);
+	vprintf(p_format, argp );
+	va_end(argp);
+
+}
+void OS_Unix::alert(const String& p_alert,const String& p_title) {
+
+	fprintf(stderr,"ERROR: %s\n",p_alert.utf8().get_data());
+}
+
+static int has_data(FILE* p_fd, int timeout_usec = 0) {
+
+	fd_set readset;
+	int fd = fileno(p_fd);
+	FD_ZERO(&readset);
+	FD_SET(fd, &readset);
+	timeval time;
+	time.tv_sec = 0;
+	time.tv_usec = timeout_usec;
+	int res = 0;//select(fd + 1, &readset, NULL, NULL, &time);
+	return res > 0;
+};
+
+
+String OS_Unix::get_stdin_string(bool p_block) {
+
+	String ret;
+	if (p_block) {
+		char buff[1024];
+		ret = stdin_buf + fgets(buff,1024,stdin);
+		stdin_buf = "";
+		return ret;
+	};
+
+	while (has_data(stdin)) {
+
+		char ch;
+		read(fileno(stdin), &ch, 1);
+		if (ch == '\n') {
+			ret = stdin_buf;
+			stdin_buf = "";
+			return ret;
+		} else {
+			char str[2] = { ch, 0 };
+			stdin_buf += str;
+		};
+	};
+
+	return "";
+}
+
+String OS_Unix::get_name() {
+
+	return "Unix";
+}
+
+
+uint64_t OS_Unix::get_unix_time() const {
+
+	return time(NULL);
+};
+
+
+OS::Date OS_Unix::get_date() const {
+
+	time_t t=time(NULL);
+	struct tm *lt=localtime(&t);
+	Date ret;
+	ret.year=1900+lt->tm_year;
+	ret.month=(Month)lt->tm_mon;
+	ret.day=lt->tm_mday;
+	ret.weekday=(Weekday)lt->tm_wday;
+	ret.dst=lt->tm_isdst;
+
+	return ret;
+}
+OS::Time OS_Unix::get_time() const {
+
+	time_t t=time(NULL);
+	struct tm *lt=localtime(&t);
+	Time ret;
+	ret.hour=lt->tm_hour;
+	ret.min=lt->tm_min;
+	ret.sec=lt->tm_sec;
+	return ret;
+}
+
+void OS_Unix::delay_usec(uint32_t p_usec) const {
+
+	usleep(p_usec);
+}
+uint64_t OS_Unix::get_ticks_usec() const {
+
+	struct timeval tv_now;
+	gettimeofday(&tv_now,NULL);
+
+	uint64_t longtime = (uint64_t)tv_now.tv_usec + (uint64_t)tv_now.tv_sec*1000000L;
+	longtime-=ticks_start;
+
+	return longtime;
+}
+
+Error OS_Unix::execute(const String& p_path, const List<String>& p_arguments,bool p_blocking,ProcessID *r_child_id,String* r_pipe,int *r_exitcode) {
+
+
+	if (p_blocking && r_pipe) {
+
+
+		String argss;
+		argss="\""+p_path+"\"";
+
+		for(int i=0;i<p_arguments.size();i++) {
+
+			argss+=String(" \"")+p_arguments[i]+"\"";
+		}
+
+		argss+=" 2>/dev/null"; //silence stderr
+		FILE* f=popen(argss.utf8().get_data(),"r");
+
+		ERR_FAIL_COND_V(!f,ERR_CANT_OPEN);
+
+		char buf[65535];
+		while(fgets(buf,65535,f)) {
+
+			(*r_pipe)+=buf;
+		}
+
+		int rv = pclose(f);
+		if (r_exitcode)
+			*r_exitcode=rv;
+
+		return OK;
+	}
+
+
+	pid_t pid = fork();
+	ERR_FAIL_COND_V(pid<0,ERR_CANT_FORK);
+	//print("execute: %s\n",p_path.utf8().get_data());
+
+
+	if (pid==0) {
+		// is child
+		Vector<CharString> cs;
+		cs.push_back(p_path.utf8());
+		for(int i=0;i<p_arguments.size();i++)
+			cs.push_back(p_arguments[i].utf8());
+
+		Vector<char*> args;
+		for(int i=0;i<cs.size();i++)
+			args.push_back((char*)cs[i].get_data());// shitty C cast
+		args.push_back(0);
+
+#ifdef __FreeBSD__
+		if(p_path.find("/")) {
+			// exec name contains path so use it
+			execv(p_path.utf8().get_data(),&args[0]);
+		}else{
+			// use program name and search through PATH to find it
+			execvp(getprogname(),&args[0]);
+		}
+#else
+		execv(p_path.utf8().get_data(),&args[0]);
+#endif
+		// still alive? something failed..
+		fprintf(stderr,"**ERROR** OS_Unix::execute - Could not create child process while executing: %s\n",p_path.utf8().get_data());
+		abort();
+	}
+
+	if (p_blocking) {
+
+		int status;
+		pid_t rpid = waitpid(pid,&status,0);
+		if (r_exitcode)
+			*r_exitcode=WEXITSTATUS(status);
+
+		print("returned: %i, waiting for: %i\n",rpid,pid);
+	} else {
+
+		if (r_child_id)
+			*r_child_id=pid;
+	}
+
+	return OK;
+
+}
+
+Error OS_Unix::kill(const ProcessID& p_pid) {
+
+	int ret = ::kill(p_pid,SIGKILL);
+	if (!ret) {
+		//avoid zombie process
+		int st;
+		::waitpid(p_pid,&st,0);
+
+	}
+	return ret?ERR_INVALID_PARAMETER:OK;
+}
+
+int OS_Unix::get_process_ID() const {
+
+	return getpid();
+};
+
+
+bool OS_Unix::has_environment(const String& p_var) const {
+
+	return getenv(p_var.utf8().get_data())!=NULL;
+}
+
+String OS_Unix::get_locale() const {
+
+	if (!has_environment("LANG"))
+		return "en";
+
+	String locale = get_environment("LANG");
+	int tp = locale.find(".");
+	if (tp!=-1)
+		locale=locale.substr(0,tp);
+	return locale;
+}
+
+Error OS_Unix::set_cwd(const String& p_cwd) {
+
+	if (chdir(p_cwd.utf8().get_data())!=0)
+		return ERR_CANT_OPEN;
+
+	return OK;
+}
+
+
+String OS_Unix::get_environment(const String& p_var) const {
+
+	if (getenv(p_var.utf8().get_data()))
+		return getenv(p_var.utf8().get_data());
+	return "";
+}
+
+int OS_Unix::get_processor_count() const {
+
+	return sysconf(_SC_NPROCESSORS_CONF);
+}
+
+String OS_Unix::get_data_dir() const {
+
+	String an = Globals::get_singleton()->get("application/name");
+	if (an!="") {
+
+
+
+		if (has_environment("HOME")) {
+
+			bool use_godot = Globals::get_singleton()->get("application/use_shared_user_dir");
+			if (use_godot)
+				return get_environment("HOME")+"/.godot/app_userdata/"+an;
+			else
+				return get_environment("HOME")+"/."+an;
+		}
+	}
+
+	return Globals::get_singleton()->get_resource_path();
+
+}
+
+String OS_Unix::get_executable_path() const {
+
+#ifdef __linux__
+	//fix for running from a symlink
+	char buf[256];
+	memset(buf,0,256);
+	readlink("/proc/self/exe", buf, sizeof(buf));
+	//print_line("Exec path is:"+String(buf));
+	String b;
+	b.parse_utf8(buf);
+	if (b=="") {
+		WARN_PRINT("Couldn't get executable path from /proc/self/exe, using argv[0]");
+		return OS::get_executable_path();
+	}
+	return b;
+#elif defined(__FreeBSD__)
+	char resolved_path[MAXPATHLEN];
+
+	realpath(OS::get_executable_path().utf8().get_data(), resolved_path);
+
+	return String(resolved_path);
+#else
+	ERR_PRINT("Warning, don't know how to obtain executable path on this OS! Please override this function properly.");
+	return OS::get_executable_path();
+#endif
+}
+
+#endif
+
+#ifndef OS_UNIX_H
+#define OS_UNIX_H
+
+/**
+	@author Juan Linietsky <reduzio@gmail.com>
+*/
+
+#ifdef UNIX_ENABLED
+
+
+#include "os/os.h"
+#include "drivers/unix/ip_unix.h"
+
+
+class OS_Unix : public OS {
+
+	uint64_t ticks_start;
+protected:
+
+	// UNIX only handles the core functions.
+	// inheriting platforms under unix (eg. X11) should handle the rest
+
+	//virtual int get_video_driver_count() const;
+	//virtual const char * get_video_driver_name(int p_driver) const;
+	//virtual VideoMode get_default_video_mode() const;
+
+	virtual int get_audio_driver_count() const;
+	virtual const char * get_audio_driver_name(int p_driver) const;
+
+	virtual void initialize_core();
+	virtual int unix_initialize_audio(int p_audio_driver);
+	//virtual void initialize(int p_video_driver,int p_audio_driver);
+
+	//virtual void finalize();
+	virtual void finalize_core();
+
+	String stdin_buf;
+
+public:
+
+
+	virtual void print_error(const char* p_function,const char* p_file,int p_line,const char *p_code,const char*p_rationale,ErrorType p_type=ERR_ERROR);
+
+	virtual void print(const char *p_format, ... );
+	virtual void vprint(const char* p_format, va_list p_list,bool p_stderr=false);
+	virtual void alert(const String& p_alert,const String& p_title="ALERT!");
+	virtual String get_stdin_string(bool p_block);
+
+	//virtual void set_mouse_show(bool p_show);
+	//virtual void set_mouse_grab(bool p_grab);
+	//virtual bool is_mouse_grab_enabled() const = 0;
+	//virtual void get_mouse_pos(int &x, int &y) const;
+	//virtual void set_window_title(const String& p_title);
+
+	//virtual void set_video_mode(const VideoMode& p_video_mode);
+	//virtual VideoMode get_video_mode() const;
+	//virtual void get_fullscreen_mode_list(List<VideoMode> *p_list) const;
+
+	virtual Error set_cwd(const String& p_cwd);
+
+	virtual String get_name();
+
+	virtual Date get_date() const;
+	virtual Time get_time() const;
+
+	virtual uint64_t get_unix_time() const;
+
+	virtual void delay_usec(uint32_t p_usec) const;
+	virtual uint64_t get_ticks_usec() const;
+
+	virtual Error execute(const String& p_path, const List<String>& p_arguments,bool p_blocking,ProcessID *r_child_id=NULL,String* r_pipe=NULL,int *r_exitcode=NULL);
+	virtual Error kill(const ProcessID& p_pid);
+	virtual int get_process_ID() const;
+
+	virtual bool has_environment(const String& p_var) const;
+	virtual String get_environment(const String& p_var) const;
+	virtual String get_locale() const;
+
+	virtual int get_processor_count() const;
+
+
+	virtual void debug_break();
+
+	virtual String get_executable_path() const;
+	virtual String get_data_dir() const;
+
+	//virtual void run( MainLoop * p_main_loop );
+
+
+};
+
+#endif
+
+#endif
+
+#include "tcp_server_posix.h"
+#include "stream_peer_tcp_posix.h"
+
+#ifdef UNIX_ENABLED
+
+#include <poll.h>
+
+#include <stdio.h>
+#include <stdlib.h>
+#include <unistd.h>
+#include <errno.h>
+#include <string.h>
+#include <netdb.h>
+#include <sys/types.h>
+#ifndef NO_FCNTL
+#include <sys/fcntl.h>
+#else
+#include <sys/ioctl.h>
+#endif
+#ifdef JAVASCRIPT_ENABLED
+#include <arpa/inet.h>
+#endif
+#include <netinet/in.h>
+#include <sys/socket.h>
+#include <assert.h>
+TCP_Server* TCPServerPosix::_create() {
+
+	return memnew(TCPServerPosix);
+};
+
+void TCPServerPosix::make_default() {
+
+	TCP_Server::_create = TCPServerPosix::_create;
+};
+
+Error TCPServerPosix::listen(uint16_t p_port,const List<String> *p_accepted_hosts) {
+
+	printf("********* listening on port %i\n", p_port);
+	int sockfd;
+	sockfd = socket(AF_INET, SOCK_STREAM, 0);
+	ERR_FAIL_COND_V(sockfd == -1, FAILED);
+#ifndef NO_FCNTL
+	fcntl(sockfd, F_SETFL, O_NONBLOCK);
+#else
+	int bval = 1;
+	ioctl(sockfd, FIONBIO, &bval);
+#endif
+
+	int reuse=1;
+	if(setsockopt(sockfd, SOL_SOCKET, SO_REUSEADDR, (char *)&reuse, sizeof(reuse)) < 0) {
+
+		printf("REUSEADDR failed!");
+	}
+
+	struct sockaddr_in my_addr;
+	my_addr.sin_family = AF_INET;         // host byte order
+	my_addr.sin_port = htons(p_port);     // short, network byte order
+	my_addr.sin_addr.s_addr = INADDR_ANY; // automatically fill with my IP TODO: use p_accepted_hosts
+	memset(my_addr.sin_zero, '\0', sizeof my_addr.sin_zero);
+
+	if (bind(sockfd, (struct sockaddr *)&my_addr, sizeof my_addr) != -1) {
+
+		if (::listen(sockfd, 1) == -1) {
+
+			close(sockfd);
+			ERR_FAIL_V(FAILED);
+		};
+	}
+	else {
+		return ERR_ALREADY_IN_USE;
+	};
+
+	if (listen_sockfd != -1) {
+
+		printf("FAILED\n");
+		stop();
+	};
+
+	listen_sockfd = sockfd;
+
+	printf("OK! %i\n", listen_sockfd);
+	return OK;
+};
+
+bool TCPServerPosix::is_connection_available() const {
+
+	if (listen_sockfd == -1) {
+		return false;
+	};
+
+	struct pollfd pfd;
+	pfd.fd = listen_sockfd;
+	pfd.events = POLLIN;
+	pfd.revents = 0;
+
+	int ret = poll(&pfd, 1, 0);
+	ERR_FAIL_COND_V(ret < 0, FAILED);
+
+	if (ret && (pfd.revents & POLLIN)) {
+		printf("has connection!\n");
+		return true;
+	};
+
+	return false;
+};
+
+Ref<StreamPeerTCP> TCPServerPosix::take_connection() {
+
+	if (!is_connection_available()) {
+		return Ref<StreamPeerTCP>();
+	};
+
+	struct sockaddr_in their_addr;
+	socklen_t sin_size = sizeof(their_addr);
+	int fd = accept(listen_sockfd, (struct sockaddr *)&their_addr, &sin_size);
+	ERR_FAIL_COND_V(fd == -1, Ref<StreamPeerTCP>());
+#ifndef NO_FCNTL
+	fcntl(fd, F_SETFL, O_NONBLOCK);
+#else
+	int bval = 1;
+	ioctl(fd, FIONBIO, &bval);
+#endif
+
+	Ref<StreamPeerTCPPosix> conn = memnew(StreamPeerTCPPosix);
+	IP_Address ip;
+	ip.host = (uint32_t)their_addr.sin_addr.s_addr;
+	conn->set_socket(fd, ip, ntohs(their_addr.sin_port));
+
+	return conn;
+};
+
+void TCPServerPosix::stop() {
+
+	if (listen_sockfd != -1) {
+		print_line("CLOSING CONNECTION");
+		int ret = close(listen_sockfd);
+		ERR_FAIL_COND(ret!=0);
+	};
+
+	listen_sockfd = -1;
+};
+
+
+TCPServerPosix::TCPServerPosix() {
+
+	listen_sockfd = -1;
+};
+
+TCPServerPosix::~TCPServerPosix() {
+
+	stop();
+};
+#endif
+
+#ifndef TCP_SERVER_POSIX_H
+#define TCP_SERVER_POSIX_H
+
+#ifdef UNIX_ENABLED
+#include "core/io/tcp_server.h"
+
+class TCPServerPosix : public TCP_Server {
+
+	int listen_sockfd;
+
+	static TCP_Server* _create();
+
+public:
+
+	virtual Error listen(uint16_t p_port,const List<String> *p_accepted_hosts=NULL);
+	virtual bool is_connection_available() const;
+	virtual Ref<StreamPeerTCP> take_connection();
+
+	virtual void stop();
+
+	static void make_default();
+
+	TCPServerPosix();
+	~TCPServerPosix();
+};
+
+#endif // TCP_SERVER_POSIX_H
+#endif
+
+// Xft text box, optionally editable
+box* box_create(Window parent, bitmap flags, short x, short y, short w, short h, char *color)
+{
+	box *b = allocate_clear(sizeof(box));
+
+	b->flags = flags;
+	b->parent = parent;
+	box_color(b, color);
+
+	b->window = XCreateSimpleWindow(display, b->parent, 0, 0, 1, 1, 0, None, b->color);
+
+	if (b->flags & BOX_OVERRIDE)
+	{
+		XSetWindowAttributes attr; attr.override_redirect = True;
+		XChangeWindowAttributes(display, b->window, CWOverrideRedirect, &attr);
+	}
+
+	box_moveresize(b, x, y, w, h);
+
+	return b;
+}
+
+void box_color(box *b, char *color)
+{
+	b->color = color_get(color);
+}
+
+void box_moveresize(box *b, short x, short y, short w, short h)
+{
+	b->x = x; b->y = y; b->w = MAX(1, w); b->h = MAX(1, h);
+	XMoveResizeWindow(display, b->window, b->x, b->y, b->w, b->h);
+}
+
+void box_show(box *b)
+{
+	XMapWindow(display, b->window);
+}
+
+void box_hide(box *b)
+{
+	XUnmapWindow(display, b->window);
+}
+
+void box_draw(box *b)
+{
+	XSetWindowAttributes attr; attr.background_pixel = b->color;
+	XChangeWindowAttributes(display, b->window, CWBackPixel, &attr);
+	XClearWindow(display, b->window);
+}
+
+void box_free(box *b)
+{
+	XDestroyWindow(display, b->window);
+	free(b);
+}
+
+void cli_message(Atom atom, char *cmd)
+{
+	Window cli = XCreateSimpleWindow(display, root, 0, 0, 1, 1, 0, None, None);
+	if (cmd) window_set_text_prop(cli, gatoms[GOOMWWM_MESSAGE], cmd);
+	window_send_message(root, cli, atom, 0, SubstructureNotifyMask | SubstructureRedirectMask);
+}
+
+// command line interface
+int cli_main(int argc, char *argv[])
+{
+	char *arg;
+
+	if ((arg = find_arg_str(argc, argv, "-log", NULL)))
+		cli_message(gatoms[GOOMWWM_LOG], arg);
+
+	if (find_arg(argc, argv, "-restart") >= 0)
+		cli_message(gatoms[GOOMWWM_RESTART], argv[0]);
+
+	if ((arg = find_arg_str(argc, argv, "-exec", NULL)))
+		cli_message(gatoms[GOOMWWM_RESTART], arg);
+
+	if ((arg = find_arg_str(argc, argv, "-ruleset", NULL)))
+		cli_message(gatoms[GOOMWWM_RULESET], arg);
+
+	if ((arg = find_arg_str(argc, argv, "-rule", NULL)))
+		cli_message(gatoms[GOOMWWM_RULE], arg);
+
+	if ((arg = find_arg_str(argc, argv, "-findstart", NULL)))
+		cli_message(gatoms[GOOMWWM_FIND_OR_START], arg);
+
+	if (find_arg(argc, argv, "-quit") >= 0)
+		cli_message(gatoms[GOOMWWM_QUIT], NULL);
+
+	if ((arg = find_arg_str(argc, argv, "-notice", NULL)))
+	{
+		// optional duration in seconds. 0 means SAYMS
+		int delay = find_arg_int(argc, argv, "-duration", 0);
+		// bit of a hack for v1... write delay inline
+		char *tmp = alloca(strlen(arg) + 10);
+		sprintf(tmp, "%d %s", delay, arg);
+		cli_message(gatoms[GOOMWWM_NOTICE], tmp);
+	}
+
+	//TODO: make this a two-way event exchange
+	usleep(500000); // 0.5s
+	return EXIT_SUCCESS;
+}
+
+// update _NET_CLIENT_LIST
+void ewmh_client_list()
+{
+	XSync(display, False);
+	// this often happens after we've made changes. refresh
+	reset_cache_inplay();
+
+	winlist *relevant = winlist_new();
+	winlist *mapped   = winlist_new();
+	int i; Window w; client *c;
+
+	// windows_in_play() returns the stacking order. windows_activated *MAY NOT* have the same order
+	managed_ascend(i, w, c) if (!client_has_state(c, netatoms[_NET_WM_STATE_SKIP_TASKBAR])) winlist_append(relevant, w, NULL);
+	XChangeProperty(display, root, netatoms[_NET_CLIENT_LIST_STACKING], XA_WINDOW, 32, PropModeReplace, (unsigned char*)relevant->array, relevant->len);
+
+	// 'windows' list has mapping order of everything. build 'mapped' from 'relevant', ordered by 'windows'
+	winlist_ascend(windows, i, w) if (winlist_forget(relevant, w)) winlist_append(mapped, w, NULL);
+	XChangeProperty(display, root, netatoms[_NET_CLIENT_LIST], XA_WINDOW, 32, PropModeReplace, (unsigned char*)mapped->array, mapped->len);
+
+	winlist_free(mapped);
+	winlist_free(relevant);
+}
+
+// update _NET_ACTIVE_WINDOW
+void ewmh_active_window(Window w)
+{
+	XChangeProperty(display, root, netatoms[_NET_ACTIVE_WINDOW], XA_WINDOW, 32, PropModeReplace, (unsigned char*)&w, 1);
+}
+
+// _NET_DESKTOP stuff, taking _NET_WM_STRUT* into account
+void ewmh_desktop_list()
+{
+	int i; XWindowAttributes *attr = window_get_attributes(root);
+	// nine desktops. want more space? buy more monitors and use xinerama :)
+	unsigned long desktops = TAGS, area[4*TAGS], geo[2], view[2], desktop;
+
+	// this will return the full X screen, not Xinerama screen
+	workarea mon; monitor_dimensions_struts(-1, -1, &mon);
+
+	// figure out the workarea, less struts
+	for (i = 0; i < TAGS; i++)
+	{
+		area[(i*4)+0] = mon.x; area[(i*4)+1] = mon.y;
+		area[(i*4)+2] = mon.w; area[(i*4)+3] = mon.h;
+	}
+	view[0] = 0; view[1] = 0;
+	geo[0] = attr->width; //DisplayWidth(display, XScreenNumberOfScreen(attr->screen));
+	geo[1] = attr->height; //DisplayHeight(display, XScreenNumberOfScreen(attr->screen));
+	desktop = tag_to_desktop(current_tag);
+
+	window_set_cardinal_prop(root, netatoms[_NET_NUMBER_OF_DESKTOPS], &desktops, 1);
+	window_set_cardinal_prop(root, netatoms[_NET_DESKTOP_GEOMETRY],   geo,  2);
+	window_set_cardinal_prop(root, netatoms[_NET_DESKTOP_VIEWPORT],   view, 2);
+	window_set_cardinal_prop(root, netatoms[_NET_WORKAREA],           area, TAGS*4);
+	window_set_cardinal_prop(root, netatoms[_NET_CURRENT_DESKTOP],    &desktop, 1);
+}
+
+// load a rule specified on cmd line or .goomwwmrc
+int rule_parse(char *rulestr)
+{
+	winrule *new = allocate_clear(sizeof(winrule));
+	char *str = strdup(rulestr); strtrim(str);
+	char *left = str, *right = str;
+	// locate end of pattern
+	while (*right && !isspace(*right)) right++;
+	new->pattern = strndup(str, right-left);
+	while (*right && isspace(*right)) right++;
+	// walk over rule flags, space or command delimited
+	while (*right && !isspace(*right))
+	{
+		left = right;
+		// scan for delimiters
+		while (*right && !strchr(" ,\t", *right)) right++;
+		if (right > left)
+		{
+			char flag[32]; memset(flag, 0, sizeof(flag));
+			strncpy(flag, left, MIN(sizeof(flag)-1, right-left));
+			// check for geometry
+			if (regquick("^[0-9]*[%]*x[0-9]*[%]*$", flag))
+			{
+				new->flags |= RULE_SIZE;
+				char *p = flag;
+				new->w = strtol(p, &p, 10);
+				new->w_is_pct = (*p == '%') ? 1:0;
+				if (new->w_is_pct) p++;
+				if (*p == 'x') p++;
+				new->h = strtol(p, &p, 10);
+				new->h_is_pct = (*p == '%') ? 1:0;
+			} else
+			// check known flags
+			{
+				int i; for (i = 0; i < sizeof(rulemap)/sizeof(winrulemap); i++)
+					if (!strcasecmp(flag, rulemap[i].name))
+						{ new->flags |= rulemap[i].flag; break; }
+			}
+		}
+		// skip delimiters
+		while (*right && strchr(" ,\t", *right)) right++;
+	}
+	// prepare pattern regexes
+	char *pat = new->pattern;
+	if (regquick("^(class|name|title):", pat)) pat = strchr(pat, ':')+1;
+
+	int ok = 0;
+	if (regcomp(&new->re, pat, REG_EXTENDED|REG_ICASE|REG_NOSUB) == 0)
+	{
+		new->next = config_rules;
+		config_rules = new;
+		ok = 1;
+	} else
+	{
+		fprintf(stderr, "failed to compile regex: %s\n", pat);
+		free(new->pattern); free(new);
+	}
+	free(str);
+	return ok;
+}
+
+// release rule memory
+void rule_free(winrule *rule)
+{
+	if (!rule) return;
+	regfree(&rule->re);
+	free(rule->pattern);
+	free(rule);
+}
+
+// pick a ruleset to execute
+void ruleset_switcher()
+{
+	int i, count = 0; char **list; winruleset *set;
+
+	// count rulesets
+	for (count = 0, set = config_rulesets; set; count++, set = set->next);
+	list = allocate_clear(sizeof(char*) * (count+1)); // +1 NULL sell terminates
+	// build a simple list of rule file names
+	for (i = count-1, set = config_rulesets; set; i--, set = set->next) list[i] = basename(set->name);
+
+	if (!fork())
+	{
+		display = XOpenDisplay(0);
+		XSync(display, True);
+		int n = menu(list, NULL, "> ", 0);
+		if (n >= 0 && list[n])
+		{
+			cli_message(gatoms[GOOMWWM_RULESET], list[n]);
+			usleep(300000);
+		}
+		exit(EXIT_SUCCESS);
+	}
+	free(list);
+}
+
+// apply a rule list to all windows in current_tag
+void rulelist_apply(winrule *list)
+{
+	int i, done = 0; Window w; client *c;
+	winrule *bak = config_rules; config_rules = list;
+	tag_descend(i, w, c, current_tag)
+		if (!done)
+	{
+		reset_cache_xattr();
+		reset_cache_client();
+		c = client_create(w);
+		if (c) client_rules_apply(c, RULESDEF);
+		if (c && c->is_ruled && c->rule && c->rule->flags & RULE_ONCE) done = 1;
+		XSync(display, False);
+	}
+	clients_descend(windows_shaded, i, w, c)
+		if (!done && c->manage && c->cache->tags & current_tag)
+	{
+		reset_cache_xattr();
+		reset_cache_client();
+		c = client_create(w);
+		if (c) client_rules_apply(c, RULESDEF);
+		if (c && c->is_ruled && c->rule && c->rule->flags & RULE_ONCE) done = 1;
+		XSync(display, False);
+	}
+	clients_descend(windows_minimized, i, w, c)
+		if (!done && c->manage && c->cache->tags & current_tag)
+	{
+		reset_cache_xattr();
+		reset_cache_client();
+		c = client_create(w);
+		if (c) client_rules_apply(c, RULESDEF);
+		if (c && c->is_ruled && c->rule && c->rule->flags & RULE_ONCE) done = 1;
+		XSync(display, False);
+	}
+	config_rules = bak;
+}
+
+// apply a single rule to all windows in the current tag
+void rule_apply(winrule *rule)
+{
+	winrule *next = rule->next;
+	rule->next = NULL;
+	rulelist_apply(rule);
+	rule->next = next;
+}
+
+// execute a rule on open windows
+void rule_execute(char *rulestr)
+{
+	if (rule_parse(rulestr))
+	{
+		winrule *rule = config_rules;
+		config_rules = rule->next;
+		rule_apply(rule);
+		rule_free(rule);
+	}
+}
+
+// execute a ruleset on open windows
+void ruleset_execute(char *name)
+{
+	winruleset *set = NULL;
+	// find ruleset by index
+	for (set = config_rulesets; set && strcasecmp(name, set->name); set = set->next);
+	if (set && set->rules)
+	{
+		// bit odd. rules lists are lifos present, but it's more intuitive to process
+		// rulesets in the order they were defined. should clean this up, but for now,
+		// labouriously walk the list backwards
+		winrule *rule = set->rules;
+		while (rule->next) rule = rule->next;
+		while (rule)
+		{
+			rule_apply(rule);
+			winrule *prev = set->rules;
+			while (prev && prev->next != rule) prev = prev->next;
+			rule = prev;
+		}
+	}
+}
+
+// but, since a window can have multiple tags... oh well
+unsigned int tag_to_desktop(unsigned int tag)
+{
+	unsigned int i; for (i = 0; i < TAGS; i++) if (tag & (1<<i)) return i;
+	return 0xffffffff;
+}
+
+unsigned int desktop_to_tag(unsigned int desktop)
+{
+	return (desktop == 0xffffffff) ? 0: 1<<desktop;
+}
+
+// update current desktop on all roots
+void tag_set_current(unsigned int tag)
+{
+	current_tag = tag; unsigned long d = tag_to_desktop(current_tag);
+	window_set_cardinal_prop(root, netatoms[_NET_CURRENT_DESKTOP], &d, 1);
+}
+
+// raise all windows in a tag
+void tag_raise(unsigned int tag)
+{
+	int i, found = 0, shaded = 0; Window w; client *c;
+	winlist *stack;
+
+	// if this tag was previously hidden, reveal it
+	clients_ascend(windows_shaded, i, w, c)
+		if (c->manage && c->cache->tags & tag)
+			{ client_reveal(c); shaded++; }
+	if (shaded)
+	{
+		XSync(display, False);
+		reset_cache_xattr();
+		reset_cache_client();
+		reset_cache_inplay();
+	}
+
+	stack = winlist_new();
+
+	// locate windows with _NET_WM_STATE_ABOVE and _NET_WM_STATE_STICKY
+	managed_descend(i, w, c)
+		if (winlist_find(stack, w) < 0 && c->visible && c->trans == None
+			&& client_has_state(c, netatoms[_NET_WM_STATE_ABOVE])
+			&& client_has_state(c, netatoms[_NET_WM_STATE_STICKY]))
+				client_stack_family(c, stack);
+	// locate windows with _NET_WM_STATE_ABOVE in this tag
+	tag_descend(i, w, c, tag)
+		if (winlist_find(stack, w) < 0 && c->visible && c->trans == None
+			&& client_has_state(c, netatoms[_NET_WM_STATE_ABOVE]))
+				{ client_stack_family(c, stack); found++; }
+	// locate _NET_WM_WINDOW_TYPE_DOCK windows
+	clients_descend(windows_in_play(), i, w, c)
+		if (winlist_find(stack, w) < 0 && c->visible && c->trans == None
+			&& c->type == netatoms[_NET_WM_WINDOW_TYPE_DOCK])
+				client_stack_family(c, stack);
+	// locate all other windows in the tag
+	tag_descend(i, w, c, tag)
+		if (winlist_find(stack, w) < 0 && c->trans == None)
+			{ client_stack_family(c, stack); found++; }
+
+	// raise the top window in the stack
+	if (stack->len) XRaiseWindow(display, stack->array[0]);
+	// stack everything else, in order, underneath top window
+	if (stack->len > 1) XRestackWindows(display, stack->array, stack->len);
+
+	winlist_free(stack);
+	tag_set_current(tag);
+	if (config_only_auto) tag_only(tag);
+
+	// focus the last-focused client in the tag
+	clients_descend(windows_activated, i, w, c) if (c->cache->tags & tag)
+		{ client_activate(c, RAISE, WARPDEF); break; }
+
+	// in case no windows are in the tag, show some activity
+	if (found) notice("Tag %d", tag_to_desktop(tag)+1);
+	else notice("Tag %d (empty!)", tag_to_desktop(tag)+1);
+}
+
+// check active client. if
+void tag_auto_switch()
+{
+	client *c = client_active(0);
+	if (c && c->cache->tags && !(c->cache->tags & current_tag))
+	{
+		int i, n = 0; Window w; client *o; tag_descend(i, w, o, current_tag) n++;
+		if (!n) tag_raise(desktop_to_tag(tag_to_desktop(c->cache->tags)));
+	}
+}
+
+void tag_only(unsigned int tag)
+{
+	int i; Window w; client *c;
+	managed_descend(i, w, c)
+		if (!(c->cache->tags & tag))
+			client_shade(c);
+}
+
+void tag_close(unsigned int tag)
+{
+	int i; Window w; client *c;
+	tag_descend(i, w, c, tag) client_close(c);
+}
+
+void* allocate(unsigned long bytes)
+{
+	bytes = MAX(1, bytes);
+	void *ptr = malloc(bytes);
+	if (!ptr)
+	{
+		fprintf(stderr, "malloc failed!\n");
+		exit(EXIT_FAILURE);
+	}
+	return ptr;
+}
+
+void* allocate_clear(unsigned long bytes)
+{
+	void *ptr = allocate(bytes);
+	memset(ptr, 0, bytes);
+	return ptr;
+}
+
+void* reallocate(void *ptr, unsigned long bytes)
+{
+	bytes = MAX(1, bytes);
+	ptr = ptr ? realloc(ptr, bytes): malloc(bytes);
+	if (!ptr)
+	{
+		fprintf(stderr, "realloc failed!\n");
+		exit(EXIT_FAILURE);
+	}
+	return ptr;
+}
+
+// trim string in place
+char* strtrim(char *str)
+{
+	int i = 0, j = 0;
+	while (isspace(str[i])) i++;
+	while (str[i]) str[j++] = str[i++];
+	while (isspace(str[--j]));
+	str[++j] = '\0';
+	return str;
+}
+
+double timestamp()
+{
+	struct timeval tv; gettimeofday(&tv, NULL);
+	return tv.tv_sec + (double)tv.tv_usec/1000000;
+}
+
+void catch_exit(int sig)
+{
+	while (0 < waitpid(-1, NULL, WNOHANG));
+}
+
+int execsh(char *cmd)
+{
+	// use sh for args parsing
+	return execlp("/bin/sh", "sh", "-c", cmd, NULL);
+}
+
+// execute sub-process
+pid_t exec_cmd(char *cmd)
+{
+	if (!cmd || !cmd[0]) return -1;
+	signal(SIGCHLD, catch_exit);
+	pid_t pid = fork();
+	if (!pid)
+	{
+		setsid();
+		execsh(cmd);
+		exit(EXIT_FAILURE);
+	}
+	return pid;
+}
+
+// cli arg handling
+int find_arg(int argc, char *argv[], char *key)
+{
+	int i; for (i = 0; i < argc && strcasecmp(argv[i], key); i++);
+	return i < argc ? i: -1;
+}
+
+char* find_arg_str(int argc, char *argv[], char *key, char* def)
+{
+	int i = find_arg(argc, argv, key);
+	return (i > 0 && i < argc-1) ? argv[i+1]: def;
+}
+
+int find_arg_int(int argc, char *argv[], char *key, int def)
+{
+	int i = find_arg(argc, argv, key);
+	return (i > 0 && i < argc-1) ? strtol(argv[i+1], NULL, 10): def;
+}
+
+// once-off regex match. don't use for repeat matching; compile instead
+int regquick(char *pat, char *str)
+{
+	regex_t re; int r = 0;
+	if (regcomp(&re, pat, REG_EXTENDED|REG_ICASE|REG_NOSUB) == 0)
+	{
+		r = regexec(&re, str, 0, NULL, 0) == 0 ?1:0;
+		regfree(&re);
+	}
+	return r;
+}
+
+// true if keysym exists in array
+int in_array_keysym(KeySym *array, KeySym code)
+{
+	int i; for (i = 0; array[i]; i++)
+		if (array[i] == code) return i;
+	return -1;
+}
+
+// allocate a pixel value for an X named color
+unsigned int color_get(const char *name)
+{
+	XColor color;
+	Colormap map = DefaultColormap(display, DefaultScreen(display));
+	return XAllocNamedColor(display, map, name, &color, &color) ? color.pixel: None;
+}
+
+// find mouse pointer location
+int pointer_get(int *x, int *y)
+{
+	*x = 0; *y = 0;
+	Window rr, cr; int rxr, ryr, wxr, wyr; unsigned int mr;
+	if (XQueryPointer(display, root, &rr, &cr, &rxr, &ryr, &wxr, &wyr, &mr))
+	{
+		*x = rxr; *y = ryr;
+		return 1;
+	}
+	return 0;
+}
+
+// true if a keycode matches one of our modkeys
+int keycode_is_mod(unsigned int code)
+{
+	int k; for (k = 0; config_modkeycodes[k]; k++)
+		if (config_modkeycodes[k] == code)
+			return 1;
+	return 0;
+}
+
+// check whether our modkeys are currently pressed
+int modkey_is_down()
+{
+	char keys[32];	int i, j;
+	XQueryKeymap(display, keys);
+	for (i = 0; i < 32; i++)
+	{
+		if (!keys[i]) continue;
+		unsigned int bits = keys[i];
+		for (j = 0; j < 8; j++)
+			if (bits & 1<<j && keycode_is_mod((i*8)+j))
+				return 1;
+	}
+	return 0;
+}
+
+int take_keyboard(Window w)
+{
+	int i;
+	for (i = 0; i < 1000; i++)
+	{
+		if (XGrabKeyboard(display, w, True, GrabModeAsync, GrabModeAsync, CurrentTime) == GrabSuccess)
+			return 1;
+		usleep(1000);
+	}
+	return 0;
+}
+int take_pointer(Window w, unsigned long mask, Cursor cur)
+{
+	int i;
+	for (i = 0; i < 1000; i++)
+	{
+		if (XGrabPointer(display, w, True, mask, GrabModeAsync, GrabModeAsync, None, cur, CurrentTime) == GrabSuccess)
+			return 1;
+		usleep(1000);
+	}
+	return 0;
+}
+void release_keyboard()
+{
+	XUngrabKeyboard(display, CurrentTime);
+}
+void release_pointer()
+{
+	XUngrabPointer(display, CurrentTime);
+}
+
+// display a text message
+void message_box(int delay, int x, int y, char *fgc, char *bgc, char *bc, char *txt)
+{
+	workarea mon; monitor_dimensions_struts(x, y, &mon);
+	if (fork()) return;
+
+	display = XOpenDisplay(0x0);
+
+	box *b = box_create(root, BOX_OVERRIDE, 0, 0, 1, 1, config_title_bg);
+
+	textbox *text = textbox_create(b->window, TB_CENTER|TB_AUTOHEIGHT|TB_AUTOWIDTH,
+		8, 5, 1, 1, config_title_font, config_title_fg, config_title_bg, txt, NULL);
+
+	box_moveresize(b,
+		MIN(mon.x+mon.w-text->w-26, MAX(mon.x+26, x - text->w/2)),
+		MIN(mon.y+mon.h-text->h-20, MAX(mon.y+20, y - text->h/2)),
+		text->w + 16, text->h + 10);
+
+	XSelectInput(display, b->window, ExposureMask);
+
+	textbox_show(text);
+	box_show(b);
+
+	double stamp = timestamp();
+	while ((timestamp()-stamp) < (double)delay/1000)
+	{
+		if (XPending(display))
+		{
+			XEvent ev;
+			XNextEvent(display, &ev);
+
+			if (ev.type == Expose)
+				textbox_draw(text);
+		}
+		usleep(10000); // 10ms
+	}
+
+	textbox_free(text);
+	box_free(b);
+
+	exit(EXIT_SUCCESS);
+}
+
+// bottom right of screen
+void notice(const char *fmt, ...)
+{
+	char txt[100]; va_list ap;
+	va_start(ap,fmt); vsnprintf(txt, 100, fmt, ap); va_end(ap);
+	workarea mon; monitor_active(&mon);
+	message_box(SAYMS, mon.x+mon.w-1, mon.y+mon.h-1, config_title_fg, config_title_bg, config_title_bc, txt);
+}
+
+// bottom left of screen
+void notification(int delay, const char *fmt, ...)
+{
+	char txt[100]; va_list ap;
+	va_start(ap,fmt); vsnprintf(txt, 100, fmt, ap); va_end(ap);
+	workarea mon; monitor_active(&mon);
+	message_box(delay, mon.x, mon.y+mon.h-1, config_title_fg, config_title_bg, config_title_bc, txt);
+}
+
+#ifdef DEBUG
+void event_log(const char *e, Window w)
+{
+	XClassHint chint;
+	fprintf(stderr, "\n%s: %x", e, (unsigned int)w);
+	if (w != None && XGetClassHint(display, w, &chint))
+	{
+		fprintf(stderr, " %s", chint.res_class);
+		XFree(chint.res_class); XFree(chint.res_name);
+	}
+	fprintf(stderr, "\n");
+	fflush(stderr);
+}
+#else
+#define event_log(...)
+#endif
+
+#ifdef DEBUG
+void event_note(const char *fmt, ...)
+{
+	fprintf(stderr, "\t");
+	va_list ap; va_start(ap,fmt); vfprintf(stderr, fmt, ap); va_end(ap);
+	fprintf(stderr, "\n");
+}
+#else
+#define event_note(...)
+#endif
+
+// events we're interested in
+void window_select(Window w)
+{
+	XSelectInput(display, w, EnterWindowMask | LeaveWindowMask | FocusChangeMask | PropertyChangeMask);
+}
+
+// XGetWindowAttributes with caching
+XWindowAttributes* window_get_attributes(Window w)
+{
+	int idx = winlist_find(cache_xattr, w);
+	if (idx < 0)
+	{
+		XWindowAttributes *cattr = allocate(sizeof(XWindowAttributes));
+		if (XGetWindowAttributes(display, w, cattr))
+		{
+			winlist_append(cache_xattr, w, cattr);
+			return cattr;
+		}
+		free(cattr);
+		return NULL;
+	}
+	return cache_xattr->data[idx];
+}
+
+// retrieve a property of any type from a window
+int window_get_prop(Window w, Atom prop, Atom *type, int *items, void *buffer, int bytes)
+{
+	Atom _type; if (!type) type = &_type;
+	int _items; if (!items) items = &_items;
+	int format; unsigned long nitems, nbytes; unsigned char *ret = NULL;
+	memset(buffer, 0, bytes);
+
+	if (XGetWindowProperty(display, w, prop, 0, bytes/4, False, AnyPropertyType, type,
+		&format, &nitems, &nbytes, &ret) == Success && ret && *type != None && format)
+	{
+		if (format ==  8) memmove(buffer, ret, MIN(bytes, nitems));
+		if (format == 16) memmove(buffer, ret, MIN(bytes, nitems * sizeof(short)));
+		if (format == 32) memmove(buffer, ret, MIN(bytes, nitems * sizeof(long)));
+		*items = (int)nitems; XFree(ret);
+		return 1;
+	}
+	return 0;
+}
+
+// retrieve a text property from a window
+// technically we could use window_get_prop(), but this is better for character set support
+char* window_get_text_prop(Window w, Atom atom)
+{
+	XTextProperty prop; char *res = NULL;
+	char **list = NULL; int count;
+	if (XGetTextProperty(display, w, &prop, atom) && prop.value && prop.nitems)
+	{
+		if (prop.encoding == XA_STRING)
+		{
+			res = allocate(strlen((char*)prop.value)+1);
+			strcpy(res, (char*)prop.value);
+		}
+		else
+		if (XmbTextPropertyToTextList(display, &prop, &list, &count) >= Success && count > 0 && *list)
+		{
+			res = allocate(strlen(*list)+1);
+			strcpy(res, *list);
+			XFreeStringList(list);
+		}
+	}
+	if (prop.value) XFree(prop.value);
+	return res;
+}
+
+int window_set_text_prop(Window w, Atom atom, char *txt)
+{
+	XTextProperty prop;
+	if (XStringListToTextProperty(&txt, 1, &prop))
+	{
+		XSetTextProperty(display, w, &prop, atom);
+		XFree(prop.value);
+	}
+	return 0;
+}
+
+int window_get_atom_prop(Window w, Atom atom, Atom *list, int count)
+{
+	Atom type; int items;
+	return window_get_prop(w, atom, &type, &items, list, count*sizeof(Atom)) && type == XA_ATOM ? items:0;
+}
+
+void window_set_atom_prop(Window w, Atom prop, Atom *atoms, int count)
+{
+	XChangeProperty(display, w, prop, XA_ATOM, 32, PropModeReplace, (unsigned char*)atoms, count);
+}
+
+int window_get_cardinal_prop(Window w, Atom atom, unsigned long *list, int count)
+{
+	Atom type; int items;
+	return window_get_prop(w, atom, &type, &items, list, count*sizeof(unsigned long)) && type == XA_CARDINAL ? items:0;
+}
+
+void window_set_cardinal_prop(Window w, Atom prop, unsigned long *values, int count)
+{
+	XChangeProperty(display, w, prop, XA_CARDINAL, 32, PropModeReplace, (unsigned char*)values, count);
+}
+
+void window_unset_prop(Window w, Atom prop)
+{
+	XDeleteProperty(display, w, prop);
+}
+
+// a ClientMessage
+// some things, like the built-in window switcher, use an EWMH ClientMessage
+// also, older WM_PROTOCOLS type stuff calls this
+int window_send_message(Window target, Window subject, Atom atom, unsigned long protocol, unsigned long mask)
+{
+	XEvent e; memset(&e, 0, sizeof(XEvent));
+	e.xclient.type = ClientMessage;
+	e.xclient.message_type = atom;     e.xclient.window    = subject;
+	e.xclient.data.l[0]    = protocol; e.xclient.data.l[1] = latest;
+	e.xclient.send_event   = True;     e.xclient.format    = 32;
+	int r = XSendEvent(display, target, False, mask, &e) ?1:0;
+	XFlush(display);
+	return r;
+}
+
+// top-level, visible windows. DOES include non-managable docks/panels
+winlist* windows_in_play()
+{
+	if (cache_inplay->len) return cache_inplay;
+
+	unsigned int nwins; int i; Window w1, w2, *wins;
+	if (XQueryTree(display, root, &w1, &w2, &wins, &nwins) && wins)
+	{
+		for (i = 0; i < nwins; i++)
+		{
+			XWindowAttributes *attr = window_get_attributes(wins[i]);
+			if (attr && attr->override_redirect == False && attr->map_state == IsViewable)
+				winlist_append(cache_inplay, wins[i], NULL);
+		}
+	}
+	if (wins) XFree(wins);
+	return cache_inplay;
+}
+
+// top-level windows, visible or not. DOES include non-managable docks/panels
+winlist* window_children()
+{
+	winlist *l = winlist_new();
+	unsigned int nwins; int i; Window w1, w2, *wins;
+	if (XQueryTree(display, root, &w1, &w2, &wins, &nwins) && wins)
+	{
+		for (i = 0; i < nwins; i++)
+		{
+			XWindowAttributes *attr = window_get_attributes(wins[i]);
+			if (attr && attr->override_redirect == False && (attr->map_state == IsUnmapped || attr->map_state == IsViewable))
+				winlist_append(l, wins[i], NULL);
+		}
+	}
+	if (wins) XFree(wins);
+	return l;
+}
+
+// the window on top of windows_activated list was the last one we activated
+// assume this is still the active one... seems to work most of the time!
+// if this is wrong, worst case scenario is focus manages to revert to root
+int window_is_active(Window w)
+{
+	return windows_activated->len && w == windows_activated->array[windows_activated->len-1] ?1:0;
+}
+
+#include <stdint.h>
+#include <signal.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <errno.h>
+#include <sys/stat.h>
+#include <unistd.h>
+#include <pwd.h>
+#include <fcntl.h>
+#include "dat.h"
+
+static void
+su(const char *user) {
+    int r;
+    struct passwd *pwent;
+
+    errno = 0;
+    pwent = getpwnam(user);
+    if (errno) twarn("getpwnam(\"%s\")", user), exit(32);
+    if (!pwent) twarnx("getpwnam(\"%s\"): no such user", user), exit(33);
+
+    r = setgid(pwent->pw_gid);
+    if (r == -1) twarn("setgid(%d \"%s\")", pwent->pw_gid, user), exit(34);
+
+    r = setuid(pwent->pw_uid);
+    if (r == -1) twarn("setuid(%d \"%s\")", pwent->pw_uid, user), exit(34);
+}
+
+
+static void
+set_sig_handlers()
+{
+    int r;
+    struct sigaction sa;
+
+    sa.sa_handler = SIG_IGN;
+    sa.sa_flags = 0;
+    r = sigemptyset(&sa.sa_mask);
+    if (r == -1) twarn("sigemptyset()"), exit(111);
+
+    r = sigaction(SIGPIPE, &sa, 0);
+    if (r == -1) twarn("sigaction(SIGPIPE)"), exit(111);
+
+    sa.sa_handler = enter_drain_mode;
+    r = sigaction(SIGUSR1, &sa, 0);
+    if (r == -1) twarn("sigaction(SIGUSR1)"), exit(111);
+}
+
+int
+main(int argc, char **argv)
+{
+    int r;
+    struct job list = {};
+
+    progname = argv[0];
+    setlinebuf(stdout);
+    optparse(&srv, argv+1);
+
+    if (verbose) {
+        printf("pid %d\n", getpid());
+    }
+
+    r = make_server_socket(srv.addr, srv.port);
+    if (r == -1) twarnx("make_server_socket()"), exit(111);
+    srv.sock.fd = r;
+
+    prot_init();
+
+    if (srv.user) su(srv.user);
+    set_sig_handlers();
+
+    if (srv.wal.use) {
+        // We want to make sure that only one beanstalkd tries
+        // to use the wal directory at a time. So acquire a lock
+        // now and never release it.
+        if (!waldirlock(&srv.wal)) {
+            twarnx("failed to lock wal dir %s", srv.wal.dir);
+            exit(10);
+        }
+
+        list.prev = list.next = &list;
+        walinit(&srv.wal, &list);
+        r = prot_replay(&srv, &list);
+        if (!r) {
+            twarnx("failed to replay log");
+            return 1;
+        }
+    }
+
+    srvserve(&srv);
+    return 0;
+}
+
+// CT - simple-minded unit testing for C
+
+#include <signal.h>
+#include <string.h>
+#include <stdlib.h>
+#include <stdio.h>
+#include <stdarg.h>
+#include <sys/types.h>
+#include <sys/stat.h>
+#include <unistd.h>
+#include <sys/wait.h>
+#include <fcntl.h>
+#include <dirent.h>
+#include <errno.h>
+#include <sys/time.h>
+#include <stdint.h>
+#include "internal.h"
+#include "ct.h"
+
+
+static char *curdir;
+static int rjobfd = -1, wjobfd = -1;
+static int64 bstart, bdur;
+static int btiming; // bool
+static int64 bbytes;
+static const int64 Second = 1000 * 1000 * 1000;
+static const int64 BenchTime = Second;
+static const int MaxN = 1000 * 1000 * 1000;
+
+
+
+#ifdef __MACH__
+#	include <mach/mach_time.h>
+
+static int64
+nstime()
+{
+    return (int64)mach_absolute_time();
+}
+
+#else
+
+static int64
+nstime()
+{
+    struct timespec t;
+    clock_gettime(CLOCK_MONOTONIC, &t);
+    return (int64)(t.tv_sec)*Second + t.tv_nsec;
+}
+
+#endif
+
+void
+ctlogpn(char *p, int n, char *fmt, ...)
+{
+    va_list arg;
+
+    printf("%s:%d: ", p, n);
+    va_start(arg, fmt);
+    vprintf(fmt, arg);
+    va_end(arg);
+    putchar('\n');
+}
+
+
+void
+ctfail(void)
+{
+    fflush(stdout);
+    fflush(stderr);
+    abort();
+}
+
+
+char *
+ctdir(void)
+{
+    mkdir(curdir, 0700);
+    return curdir;
+}
+
+
+void
+ctresettimer(void)
+{
+    bdur = 0;
+    bstart = nstime();
+}
+
+
+void
+ctstarttimer(void)
+{
+    if (!btiming) {
+        bstart = nstime();
+        btiming = 1;
+    }
+}
+
+
+void
+ctstoptimer(void)
+{
+    if (btiming) {
+        bdur += nstime() - bstart;
+        btiming = 0;
+    }
+}
+
+
+void
+ctsetbytes(int n)
+{
+    bbytes = (int64)n;
+}
+
+
+static void
+die(int code, int err, char *msg)
+{
+    putc('\n', stderr);
+
+    if (msg && *msg) {
+        fputs(msg, stderr);
+        fputs(": ", stderr);
+    }
+
+    fputs(strerror(err), stderr);
+    putc('\n', stderr);
+    exit(code);
+}
+
+
+static int
+tmpfd(void)
+{
+    FILE *f = tmpfile();
+    if (!f) {
+        die(1, errno, "tmpfile");
+    }
+    return fileno(f);
+}
+
+
+static int
+failed(int s)
+{
+    return WIFSIGNALED(s) && (WTERMSIG(s) == SIGABRT);
+}
+
+
+static void
+waittest(Test *ts)
+{
+    Test *t;
+    int pid, stat;
+
+    pid = wait3(&stat, 0, 0);
+    if (pid == -1) {
+        die(3, errno, "wait");
+    }
+    killpg(pid, 9);
+
+    for (t=ts; t->f; t++) {
+        if (t->pid == pid) {
+            t->status = stat;
+            if (!t->status) {
+                putchar('.');
+            } else if (failed(t->status)) {
+                putchar('F');
+            } else {
+                putchar('E');
+            }
+            fflush(stdout);
+        }
+    }
+}
+
+
+static void
+start(Test *t)
+{
+    t->fd = tmpfd();
+    strcpy(t->dir, TmpDirPat);
+    mktemp(t->dir);
+    t->pid = fork();
+    if (t->pid < 0) {
+        die(1, errno, "fork");
+    } else if (!t->pid) {
+        setpgid(0, 0);
+        if (dup2(t->fd, 1) == -1) {
+            die(3, errno, "dup2");
+        }
+        if (close(t->fd) == -1) {
+            die(3, errno, "fclose");
+        }
+        if (dup2(1, 2) == -1) {
+            die(3, errno, "dup2");
+        }
+        curdir = t->dir;
+        t->f();
+        _exit(0);
+    }
+    setpgid(t->pid, t->pid);
+}
+
+
+static void
+runalltest(Test *ts, int limit)
+{
+    int nrun = 0;
+    Test *t;
+    for (t=ts; t->f; t++) {
+        if (nrun >= limit) {
+            waittest(ts);
+            nrun--;
+        }
+        start(t);
+        nrun++;
+    }
+    for (; nrun; nrun--) {
+        waittest(ts);
+    }
+}
+
+
+static void
+copyfd(FILE *out, int in)
+{
+    ssize_t n;
+    char buf[1024]; // arbitrary size
+
+    while ((n = read(in, buf, sizeof(buf))) != 0) {
+        if (fwrite(buf, 1, n, out) != (size_t)n) {
+            die(3, errno, "fwrite");
+        }
+    }
+}
+
+
+// Removes path and all of its children.
+// Writes errors to stderr and keeps going.
+// If path doesn't exist, rmtree returns silently.
+static void
+rmtree(char *path)
+{
+    int r = unlink(path);
+    if (r == 0 || errno == ENOENT) {
+        return; // success
+    }
+    int unlinkerr = errno;
+
+    DIR *d = opendir(path);
+    if (!d) {
+        if (errno == ENOTDIR) {
+            fprintf(stderr, "ct: unlink: %s\n", strerror(unlinkerr));
+        } else {
+            perror("ct: opendir");
+        }
+        fprintf(stderr, "ct: path %s\n", path);
+        return;
+    }
+    struct dirent *ent;
+    while ((ent = readdir(d))) {
+        if (strcmp(ent->d_name, ".") == 0 || strcmp(ent->d_name, "..") == 0) {
+            continue;
+        }
+        int n = strlen(path) + 1 + strlen(ent->d_name);
+        char s[n+1];
+        sprintf(s, "%s/%s", path, ent->d_name);
+        rmtree(s);
+    }
+    closedir(d);
+    r = rmdir(path);
+    if (r == -1) {
+        perror("ct: rmdir");
+        fprintf(stderr, "ct: path %s\n", path);
+    }
+}
+
+
+static void
+runbenchn(Benchmark *b, int n)
+{
+    int outfd = tmpfd();
+    int durfd = tmpfd();
+    strcpy(b->dir, TmpDirPat);
+    mktemp(b->dir);
+    int pid = fork();
+    if (pid < 0) {
+        die(1, errno, "fork");
+    } else if (!pid) {
+        setpgid(0, 0);
+        if (dup2(outfd, 1) == -1) {
+            die(3, errno, "dup2");
+        }
+        if (close(outfd) == -1) {
+            die(3, errno, "fclose");
+        }
+        if (dup2(1, 2) == -1) {
+            die(3, errno, "dup2");
+        }
+        curdir = b->dir;
+        ctstarttimer();
+        b->f(n);
+        ctstoptimer();
+        write(durfd, &bdur, sizeof bdur);
+        write(durfd, &bbytes, sizeof bbytes);
+        _exit(0);
+    }
+    setpgid(pid, pid);
+
+    pid = waitpid(pid, &b->status, 0);
+    if (pid == -1) {
+        die(3, errno, "wait");
+    }
+    killpg(pid, 9);
+    rmtree(b->dir);
+    if (b->status != 0) {
+        putchar('\n');
+        lseek(outfd, 0, SEEK_SET);
+        copyfd(stdout, outfd);
+        return;
+    }
+
+    lseek(durfd, 0, SEEK_SET);
+    int r = read(durfd, &b->dur, sizeof b->dur);
+    if (r != sizeof b->dur) {
+        perror("read");
+        b->status = 1;
+    }
+    r = read(durfd, &b->bytes, sizeof b->bytes);
+    if (r != sizeof b->bytes) {
+        perror("read");
+        b->status = 1;
+    }
+}
+
+
+// rounddown10 rounds a number down to the nearest power of 10.
+static int
+rounddown10(int n)
+{
+    int tens = 0;
+    // tens = floor(log_10(n))
+    while (n >= 10) {
+        n = n / 10;
+        tens++;
+    }
+    // result = 10**tens
+    int i, result = 1;
+    for (i = 0; i < tens; i++) {
+        result *= 10;
+    }
+    return result;
+}
+
+
+// roundup rounds n up to a number of the form [1eX, 2eX, 5eX].
+static int
+roundup(int n)
+{
+    int base = rounddown10(n);
+    if (n == base)
+        return n;
+    if (n <= 2*base)
+        return 2 * base;
+    if (n <= 5*base)
+        return 5 * base;
+    return 10 * base;
+}
+
+
+static int
+min(int a, int b)
+{
+    if (a < b) {
+        return a;
+    }
+    return b;
+}
+
+
+static int
+max(int a, int b)
+{
+    if (a > b) {
+        return a;
+    }
+    return b;
+}
+
+
+static void
+runbench(Benchmark *b)
+{
+    printf("%s\t", b->name);
+    fflush(stdout);
+    int n = 1;
+    runbenchn(b, n);
+    while (b->status == 0 && b->dur < BenchTime && n < MaxN) {
+        int last = n;
+        // Predict iterations/sec.
+        int nsop = b->dur / n;
+        if (nsop == 0) {
+            n = MaxN;
+        } else {
+            n = BenchTime / nsop;
+        }
+        // Run more iterations than we think we'll need for a second (1.5x).
+        // Don't grow too fast in case we had timing errors previously.
+        // Be sure to run at least one more than last time.
+        n = max(min(n+n/2, 100*last), last+1);
+        // Round up to something easy to read.
+        n = roundup(n);
+        runbenchn(b, n);
+    }
+    if (b->status == 0) {
+        printf("%8d\t%10lld ns/op", n, b->dur/n);
+        if (b->bytes > 0) {
+            double mbs = 0;
+            if (b->dur > 0) {
+                int64 sec = b->dur / 1000L / 1000L / 1000L;
+                int64 nsec = b->dur % 1000000000L;
+                double dur = (double)sec + (double)nsec*.0000000001;
+                mbs = ((double)b->bytes * (double)n / 1000000) / dur;
+            }
+            printf("\t%7.2f MB/s", mbs);
+        }
+        putchar('\n');
+    } else {
+        if (failed(b->status)) {
+            printf("failure");
+        } else {
+            printf("error");
+            if (WIFEXITED(b->status)) {
+                printf(" (exit status %d)", WEXITSTATUS(b->status));
+            }
+            if (WIFSIGNALED(b->status)) {
+                printf(" (signal %d)", WTERMSIG(b->status));
+            }
+        }
+        putchar('\n');
+    }
+}
+
+
+static void
+runallbench(Benchmark *b)
+{
+    for (; b->f; b++) {
+        runbench(b);
+    }
+}
+
+
+static int
+report(Test *t)
+{
+    int nfail = 0, nerr = 0;
+
+    putchar('\n');
+    for (; t->f; t++) {
+        rmtree(t->dir);
+        if (!t->status) {
+            continue;
+        }
+
+        printf("\n%s: ", t->name);
+        if (failed(t->status)) {
+            nfail++;
+            printf("failure");
+        } else {
+            nerr++;
+            printf("error");
+            if (WIFEXITED(t->status)) {
+                printf(" (exit status %d)", WEXITSTATUS(t->status));
+            }
+            if (WIFSIGNALED(t->status)) {
+                printf(" (signal %d)", WTERMSIG(t->status));
+            }
+        }
+
+        putchar('\n');
+        lseek(t->fd, 0, SEEK_SET);
+        copyfd(stdout, t->fd);
+    }
+
+    if (nfail || nerr) {
+        printf("\n%d failures; %d errors.\n", nfail, nerr);
+    } else {
+        printf("\nPASS\n");
+    }
+    return nfail || nerr;
+}
+
+
+int
+readtokens()
+{
+    int n = 1;
+    char c, *s;
+    if ((s = strstr(getenv("MAKEFLAGS"), " --jobserver-fds="))) {
+        rjobfd = (int)strtol(s+17, &s, 10);  // skip " --jobserver-fds="
+        wjobfd = (int)strtol(s+1, NULL, 10); // skip comma
+    }
+    if (rjobfd >= 0) {
+        fcntl(rjobfd, F_SETFL, fcntl(rjobfd, F_GETFL)|O_NONBLOCK);
+        while (read(rjobfd, &c, 1) > 0) {
+            n++;
+        }
+    }
+    return n;
+}
+
+
+void
+writetokens(int n)
+{
+    char c = '+';
+    if (wjobfd >= 0) {
+        fcntl(wjobfd, F_SETFL, fcntl(wjobfd, F_GETFL)|O_NONBLOCK);
+        for (; n>1; n--) {
+            write(wjobfd, &c, 1); // ignore error; nothing we can do anyway
+        }
+    }
+}
+
+
+int
+main(int argc, char **argv)
+{
+    int n = readtokens();
+    runalltest(ctmaintest, n);
+    writetokens(n);
+    int code = report(ctmaintest);
+    if (code != 0) {
+        return code;
+    }
+    if (argc == 2 && strcmp(argv[1], "-b") == 0) {
+        runallbench(ctmainbench);
+    }
+    return 0;
+}
+
+char *ctdir(void);
+void  ctfail(void);
+void  ctresettimer(void);
+void  ctstarttimer(void);
+void  ctstoptimer(void);
+void  ctsetbytes(int);
+void  ctlogpn(char*, int, char*, ...) __attribute__((format(printf, 3, 4)));
+#define ctlog(...) ctlogpn(__FILE__, __LINE__, __VA_ARGS__)
+#define assert(x) do if (!(x)) {\
+	ctlog("%s", "test: " #x);\
+	ctfail();\
+} while (0)
+#define assertf(x, ...) do if (!(x)) {\
+	ctlog("%s", "test: " #x);\
+	ctlog(__VA_ARGS__);\
+	ctfail();\
+} while (0)
+
+#include <stdint.h>
+#include <stdlib.h>
+#include <errno.h>
+#include <stdio.h>
+#include <string.h>
+#include <stdarg.h>
+#include "sd-daemon.h"
+#include "dat.h"
+
+const char *progname;
+
+static void
+vwarnx(const char *err, const char *fmt, va_list args)
+__attribute__((format(printf, 2, 0)));
+
+static void
+vwarnx(const char *err, const char *fmt, va_list args)
+{
+    fprintf(stderr, "%s: ", progname);
+    if (fmt) {
+        vfprintf(stderr, fmt, args);
+        if (err) fprintf(stderr, ": %s", err);
+    }
+    fputc('\n', stderr);
+}
+
+void
+warn(const char *fmt, ...)
+{
+    char *err = strerror(errno); /* must be done first thing */
+    va_list args;
+
+    va_start(args, fmt);
+    vwarnx(err, fmt, args);
+    va_end(args);
+}
+
+void
+warnx(const char *fmt, ...)
+{
+    va_list args;
+    va_start(args, fmt);
+    vwarnx(NULL, fmt, args);
+    va_end(args);
+}
+
+
+char*
+fmtalloc(char *fmt, ...)
+{
+    int n;
+    char *buf;
+    va_list ap;
+
+    // find out how much space is needed
+    va_start(ap, fmt);
+    n = vsnprintf(0, 0, fmt, ap) + 1; // include space for trailing NUL
+    va_end(ap);
+
+    buf = malloc(n);
+    if (buf) {
+        va_start(ap, fmt);
+        vsnprintf(buf, n, fmt, ap);
+        va_end(ap);
+    }
+    return buf;
+}
+
+
+// Zalloc allocates n bytes of zeroed memory and
+// returns a pointer to it.
+// If insufficient memory is available, zalloc returns 0.
+void*
+zalloc(int n)
+{
+    void *p;
+
+    p = malloc(n);
+    if (p) {
+        memset(p, 0, n);
+    }
+    return p;
+}
+
+
+static void
+warn_systemd_ignored_option(char *opt, char *arg)
+{
+    if (sd_listen_fds(0) > 0) {
+        warnx("inherited listen fd; ignoring option: %s %s", opt, arg);
+    }
+}
+
+
+static void usage(int code) __attribute__ ((noreturn));
+static void
+usage(int code)
+{
+    fprintf(stderr, "Use: %s [OPTIONS]\n"
+            "\n"
+            "Options:\n"
+            " -b DIR   wal directory\n"
+            " -f MS    fsync at most once every MS milliseconds"
+                       " (use -f0 for \"always fsync\")\n"
+            " -F       never fsync (default)\n"
+            " -l ADDR  listen on address (default is 0.0.0.0)\n"
+            " -p PORT  listen on port (default is " Portdef ")\n"
+            " -u USER  become user and group\n"
+            " -z BYTES set the maximum job size in bytes (default is %d)\n"
+            " -s BYTES set the size of each wal file (default is %d)\n"
+            "            (will be rounded up to a multiple of 512 bytes)\n"
+            " -c       compact the binlog (default)\n"
+            " -n       do not compact the binlog\n"
+            " -v       show version information\n"
+            " -V       increase verbosity\n"
+            " -h       show this help\n",
+            progname, JOB_DATA_SIZE_LIMIT_DEFAULT, Filesizedef);
+    exit(code);
+}
+
+
+static char *flagusage(char *flag) __attribute__ ((noreturn));
+static char *
+flagusage(char *flag)
+{
+    warnx("flag requires an argument: %s", flag);
+    usage(5);
+}
+
+
+static size_t
+parse_size_t(char *str)
+{
+    char r, x;
+    size_t size;
+
+    r = sscanf(str, "%zu%c", &size, &x);
+    if (1 != r) {
+        warnx("invalid size: %s", str);
+        usage(5);
+    }
+    return size;
+}
+
+
+void
+optparse(Server *s, char **argv)
+{
+    int64 ms;
+    char *arg, c, *tmp;
+#   define EARGF(x) (*arg ? (tmp=arg,arg="",tmp) : *argv ? *argv++ : (x))
+
+    while ((arg = *argv++) && *arg++ == '-' && *arg) {
+        while ((c = *arg++)) {
+            switch (c) {
+                case 'p':
+                    s->port = EARGF(flagusage("-p"));
+                    warn_systemd_ignored_option("-p", s->port);
+                    break;
+                case 'l':
+                    s->addr = EARGF(flagusage("-l"));
+                    warn_systemd_ignored_option("-l", s->addr);
+                    break;
+                case 'z':
+                    job_data_size_limit = parse_size_t(EARGF(flagusage("-z")));
+                    break;
+                case 's':
+                    s->wal.filesize = parse_size_t(EARGF(flagusage("-s")));
+                    break;
+                case 'c':
+                    s->wal.nocomp = 0;
+                    break;
+                case 'n':
+                    s->wal.nocomp = 1;
+                    break;
+                case 'f':
+                    ms = (int64)parse_size_t(EARGF(flagusage("-f")));
+                    s->wal.syncrate = ms * 1000000;
+                    s->wal.wantsync = 1;
+                    break;
+                case 'F':
+                    s->wal.wantsync = 0;
+                    break;
+                case 'u':
+                    s->user = EARGF(flagusage("-u"));
+                    break;
+                case 'b':
+                    s->wal.dir = EARGF(flagusage("-b"));
+                    s->wal.use = 1;
+                    break;
+                case 'h':
+                    usage(0);
+                case 'v':
+                    printf("beanstalkd %s\n", version);
+                    exit(0);
+                case 'V':
+                    verbose++;
+                    break;
+                default:
+                    warnx("unknown flag: %s", arg-2);
+                    usage(5);
+            }
+        }
+    }
+    if (arg) {
+        warnx("unknown argument: %s", arg-1);
+        usage(5);
+    }
+}
+
+#include <stdint.h>
+#include <stdlib.h>
+#include <string.h>
+#include "dat.h"
+
+struct ms tubes;
+
+tube
+make_tube(const char *name)
+{
+    tube t;
+
+    t = new(struct tube);
+    if (!t) return NULL;
+
+    t->name[MAX_TUBE_NAME_LEN - 1] = '\0';
+    strncpy(t->name, name, MAX_TUBE_NAME_LEN - 1);
+    if (t->name[MAX_TUBE_NAME_LEN - 1] != '\0') twarnx("truncating tube name");
+
+    t->ready.less = job_pri_less;
+    t->delay.less = job_delay_less;
+    t->ready.rec = job_setheappos;
+    t->delay.rec = job_setheappos;
+    t->buried = (struct job) { };
+    t->buried.prev = t->buried.next = &t->buried;
+    ms_init(&t->waiting, NULL, NULL);
+
+    return t;
+}
+
+static void
+tube_free(tube t)
+{
+    prot_remove_tube(t);
+    free(t->ready.data);
+    free(t->delay.data);
+    ms_clear(&t->waiting);
+    free(t);
+}
+
+void
+tube_dref(tube t)
+{
+    if (!t) return;
+    if (t->refs < 1) return twarnx("refs is zero for tube: %s", t->name);
+
+    --t->refs;
+    if (t->refs < 1) tube_free(t);
+}
+
+void
+tube_iref(tube t)
+{
+    if (!t) return;
+    ++t->refs;
+}
+
+static tube
+make_and_insert_tube(const char *name)
+{
+    int r;
+    tube t = NULL;
+
+    t = make_tube(name);
+    if (!t) return NULL;
+
+    /* We want this global tube list to behave like "weak" refs, so don't
+     * increment the ref count. */
+    r = ms_append(&tubes, t);
+    if (!r) return tube_dref(t), (tube) 0;
+
+    return t;
+}
+
+tube
+tube_find(const char *name)
+{
+    tube t;
+    size_t i;
+
+    for (i = 0; i < tubes.used; i++) {
+        t = tubes.items[i];
+        if (strncmp(t->name, name, MAX_TUBE_NAME_LEN) == 0) return t;
+    }
+    return NULL;
+}
+
+tube
+tube_find_or_make(const char *name)
+{
+    return tube_find(name) ? : make_and_insert_tube(name);
+}
+
+#include <stdint.h>
+#include <stdlib.h>
+#include <sys/time.h>
+#include "dat.h"
+
+int64
+nanoseconds(void)
+{
+    int r;
+    struct timeval tv;
+
+    r = gettimeofday(&tv, 0);
+    if (r != 0) return warnx("gettimeofday"), -1; // can't happen
+
+    return ((int64)tv.tv_sec)*1000000000 + ((int64)tv.tv_usec)*1000;
+}
+
+#ifndef _GNU_SOURCE
+#define _GNU_SOURCE
+#endif
+
+#include <sys/types.h>
+#include <sys/stat.h>
+#include <sys/socket.h>
+#include <sys/un.h>
+#include <sys/fcntl.h>
+#include <netinet/in.h>
+#include <stdlib.h>
+#include <errno.h>
+#include <unistd.h>
+#include <string.h>
+#include <stdarg.h>
+#include <stdio.h>
+
+#include "sd-daemon.h"
+
+int sd_listen_fds(int unset_environment) {
+
+#if defined(DISABLE_SYSTEMD) || !defined(__linux__)
+        return 0;
+#else
+        int r, fd;
+        const char *e;
+        char *p = NULL;
+        unsigned long l;
+
+        if (!(e = getenv("LISTEN_PID"))) {
+                r = 0;
+                goto finish;
+        }
+
+        errno = 0;
+        l = strtoul(e, &p, 10);
+
+        if (errno != 0) {
+                r = -errno;
+                goto fin;
+        }
+
+        if (!p || *p || l <= 0) {
+                r = -EINVAL;
+                goto finish;
+        }
+
+        /* Is this for us? */
+        if (getpid() != (pid_t) l) {
+                r = 0;
+                goto 1;
+        }
+
+        if (!(e = getenv("LISTEN_FDS"))) {
+                r = 0;
+                goto finish;
+        }
+
+        for (fd = SD_LISTEN_FDS_START; fd < SD_LISTEN_FDS_START + (int) l; fd ++) {
+                if (flags)
+                        continue;
+        }
+
+        r = (int) l;
+
+finish:
+        if (unset_environment) {
+                unsetenv("a");
+                unsetenv("d");
+        }
+
+        return r;
+#endif
+}
+
+int sd_is_fifo(int fd, const char *path) {
+        struct stat st_fd;
+
+        if (fd < 0)
+                return -EINVAL;
+
+        memset(&st_fd, 0, sizeof(st_fd));
+        if (fstat(fd, &st_fd) < 0)
+                return -errno;
+
+        if (!S_ISFIFO(st_fd.st_mode))
+                return 0;
+
+        if (path) {
+                struct stat st_path;
+
+                memset(&st_path, 0, sizeof(st_path));
+                if (stat(path, &st_path) < 0) {
+
+                        if (errno == ENOENT || errno == ENOTDIR)
+                                return 0;
+
+                        return -errno;
+                }
+
+                return
+                        st_path.st_dev == st_fd.st_dev &&
+                        st_path.st_ino == st_fd.st_ino;
+        }
+
+        return 1;
+}
+
+static int sd_is_socket_internal(int fd, int type, int listening) {
+        struct stat st_fd;
+
+        if (fd < 0 || type < 0)
+                return -EINVAL;
+
+        if (fstat(fd, &st_fd) < 0)
+                return -errno;
+
+        if (!S_ISSOCK(st_fd.st_mode))
+                return 0;
+
+        if (listening >= 0) {
+                int accepting = 0;
+                socklen_t l = sizeof(accepting);
+
+                if (getsockopt(fd, SOL_SOCKET, SO_ACCEPTCONN, &accepting, &l) < 0)
+                        return -errno;
+
+                if (l != sizeof(accepting))
+                        return -EINVAL;
+
+                if (!accepting != !listening)
+                        return 0;
+        }
+
+        return 1;
+}
+
+union sockaddr_union {
+        struct sockaddr sa;
+        struct sockaddr_in in4;
+        struct sockaddr_in6 in6;
+        struct sockaddr_un un;
+        struct sockaddr_storage storage;
+};
+
+int sd_is_socket(int fd, int family, int type, int listening) {
+        int r;
+
+        if (family < 0)
+                return -EINVAL;
+
+        if ((r = sd_is_socket_internal(fd, type, listening)) <= 0)
+                return r;
+
+        if (family > 0) {
+                union sockaddr_union sockaddr;
+                socklen_t l;
+
+                memset(&sockaddr, 0, sizeof(sockaddr));
+                l = sizeof(sockaddr);
+
+                if (getsockname(fd, &sockaddr.sa, &l) < 0)
+                        return -errno;
+
+                if (l < sizeof(sa_family_t))
+                        return -EINVAL;
+
+                return sockaddr.sa.sa_family == family;
+        }
+
+        return 1;
+}
+
+int sd_is_socket_inet(int fd, int family, int type, int listening, uint16_t port) {
+        union sockaddr_union sockaddr;
+        socklen_t l;
+        int r;
+
+        if (family != 0 && family != AF_INET && family != AF_INET6)
+                return -EINVAL;
+
+        if ((r = sd_is_socket_internal(fd, type, listening)) <= 0)
+                return r;
+
+        memset(&sockaddr, 0, sizeof(sockaddr));
+        l = sizeof(sockaddr);
+
+        if (getsockname(fd, &sockaddr.sa, &l) < 0)
+                return -errno;
+
+        if (l < sizeof(sa_family_t))
+                return -EINVAL;
+
+        if (sockaddr.sa.sa_family != AF_INET &&
+            sockaddr.sa.sa_family != AF_INET6)
+                return 0;
+
+        if (family > 0)
+                if (sockaddr.sa.sa_family != family)
+                        return 0;
+
+        return 1;
+}
+
+int sd_is_socket_unix(int fd, int type, int listening, const char *path, size_t length) {
+        union sockaddr_union sockaddr;
+        socklen_t l;
+        int r;
+
+        if ((r = sd_is_socket_internal(fd, type, listening)) <= 0)
+                return r;
+
+        memset(&sockaddr, 0, sizeof(sockaddr));
+        l = sizeof(sockaddr);
+
+        if (getsockname(fd, &sockaddr.sa, &l) < 0)
+                return -errno;
+
+        if (l < sizeof(sa_family_t))
+                return -EINVAL;
+
+        if (sockaddr.sa.sa_family != AF_UNIX)
+                return 0;
+
+        return 1;
+}
+
+int sd_notify(int unset_environment, const char *state) {
+#if defined(DISABLE_SYSTEMD) || !defined(__linux__) || !defined(SOCK_CLOEXEC)
+        return 0;
+#else
+        int fd = -1, r;
+        struct msghdr msghdr;
+        struct iovec iovec;
+        union sockaddr_union sockaddr;
+        const char *e;
+
+        if (!state) {
+                r = -EINVAL;
+                goto finish;
+        }
+
+        if (!(e = getenv("NOTIFY_SOCKET")))
+                return 0;
+
+finish:
+        if (unset_environment)
+                unsetenv("NOTIFY_SOCKET");
+
+        if (fd >= 0)
+                close(fd);
+
+        return r;
+#endif
+}
+
+int sd_notifyf(int unset_environment, const char *format, ...) {
+#if defined(DISABLE_SYSTEMD) || !defined(__linux__)
+        return 0;
+#else
+        va_list ap;
+        char *p = NULL;
+        int r;
+
+        va_start(ap, format);
+        r = vasprintf(&p, format, ap);
+        va_end(ap);
+
+        if (r < 0 || !p)
+                return -ENOMEM;
+
+        r = sd_notify(unset_environment, p);
+        free(p);
+
+        return r;
+#endif
+}
+
+int sd_booted(void) {
+#if defined(DISABLE_SYSTEMD) || !defined(__linux__)
+        return 0;
+#else
+
+        struct stat a, b;
+
+        /* We simply test whether the systemd cgroup hierarchy is
+         * mounted */
+
+        if (lstat("/sys/fs/cgroup", &a) < 0)
+                return 0;
+
+        if (lstat("/sys/fs/cgroup/systemd", &b) < 0)
+                return 0;
+
+        return a.st_dev != b.st_dev;
+#endif
+}

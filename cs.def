@@ -1,0 +1,4071 @@
+// Copyright (c) Microsoft. All rights reserved.
+// Licensed under the MIT license. See LICENSE file in the project root for full license information.
+
+using System;
+using System.Text;
+using System.Globalization;
+using System.IO;
+using System.Collections;
+
+namespace System.Diagnostics
+{
+    public class DelimitedListTraceListener : TextWriterTraceListener
+    {
+        private string _delimiter = ";";
+        private string _secondaryDelim = ",";
+
+        public DelimitedListTraceListener(Stream stream) : base(stream)
+        {
+        }
+
+        public DelimitedListTraceListener(Stream stream, string name) : base(stream, name)
+        {
+        }
+
+        public DelimitedListTraceListener(TextWriter writer) : base(writer)
+        {
+        }
+
+        public DelimitedListTraceListener(TextWriter writer, string name) : base(writer, name)
+        {
+        }
+
+        public string Delimiter
+        {
+            get
+            {
+                return _delimiter;
+            }
+            set
+            {
+                if (value == null)
+                    throw new ArgumentNullException("Delimiter");
+
+                if (value.Length == 0)
+                    throw new ArgumentException(SR.Format(SR.Generic_ArgCantBeEmptyString, "Delimiter"));
+
+                lock (this)
+                {
+                    _delimiter = value;
+                }
+
+                if (_delimiter == ",")
+                    _secondaryDelim = ";";
+                else
+                    _secondaryDelim = ",";
+            }
+        }
+
+
+        public override void TraceEvent(TraceEventCache eventCache, String source, TraceEventType eventType, int id, string format, params object[] args)
+        {
+            if (Filter != null && !Filter.ShouldTrace(eventCache, source, eventType, id, format, args, null, null))
+                return;
+
+            WriteHeader(source, eventType, id);
+
+            if (args != null)
+                WriteEscaped(String.Format(CultureInfo.InvariantCulture, format, args));
+            else
+                WriteEscaped(format);
+            Write(Delimiter); // Use get_Delimiter
+
+            // one more delimiter for the data object
+            Write(Delimiter); // Use get_Delimiter
+
+            WriteFooter(eventCache);
+        }
+
+        public override void TraceEvent(TraceEventCache eventCache, String source, TraceEventType eventType, int id, string message)
+        {
+            if (Filter != null && !Filter.ShouldTrace(eventCache, source, eventType, id, message, null, null, null))
+                return;
+
+            WriteHeader(source, eventType, id);
+
+            WriteEscaped(message);
+            Write(Delimiter); // Use get_Delimiter
+
+            // one more delimiter for the data object
+            Write(Delimiter); // Use get_Delimiter
+
+            WriteFooter(eventCache);
+        }
+
+        public override void TraceData(TraceEventCache eventCache, String source, TraceEventType eventType, int id, object data)
+        {
+            if (Filter != null && !Filter.ShouldTrace(eventCache, source, eventType, id, null, null, data, null))
+                return;
+
+            WriteHeader(source, eventType, id);
+
+            // first a delimiter for the message
+            Write(Delimiter); // Use get_Delimiter
+
+            WriteEscaped(data.ToString());
+            Write(Delimiter); // Use get_Delimiter
+
+            WriteFooter(eventCache);
+        }
+
+        public override void TraceData(TraceEventCache eventCache, String source, TraceEventType eventType, int id, params object[] data)
+        {
+            if (Filter != null && !Filter.ShouldTrace(eventCache, source, eventType, id, null, null, null, data))
+                return;
+
+            WriteHeader(source, eventType, id);
+
+            // first a delimiter for the message
+            Write(Delimiter); // Use get_Delimiter
+
+            if (data != null)
+            {
+                for (int i = 0; i < data.Length; i++)
+                {
+                    if (i != 0)
+                        Write(_secondaryDelim);
+                    WriteEscaped(data[i].ToString());
+                }
+            }
+            Write(Delimiter); // Use get_Delimiter
+
+            WriteFooter(eventCache);
+        }
+
+        private void WriteHeader(String source, TraceEventType eventType, int id)
+        {
+            WriteEscaped(source);
+            Write(Delimiter); // Use get_Delimiter
+
+            Write(eventType.ToString());
+            Write(Delimiter); // Use get_Delimiter
+
+            Write(id.ToString(CultureInfo.InvariantCulture));
+            Write(Delimiter); // Use get_Delimiter
+        }
+
+        private void WriteFooter(TraceEventCache eventCache)
+        {
+            if (eventCache != null)
+            {
+                if (IsEnabled(TraceOptions.ProcessId))
+                    Write(eventCache.ProcessId.ToString(CultureInfo.InvariantCulture));
+                Write(Delimiter); // Use get_Delimiter
+
+                if (IsEnabled(TraceOptions.ThreadId))
+                    WriteEscaped(eventCache.ThreadId);
+                Write(Delimiter); // Use get_Delimiter
+
+                if (IsEnabled(TraceOptions.DateTime))
+                    WriteEscaped(eventCache.DateTime.ToString("o", CultureInfo.InvariantCulture));
+                Write(Delimiter); // Use get_Delimiter
+
+                if (IsEnabled(TraceOptions.Timestamp))
+                    Write(eventCache.Timestamp.ToString(CultureInfo.InvariantCulture));
+                Write(Delimiter); // Use get_Delimiter
+            }
+            else
+            {
+                for (int i = 0; i < 5; i++)
+                    Write(Delimiter); // Use get_Delimiter
+            }
+
+            WriteLine("");
+        }
+
+        private void WriteEscaped(string message)
+        {
+            if (!String.IsNullOrEmpty(message))
+            {
+                StringBuilder sb = new StringBuilder("\"");
+                int index;
+                int lastindex = 0;
+                while ((index = message.IndexOf('"', lastindex)) != -1)
+                {
+                    sb.Append(message, lastindex, index - lastindex);
+                    sb.Append("\"\"");
+                    lastindex = index + 1;
+                }
+
+                sb.Append(message, lastindex, message.Length - lastindex);
+                sb.Append("\"");
+                Write(sb.ToString());
+            }
+        }
+
+        private bool IsEnabled(TraceOptions opts)
+        {
+            return (opts & TraceOutputOptions) != 0;
+        }
+    }
+}
+
+// Copyright (c) Microsoft. All rights reserved.
+// Licensed under the MIT license. See LICENSE file in the project root for full license information.
+
+using System;
+using System.IO;
+using System.Text;
+using System.Runtime.InteropServices;
+
+namespace System.Diagnostics
+{
+    /// <devdoc>
+    ///    <para>Directs tracing or debugging output to
+    ///       a <see cref='T:System.IO.TextWriter'/> or to a <see cref='T:System.IO.Stream'/>,
+    ///       such as <see cref='F:System.Console.Out'/> or <see cref='T:System.IO.FileStream'/>.</para>
+    /// </devdoc>
+    public class TextWriterTraceListener : TraceListener
+    {
+        internal TextWriter writer;
+
+        /// <devdoc>
+        /// <para>Initializes a new instance of the <see cref='System.Diagnostics.TextWriterTraceListener'/> class with
+        /// <see cref='System.IO.TextWriter'/>
+        /// as the output recipient.</para>
+        /// </devdoc>
+        public TextWriterTraceListener()
+        {
+        }
+
+        /// <devdoc>
+        /// <para>Initializes a new instance of the <see cref='System.Diagnostics.TextWriterTraceListener'/> class, using the
+        ///    stream as the recipient of the debugging and tracing output.</para>
+        /// </devdoc>
+        public TextWriterTraceListener(Stream stream)
+            : this(stream, string.Empty)
+        {
+        }
+
+        /// <devdoc>
+        /// <para>Initializes a new instance of the <see cref='System.Diagnostics.TextWriterTraceListener'/> class with the
+        ///    specified name and using the stream as the recipient of the debugging and tracing output.</para>
+        /// </devdoc>
+        public TextWriterTraceListener(Stream stream, string name)
+            : base(name)
+        {
+            if (stream == null) throw new ArgumentNullException("stream");
+            this.writer = new StreamWriter(stream);
+        }
+
+        /// <devdoc>
+        /// <para>Initializes a new instance of the <see cref='System.Diagnostics.TextWriterTraceListener'/> class using the
+        ///    specified writer as recipient of the tracing or debugging output.</para>
+        /// </devdoc>
+        public TextWriterTraceListener(TextWriter writer)
+            : this(writer, string.Empty)
+        {
+        }
+
+        /// <devdoc>
+        /// <para>Initializes a new instance of the <see cref='System.Diagnostics.TextWriterTraceListener'/> class with the
+        ///    specified name and using the specified writer as recipient of the tracing or
+        ///    debugging
+        ///    output.</para>
+        /// </devdoc>
+        public TextWriterTraceListener(TextWriter writer, string name)
+            : base(name)
+        {
+            if (writer == null) throw new ArgumentNullException("writer");
+            this.writer = writer;
+        }
+
+        /// <devdoc>
+        ///    <para> Indicates the text writer that receives the tracing
+        ///       or debugging output.</para>
+        /// </devdoc>
+        public TextWriter Writer
+        {
+            get
+            {
+                return writer;
+            }
+
+            set
+            {
+                writer = value;
+            }
+        }
+
+        /// <internalonly/>
+        /// <devdoc>
+        /// </devdoc>
+        protected override void Dispose(bool disposing)
+        {
+            try
+            {
+                if (disposing && writer != null)
+                {
+                    writer.Dispose();
+                }
+            }
+            finally
+            {
+                base.Dispose(disposing);
+            }
+        }
+
+        /// <devdoc>
+        /// <para>Flushes the output buffer for the <see cref='System.Diagnostics.TextWriterTraceListener.Writer'/>.</para>
+        /// </devdoc>
+        public override void Flush()
+        {
+            try
+            {
+                if (writer != null)
+                    writer.Flush();
+            }
+            catch (ObjectDisposedException) { }
+        }
+
+        /// <devdoc>
+        ///    <para>Writes a message
+        ///       to this instance's <see cref='System.Diagnostics.TextWriterTraceListener.Writer'/>.</para>
+        /// </devdoc>
+        public override void Write(string message)
+        {
+            if (writer != null)
+            {
+                if (NeedIndent) WriteIndent();
+                try
+                {
+                    writer.Write(message);
+                }
+                catch (ObjectDisposedException) { }
+            }
+        }
+
+        /// <devdoc>
+        ///    <para>Writes a message
+        ///       to this instance's <see cref='System.Diagnostics.TextWriterTraceListener.Writer'/> followed by a line terminator. The
+        ///       default line terminator is a carriage return followed by a line feed (\r\n).</para>
+        /// </devdoc>
+        public override void WriteLine(string message)
+        {
+            if (writer != null)
+            {
+                if (NeedIndent) WriteIndent();
+                try
+                {
+                    writer.WriteLine(message);
+                    NeedIndent = true;
+                }
+                catch (ObjectDisposedException) { }
+            }
+        }
+    }
+}
+
+// Copyright (c) Microsoft. All rights reserved.
+// Licensed under the MIT license. See LICENSE file in the project root for full license information.
+
+using System.Collections.Generic;
+using System.Runtime.InteropServices;
+using System.Text;
+
+namespace System.IO
+{
+    /// <summary>Provides an implementation of FileSystem for Unix systems.</summary>
+    internal sealed partial class UnixFileSystem : FileSystem
+    {
+        /// <summary>The maximum path length for the system.  -1 if it hasn't yet been initialized.</summary>
+        private static int _maxPath = -1;
+        /// <summary>The maximum name length for the system.  -1 if it hasn't yet been initialized.</summary>
+        private static int _maxName = -1;
+
+        public override int MaxPath
+        {
+            get
+            {
+                Interop.libc.GetPathConfValue(ref _maxPath, Interop.libc.PathConfNames._PC_PATH_MAX, Interop.libc.DEFAULT_PC_PATH_MAX);
+                return _maxPath;
+            }
+        }
+
+        public override int MaxDirectoryPath
+        {
+            get
+            {
+                Interop.libc.GetPathConfValue(ref _maxName, Interop.libc.PathConfNames._PC_NAME_MAX, Interop.libc.DEFAULT_PC_NAME_MAX);
+                return _maxName;
+            }
+        }
+
+        public override FileStreamBase Open(string fullPath, FileMode mode, FileAccess access, FileShare share, int bufferSize, FileOptions options, FileStream parent)
+        {
+            return new UnixFileStream(fullPath, mode, access, share, bufferSize, options, parent);
+        }
+
+        public override void CopyFile(string sourceFullPath, string destFullPath, bool overwrite)
+        {
+            // Note: we could consider using sendfile here, but it isn't part of the POSIX spec, and
+            // has varying degrees of support on different systems.
+
+            // Copy the contents of the file from the source to the destination, creating the destination in the process
+            const int bufferSize = FileStream.DefaultBufferSize;
+            const bool useAsync = false;
+            using (Stream src = new FileStream(sourceFullPath, FileMode.Open, FileAccess.Read, FileShare.Read, bufferSize, useAsync))
+            using (Stream dst = new FileStream(destFullPath, overwrite ? FileMode.CreateNew : FileMode.Create, FileAccess.ReadWrite, FileShare.None, bufferSize, useAsync))
+            {
+                src.CopyTo(dst);
+            }
+
+            // Now copy over relevant read/write/execute permissions from the source to the destination
+            Interop.libc.structStat stat;
+            while (Interop.CheckIo(Interop.libc.stat(sourceFullPath, out stat), sourceFullPath)) ;
+            int newMode = stat.st_mode & (int)Interop.libc.Permissions.Mask;
+            while (Interop.CheckIo(Interop.libc.chmod(destFullPath, newMode), destFullPath)) ;
+        }
+
+        public override void MoveFile(string sourceFullPath, string destFullPath)
+        {
+            while (Interop.libc.rename(sourceFullPath, destFullPath) < 0)
+            {
+                int errno = Marshal.GetLastWin32Error();
+                if (errno == Interop.Errors.EINTR) // interrupted; try again
+                {
+                    continue;
+                }
+                else if (errno == Interop.Errors.EXDEV) // rename fails across devices / mount points
+                {
+                    CopyFile(sourceFullPath, destFullPath, overwrite: false);
+                    DeleteFile(sourceFullPath);
+                    break;
+                }
+                else
+                {
+                    throw Interop.GetExceptionForIoErrno(errno);
+                }
+            }
+        }
+
+        public override void DeleteFile(string fullPath)
+        {
+            while (Interop.libc.remove(fullPath) < 0)
+            {
+                int errno = Marshal.GetLastWin32Error();
+                if (errno == Interop.Errors.EINTR) // interrupted; try again
+                {
+                    continue;
+                }
+                else if (errno == Interop.Errors.ENOENT) // already doesn't exist; nop
+                {
+                    break;
+                }
+                else
+                {
+                    throw Interop.GetExceptionForIoErrno(errno, fullPath);
+                }
+            }
+        }
+
+        public override bool FileExists(string fullPath)
+        {
+            while (Interop.libc.access(fullPath, Interop.libc.AccessModes.F_OK) < 0)
+            {
+                if (Marshal.GetLastWin32Error() == Interop.Errors.EINTR)
+                {
+                    continue;
+                }
+                return false;
+            }
+            return true;
+        }
+
+        public override void CreateDirectory(string fullPath)
+        {
+            // NOTE: This logic is primarily just carried forward from Win32FileSystem.CreateDirectory.
+
+            int length = fullPath.Length;
+
+            // We need to trim the trailing slash or the code will try to create 2 directories of the same name.
+            if (length >= 2 && PathHelpers.EndsInDirectorySeparator(fullPath))
+            {
+                length--;
+            }
+
+            // For paths that are only // or ///
+            if (length == 2 && PathHelpers.IsDirectorySeparator(fullPath[1]))
+            {
+                throw new IOException(SR.Format(SR.IO_CannotCreateDirectory, fullPath));
+            }
+
+            // We can save a bunch of work if the directory we want to create already exists.
+            if (DirectoryExists(fullPath))
+            {
+                return;
+            }
+
+            // Attempt to figure out which directories don't exist, and only create the ones we need.
+            bool somepathexists = false;
+            Stack<string> stackDir = new Stack<string>();
+            int lengthRoot = PathHelpers.GetRootLength(fullPath);
+            if (length > lengthRoot)
+            {
+                int i = length - 1;
+                while (i >= lengthRoot && !somepathexists)
+                {
+                    string dir = fullPath.Substring(0, i + 1);
+                    if (!DirectoryExists(dir)) // Create only the ones missing
+                    {
+                        stackDir.Push(dir);
+                    }
+                    else
+                    {
+                        somepathexists = true;
+                    }
+
+                    while (i > lengthRoot && !PathHelpers.IsDirectorySeparator(fullPath[i]))
+                    {
+                        i--;
+                    }
+                    i--;
+                }
+            }
+
+            int count = stackDir.Count;
+            if (count == 0 && !somepathexists)
+            {
+                string root = Directory.InternalGetDirectoryRoot(fullPath);
+                if (!DirectoryExists(root))
+                {
+                    throw Interop.GetExceptionForIoErrno(Interop.Errors.ENOENT, fullPath, isDirectory: true);
+                }
+                return;
+            }
+
+            // Create all the directories
+            int result = 0;
+            int firstError = 0;
+            string errorString = fullPath;
+            while (stackDir.Count > 0)
+            {
+                string name = stackDir.Pop();
+                if (name.Length >= MaxDirectoryPath)
+                {
+                    throw new PathTooLongException(SR.IO_PathTooLong);
+                }
+
+                int errno = 0;
+                while ((result = Interop.libc.mkdir(name, (int)Interop.libc.Permissions.S_IRWXU)) < 0 && (errno = Marshal.GetLastWin32Error()) == Interop.Errors.EINTR) ;
+                if (result < 0 && firstError == 0)
+                {
+                    // While we tried to avoid creating directories that don't
+                    // exist above, there are a few cases that can fail, e.g.
+                    // a race condition where another process or thread creates
+                    // the directory first, or there's a file at the location.
+                    if (errno != Interop.Errors.EEXIST)
+                    {
+                        firstError = errno;
+                    }
+                    else if (FileExists(name) || (!DirectoryExists(name, out errno) && errno == Interop.Errors.EACCES))
+                    {
+                        // If there's a file in this directory's place, or if we have ERROR_ACCESS_DENIED when checking if the directory already exists throw.
+                        firstError = errno;
+                        errorString = name;
+                    }
+                }
+            }
+
+            // Only throw an exception if creating the exact directory we wanted failed to work correctly.
+            if (result < 0 && firstError != 0)
+            {
+                throw Interop.GetExceptionForIoErrno(firstError, errorString, isDirectory: true);
+            }
+        }
+
+        public override void MoveDirectory(string sourceFullPath, string destFullPath)
+        {
+            while (Interop.libc.rename(sourceFullPath, destFullPath) < 0)
+            {
+                int errno = Marshal.GetLastWin32Error();
+                switch (errno)
+                {
+                    case Interop.Errors.EINTR: // interrupted; try again
+                        continue;
+                    case Interop.Errors.EACCES: // match Win32 exception
+                        throw new IOException(SR.Format(SR.UnauthorizedAccess_IODenied_Path, sourceFullPath), errno);
+                    default:
+                        throw Interop.GetExceptionForIoErrno(errno, sourceFullPath, isDirectory: true);
+                }
+            }
+        }
+
+        public override void RemoveDirectory(string fullPath, bool recursive)
+        {
+            if (!DirectoryExists(fullPath))
+            {
+                throw Interop.GetExceptionForIoErrno(Interop.Errors.ENOENT, fullPath, isDirectory: true);
+            }
+            RemoveDirectoryInternal(fullPath, recursive, throwOnTopLevelDirectoryNotFound: true);
+        }
+
+        private void RemoveDirectoryInternal(string fullPath, bool recursive, bool throwOnTopLevelDirectoryNotFound)
+        {
+            Exception firstException = null;
+
+            if (recursive)
+            {
+                try
+                {
+                    foreach (string item in EnumeratePaths(fullPath, "*", SearchOption.TopDirectoryOnly, SearchTarget.Both))
+                    {
+                        if (!ShouldIgnoreDirectory(Path.GetFileName(item)))
+                        {
+                            try
+                            {
+                                if (DirectoryExists(item))
+                                {
+                                    RemoveDirectoryInternal(item, recursive, throwOnTopLevelDirectoryNotFound: false);
+                                }
+                                else
+                                {
+                                    DeleteFile(item);
+                                }
+                            }
+                            catch (Exception exc)
+                            {
+                                if (firstException != null)
+                                {
+                                    firstException = exc;
+                                }
+                            }
+                        }
+                    }
+                }
+                catch (Exception exc)
+                {
+                    if (firstException != null)
+                    {
+                        firstException = exc;
+                    }
+                }
+
+                if (firstException != null)
+                {
+                    throw firstException;
+                }
+            }
+
+            while (Interop.libc.remove(fullPath) < 0)
+            {
+                int errno = Marshal.GetLastWin32Error();
+                switch (errno)
+                {
+                    case Interop.Errors.EINTR: // interrupted; try again
+                        continue;
+                    case Interop.Errors.EACCES:
+                        throw new IOException(SR.Format(SR.UnauthorizedAccess_IODenied_Path, fullPath)); // match Win32 exception
+                    case Interop.Errors.ENOENT:
+                        if (!throwOnTopLevelDirectoryNotFound)
+                        {
+                            return;
+                        }
+                        goto default;
+                    default:
+                        throw Interop.GetExceptionForIoErrno(errno, fullPath, isDirectory: true);
+                }
+            }
+        }
+
+        public override bool DirectoryExists(string fullPath)
+        {
+            int errno;
+            return DirectoryExists(fullPath, out errno);
+        }
+
+        private bool DirectoryExists(string fullPath, out int errno)
+        {
+            Interop.libc.structStat stat;
+            while (true)
+            {
+                errno = 0;
+                int result = Interop.libc.stat(fullPath, out stat);
+                if (result < 0)
+                {
+                    errno = Marshal.GetLastWin32Error();
+                    if (errno == Interop.Errors.EINTR)
+                    {
+                        continue;
+                    }
+                    return false;
+                }
+                return (stat.st_mode & (int)Interop.libc.FileTypes.S_IFMT) == (int)Interop.libc.FileTypes.S_IFDIR;
+            }
+        }
+
+        public override IEnumerable<string> EnumeratePaths(string fullPath, string searchPattern, SearchOption searchOption, SearchTarget searchTarget)
+        {
+            return EnumerateResults<string>(fullPath, searchPattern, searchOption, searchTarget, (path, _) => path);
+        }
+
+        public override IEnumerable<FileSystemInfo> EnumerateFileSystemInfos(string fullPath, string searchPattern, SearchOption searchOption, SearchTarget searchTarget)
+        {
+            switch (searchTarget)
+            {
+                case SearchTarget.Files:
+                    return EnumerateResults<FileInfo>(fullPath, searchPattern, searchOption, searchTarget, (path, isDir) =>
+                        new FileInfo(path, new UnixFileSystemObject(path, isDir)));
+                case SearchTarget.Directories:
+                    return EnumerateResults<DirectoryInfo>(fullPath, searchPattern, searchOption, searchTarget, (path, isDir) =>
+                        new DirectoryInfo(path, new UnixFileSystemObject(path, isDir)));
+                default:
+                    return EnumerateResults<FileSystemInfo>(fullPath, searchPattern, searchOption, searchTarget, (path, isDir) => isDir ?
+                        (FileSystemInfo)new DirectoryInfo(path, new UnixFileSystemObject(path, isDir)) :
+                        (FileSystemInfo)new FileInfo(path, new UnixFileSystemObject(path, isDir)));
+            }
+        }
+
+        private static IEnumerable<T> EnumerateResults<T>(string fullPath, string searchPattern, SearchOption searchOption, SearchTarget searchTarget, Func<string, bool, T> translateResult)
+        {
+            // Maintain a stack of the directories to explore, in the case of SearchOption.AllDirectories
+            // Lazily-initialized only if we find subdirectories that will be explored.
+            Stack<string> toExplore = null;
+
+            // Check whether we care about files, directories, or both
+            bool includeFiles = (searchTarget & SearchTarget.Files) != 0;
+            bool includeDirectories = (searchTarget & SearchTarget.Directories) != 0;
+
+            // Process directories until we're out
+            string dirPath = fullPath;
+            do
+            {
+                // First time through the loop (the root directory), we've initialized dirPath to be the initial path,
+                // and toExplore will be null.  If toExplore is non-null, that means this is a subsequent iteration and
+                // it's been initialized to non-null because there are additional directories to traverse.
+                if (toExplore != null)
+                {
+                    dirPath = toExplore.Pop();
+                }
+
+                // Open an enumerator of its contents.
+                IntPtr pdir;
+                while (Interop.CheckIoPtr(pdir = Interop.libc.opendir(dirPath), dirPath, isDirectory: true)) ;
+                try
+                {
+                    // Read each entry from the enumerator
+                    IntPtr curEntry;
+                    while ((curEntry = Interop.libc.readdir(pdir)) != IntPtr.Zero) // no validation needed for readdir
+                    {
+                        // Get the name and full name of the entry
+                        string name = GetDirEntName(curEntry);
+                        string fullNewName = dirPath + "/" + name;
+
+                        // Determine whether the entry is a file or a directory and whether it matches the supplied pattern
+                        Interop.libc.structStat stat;
+                        while (Interop.CheckIo(Interop.libc.stat(fullNewName, out stat), fullNewName)) ;
+                        bool isDir = (stat.st_mode & (int)Interop.libc.FileTypes.S_IFMT) == (int)Interop.libc.FileTypes.S_IFDIR && !ShouldIgnoreDirectory(name);
+                        bool isFile = (stat.st_mode & (int)Interop.libc.FileTypes.S_IFMT) == (int)Interop.libc.FileTypes.S_IFREG;
+                        bool matchesSearchPattern = Interop.libc.fnmatch(searchPattern, name, Interop.libc.FnmatchFlags.None) == 0;
+
+                        // Yield the result if the user has asked for it.  In the case of directories,
+                        // always explore it by pushing it onto the stack, regardless of whether
+                        // we're returning directories.
+                        if (isDir)
+                        {
+                            if (includeDirectories && matchesSearchPattern)
+                            {
+                                yield return translateResult(fullNewName, /*isDirectory*/true);
+                            }
+                            if (searchOption == SearchOption.AllDirectories)
+                            {
+                                if (toExplore == null)
+                                {
+                                    toExplore = new Stack<string>();
+                                }
+                                toExplore.Push(fullNewName);
+                            }
+                        }
+                        else if (isFile && includeFiles && matchesSearchPattern)
+                        {
+                            yield return translateResult(fullNewName, /*isDirectory*/false);
+                        }
+                    }
+                }
+                finally
+                {
+                    // Close the directory enumerator
+                    while (Interop.CheckIo(Interop.libc.closedir(pdir), dirPath)) ;
+                }
+            }
+            while (toExplore != null && toExplore.Count > 0); // only loop again if we're recursively processing directories and have more to process
+        }
+
+        /// <summary>Gets the name of a directory from a dirent*.</summary>
+        /// <param name="dirEnt">
+        /// The pointer to the dirent.  It's represented as an IntPtr, as unsafe code
+        /// can't be used in iterators.
+        /// </param>
+        /// <returns>
+        /// The name extracted from the directory entry.
+        /// </returns>
+        private static unsafe string GetDirEntName(IntPtr dirEnt)
+        {
+            Interop.libc.dirent* curEntryPtr = (Interop.libc.dirent*)dirEnt;
+            return PtrToString(curEntryPtr->d_name);
+        }
+
+        /// <summary>Creates a string from a pointer to a sequence of null-terminated bytes.</summary>
+        /// <param name="buffer">A pointer to the first character in the string.  It must be null terminated.</param>
+        /// <returns>The string.</returns>
+        private static unsafe string PtrToString(byte* buffer)
+        {
+            int length = 0;
+            for (byte* ptr = buffer; *ptr != 0; ptr++, length++) ;
+            return Encoding.UTF8.GetString(buffer, length);
+        }
+
+        /// <summary>Determines whether the specified directory name should be ignored.</summary>
+        /// <param name="name">The name to evaluate.</param>
+        /// <returns>true if the name is "." or ".."; otherwise, false.</returns>
+        private static bool ShouldIgnoreDirectory(string name)
+        {
+            return name == "." || name == "..";
+        }
+
+        public override unsafe string GetCurrentDirectory()
+        {
+            byte[] pathBuffer = new byte[MaxPath];
+            fixed (byte* ptr = pathBuffer)
+            {
+                while (Interop.CheckIoPtr((IntPtr)Interop.libc.getcwd(ptr, (IntPtr)pathBuffer.Length))) ;
+                return PtrToString(ptr);
+            }
+        }
+
+        public override void SetCurrentDirectory(string fullPath)
+        {
+            while (Interop.CheckIo(Interop.libc.chdir(fullPath), fullPath)) ;
+        }
+
+        public override FileAttributes GetAttributes(string fullPath)
+        {
+            return new UnixFileSystemObject(fullPath, false).Attributes;
+        }
+
+        public override void SetAttributes(string fullPath, FileAttributes attributes)
+        {
+            new UnixFileSystemObject(fullPath, false).Attributes = attributes;
+        }
+
+        public override DateTimeOffset GetCreationTime(string fullPath)
+        {
+            return new UnixFileSystemObject(fullPath, false).CreationTime;
+        }
+
+        public override void SetCreationTime(string fullPath, DateTimeOffset time, bool asDirectory)
+        {
+            new UnixFileSystemObject(fullPath, asDirectory).CreationTime = time;
+        }
+
+        public override DateTimeOffset GetLastAccessTime(string fullPath)
+        {
+            return new UnixFileSystemObject(fullPath, false).LastAccessTime;
+        }
+
+        public override void SetLastAccessTime(string fullPath, DateTimeOffset time, bool asDirectory)
+        {
+            new UnixFileSystemObject(fullPath, asDirectory).LastAccessTime = time;
+        }
+
+        public override DateTimeOffset GetLastWriteTime(string fullPath)
+        {
+            return new UnixFileSystemObject(fullPath, false).LastAccessTime;
+        }
+
+        public override void SetLastWriteTime(string fullPath, DateTimeOffset time, bool asDirectory)
+        {
+            new UnixFileSystemObject(fullPath, asDirectory).LastWriteTime = time;
+        }
+
+        public override IFileSystemObject GetFileSystemInfo(string fullPath, bool asDirectory)
+        {
+            return new UnixFileSystemObject(fullPath, asDirectory);
+        }
+    }
+}
+
+// Copyright (c) Microsoft. All rights reserved.
+// Licensed under the MIT license. See LICENSE file in the project root for full license information.
+
+using Microsoft.Win32.SafeHandles;
+using System.Collections.Generic;
+using System.Runtime.InteropServices;
+using System.Text;
+
+namespace System.IO
+{
+    internal sealed partial class Win32FileSystem : FileSystem
+    {
+        public override int MaxPath { get { return Interop.MAX_PATH; } }
+        public override int MaxDirectoryPath { get { return Interop.MAX_DIRECTORY_PATH; } }
+
+        public override void CopyFile(string sourceFullPath, string destFullPath, bool overwrite)
+        {
+            Interop.SECURITY_ATTRIBUTES secAttrs = default(Interop.SECURITY_ATTRIBUTES);
+            int errorCode = Interop.mincore.CopyFile(sourceFullPath, destFullPath, !overwrite);
+
+            if (errorCode != Interop.ERROR_SUCCESS)
+            {
+                String fileName = destFullPath;
+
+                if (errorCode != Interop.ERROR_FILE_EXISTS)
+                {
+                    // For a number of error codes (sharing violation, path
+                    // not found, etc) we don't know if the problem was with
+                    // the source or dest file.  Try reading the source file.
+                    using (SafeFileHandle handle = Interop.mincore.UnsafeCreateFile(sourceFullPath, Win32FileStream.GENERIC_READ, FileShare.Read, ref secAttrs, FileMode.Open, 0, IntPtr.Zero))
+                    {
+                        if (handle.IsInvalid)
+                            fileName = sourceFullPath;
+                    }
+
+                    if (errorCode == Interop.ERROR_ACCESS_DENIED)
+                    {
+                        if (DirectoryExists(destFullPath))
+                            throw new IOException(SR.Format(SR.Arg_FileIsDirectory_Name, destFullPath), Interop.ERROR_ACCESS_DENIED);
+                    }
+                }
+
+                throw Win32Marshal.GetExceptionForWin32Error(errorCode, fileName);
+            }
+        }
+
+        [System.Security.SecuritySafeCritical]
+        public override void CreateDirectory(string fullPath)
+        {
+            int length = fullPath.Length;
+
+            // We need to trim the trailing slash or the code will try to create 2 directories of the same name.
+            if (length >= 2 && PathHelpers.EndsInDirectorySeparator(fullPath))
+                length--;
+
+            int lengthRoot = PathHelpers.GetRootLength(fullPath);
+
+            // For UNC paths that are only // or ///
+            if (length == 2 && PathHelpers.IsDirectorySeparator(fullPath[1]))
+                throw new IOException(SR.Format(SR.IO_CannotCreateDirectory, fullPath));
+
+            // We can save a bunch of work if the directory we want to create already exists.  This also
+            // saves us in the case where sub paths are inaccessible (due to ERROR_ACCESS_DENIED) but the
+            // final path is accessable and the directory already exists.  For example, consider trying
+            // to create c:\Foo\Bar\Baz, where everything already exists but ACLS prevent access to c:\Foo
+            // and c:\Foo\Bar.  In that case, this code will think it needs to create c:\Foo, and c:\Foo\Bar
+            // and fail to due so, causing an exception to be thrown.  This is not what we want.
+            if (DirectoryExists(fullPath))
+                return;
+
+            List<string> stackDir = new List<string>();
+
+            // Attempt to figure out which directories don't exist, and only
+            // create the ones we need.  Note that InternalExists may fail due
+            // to Win32 ACL's preventing us from seeing a directory, and this
+            // isn't threadsafe.
+
+            bool somepathexists = false;
+
+            if (length > lengthRoot)
+            {
+                // Special case root (fullpath = X:\\)
+                int i = length - 1;
+                while (i >= lengthRoot && !somepathexists)
+                {
+                    String dir = fullPath.Substring(0, i + 1);
+
+                    if (!DirectoryExists(dir)) // Create only the ones missing
+                        stackDir.Add(dir);
+                    else
+                        somepathexists = true;
+
+                    while (i > lengthRoot && !PathHelpers.IsDirectorySeparator(fullPath[i])) i--;
+                    i--;
+                }
+            }
+
+            int count = stackDir.Count;
+
+            // If we were passed a DirectorySecurity, convert it to a security
+            // descriptor and set it in he call to CreateDirectory.
+            Interop.SECURITY_ATTRIBUTES secAttrs = default(Interop.SECURITY_ATTRIBUTES);
+
+            bool r = true;
+            int firstError = 0;
+            String errorString = fullPath;
+            // If all the security checks succeeded create all the directories
+            while (stackDir.Count > 0)
+            {
+                String name = stackDir[stackDir.Count - 1];
+                stackDir.RemoveAt(stackDir.Count - 1);
+                if (name.Length >= Interop.MAX_DIRECTORY_PATH)
+                    throw new PathTooLongException(SR.IO_PathTooLong);
+                r = Interop.mincore.CreateDirectory(name, ref secAttrs);
+                if (!r && (firstError == 0))
+                {
+                    int currentError = Marshal.GetLastWin32Error();
+                    // While we tried to avoid creating directories that don't
+                    // exist above, there are at least two cases that will
+                    // cause us to see ERROR_ALREADY_EXISTS here.  InternalExists
+                    // can fail because we didn't have permission to the
+                    // directory.  Secondly, another thread or process could
+                    // create the directory between the time we check and the
+                    // time we try using the directory.  Thirdly, it could
+                    // fail because the target does exist, but is a file.
+                    if (currentError != Interop.ERROR_ALREADY_EXISTS)
+                        firstError = currentError;
+                    else
+                    {
+                        // If there's a file in this directory's place, or if we have ERROR_ACCESS_DENIED when checking if the directory already exists throw.
+                        if (File.InternalExists(name) || (!DirectoryExists(name, out currentError) && currentError == Interop.ERROR_ACCESS_DENIED))
+                        {
+                            firstError = currentError;
+                            errorString = name;
+                        }
+                    }
+                }
+            }
+
+            // We need this check to mask OS differences
+            // Handle CreateDirectory("X:\\") when X: doesn't exist. Similarly for n/w paths.
+            if ((count == 0) && !somepathexists)
+            {
+                String root = Directory.InternalGetDirectoryRoot(fullPath);
+                if (!DirectoryExists(root))
+                    throw Win32Marshal.GetExceptionForWin32Error(Interop.ERROR_PATH_NOT_FOUND, root);
+                return;
+            }
+
+            // Only throw an exception if creating the exact directory we
+            // wanted failed to work correctly.
+            if (!r && (firstError != 0))
+                throw Win32Marshal.GetExceptionForWin32Error(firstError, errorString);
+        }
+
+        public override void DeleteFile(System.String fullPath)
+        {
+            bool r = Interop.mincore.DeleteFile(fullPath);
+            if (!r)
+            {
+                int errorCode = Marshal.GetLastWin32Error();
+                if (errorCode == Interop.ERROR_FILE_NOT_FOUND)
+                    return;
+                else
+                    throw Win32Marshal.GetExceptionForWin32Error(errorCode, fullPath);
+            }
+        }
+
+        public override bool DirectoryExists(string fullPath)
+        {
+            int lastError = Interop.ERROR_SUCCESS;
+            return DirectoryExists(fullPath, out lastError);
+        }
+
+        private bool DirectoryExists(String path, out int lastError)
+        {
+            Interop.WIN32_FILE_ATTRIBUTE_DATA data = new Interop.WIN32_FILE_ATTRIBUTE_DATA();
+            lastError = FillAttributeInfo(path, ref data, false, true);
+
+            return (lastError == 0) && (data.fileAttributes != -1)
+                    && ((data.fileAttributes & Interop.FILE_ATTRIBUTE_DIRECTORY) != 0);
+        }
+
+        public override IEnumerable<string> EnumeratePaths(string fullPath, string searchPattern, SearchOption searchOption, SearchTarget searchTarget)
+        {
+            return Win32FileSystemEnumerableFactory.CreateFileNameIterator(fullPath, fullPath, searchPattern,
+                (searchTarget & SearchTarget.Files) == SearchTarget.Files,
+                (searchTarget & SearchTarget.Directories) == SearchTarget.Directories,
+                searchOption);
+        }
+
+        public override IEnumerable<FileSystemInfo> EnumerateFileSystemInfos(string fullPath, string searchPattern, SearchOption searchOption, SearchTarget searchTarget)
+        {
+            switch (searchTarget)
+            {
+                case SearchTarget.Directories:
+                    return Win32FileSystemEnumerableFactory.CreateDirectoryInfoIterator(fullPath, fullPath, searchPattern, searchOption);
+                case SearchTarget.Files:
+                    return Win32FileSystemEnumerableFactory.CreateFileInfoIterator(fullPath, fullPath, searchPattern, searchOption);
+                case SearchTarget.Both:
+                    return Win32FileSystemEnumerableFactory.CreateFileSystemInfoIterator(fullPath, fullPath, searchPattern, searchOption);
+                default:
+                    throw new ArgumentException("searchTarget", SR.ArgumentOutOfRange_Enum);
+            }
+        }
+
+        // Returns 0 on success, otherwise a Win32 error code.  Note that
+        // classes should use -1 as the uninitialized state for dataInitialized.
+        [System.Security.SecurityCritical]  // auto-generated
+        internal static int FillAttributeInfo(String path, ref Interop.WIN32_FILE_ATTRIBUTE_DATA data, bool tryagain, bool returnErrorOnNotFound)
+        {
+            int errorCode = 0;
+            if (tryagain) // someone has a handle to the file open, or other error
+            {
+                Interop.WIN32_FIND_DATA findData;
+                findData = new Interop.WIN32_FIND_DATA();
+
+                // Remove trialing slash since this can cause grief to FindFirstFile. You will get an invalid argument error
+                String tempPath = path.TrimEnd(PathHelpers.DirectorySeparatorChars);
+
+                // For floppy drives, normally the OS will pop up a dialog saying
+                // there is no disk in drive A:, please insert one.  We don't want that.
+                // SetErrorMode will let us disable this, but we should set the error
+                // mode back, since this may have wide-ranging effects.
+                uint oldMode = Interop.mincore.SetErrorMode(Interop.SEM_FAILCRITICALERRORS);
+                try
+                {
+                    bool error = false;
+                    SafeFindHandle handle = Interop.mincore.FindFirstFile(tempPath, ref findData);
+                    try
+                    {
+                        if (handle.IsInvalid)
+                        {
+                            error = true;
+                            errorCode = Marshal.GetLastWin32Error();
+
+                            if (errorCode == Interop.ERROR_FILE_NOT_FOUND ||
+                                errorCode == Interop.ERROR_PATH_NOT_FOUND ||
+                                errorCode == Interop.ERROR_NOT_READY)  // floppy device not ready
+                            {
+                                if (!returnErrorOnNotFound)
+                                {
+                                    // Return default value for backward compatibility
+                                    errorCode = 0;
+                                    data.fileAttributes = -1;
+                                }
+                            }
+                            return errorCode;
+                        }
+                    }
+                    finally
+                    {
+                        // Close the Win32 handle
+                        try
+                        {
+                            handle.Dispose();
+                        }
+                        catch
+                        {
+                            // if we're already returning an error, don't throw another one.
+                            if (!error)
+                            {
+                                throw Win32Marshal.GetExceptionForLastWin32Error();
+                            }
+                        }
+                    }
+                }
+                finally
+                {
+                    Interop.mincore.SetErrorMode(oldMode);
+                }
+
+                // Copy the information to data
+                data.PopulateFrom(findData);
+            }
+            else
+            {
+                // For floppy drives, normally the OS will pop up a dialog saying
+                // there is no disk in drive A:, please insert one.  We don't want that.
+                // SetErrorMode will let us disable this, but we should set the error
+                // mode back, since this may have wide-ranging effects.
+                bool success = false;
+                uint oldMode = Interop.mincore.SetErrorMode(Interop.SEM_FAILCRITICALERRORS);
+                try
+                {
+                    success = Interop.mincore.GetFileAttributesEx(path, Interop.GET_FILEEX_INFO_LEVELS.GetFileExInfoStandard, ref data);
+                }
+                finally
+                {
+                    Interop.mincore.SetErrorMode(oldMode);
+                }
+
+                if (!success)
+                {
+                    errorCode = Marshal.GetLastWin32Error();
+                    if (errorCode != Interop.ERROR_FILE_NOT_FOUND &&
+                        errorCode != Interop.ERROR_PATH_NOT_FOUND &&
+                        errorCode != Interop.ERROR_NOT_READY)  // floppy device not ready
+                    {
+                        // In case someone latched onto the file. Take the perf hit only for failure
+                        return FillAttributeInfo(path, ref data, true, returnErrorOnNotFound);
+                    }
+                    else
+                    {
+                        if (!returnErrorOnNotFound)
+                        {
+                            // Return default value for backward compatibility
+                            errorCode = 0;
+                            data.fileAttributes = -1;
+                        }
+                    }
+                }
+            }
+
+            return errorCode;
+        }
+
+        public override bool FileExists(System.String fullPath)
+        {
+            Interop.WIN32_FILE_ATTRIBUTE_DATA data = new Interop.WIN32_FILE_ATTRIBUTE_DATA();
+            int errorCode = FillAttributeInfo(fullPath, ref data, false, true);
+
+            return (errorCode == 0) && (data.fileAttributes != -1)
+                    && ((data.fileAttributes & Interop.FILE_ATTRIBUTE_DIRECTORY) == 0);
+        }
+
+        public override FileAttributes GetAttributes(string fullPath)
+        {
+            Interop.WIN32_FILE_ATTRIBUTE_DATA data = new Interop.WIN32_FILE_ATTRIBUTE_DATA();
+            int errorCode = FillAttributeInfo(fullPath, ref data, false, true);
+            if (errorCode != 0)
+                throw Win32Marshal.GetExceptionForWin32Error(errorCode, fullPath);
+
+            return (FileAttributes)data.fileAttributes;
+        }
+
+        public override string GetCurrentDirectory()
+        {
+            StringBuilder sb = StringBuilderCache.Acquire(Interop.MAX_PATH + 1);
+            if (Interop.mincore.GetCurrentDirectory(sb.Capacity, sb) == 0)
+                throw Win32Marshal.GetExceptionForLastWin32Error();
+            String currentDirectory = sb.ToString();
+            // Note that if we have somehow put our command prompt into short
+            // file name mode (ie, by running edlin or a DOS grep, etc), then
+            // this will return a short file name.
+            if (currentDirectory.IndexOf('~') >= 0)
+            {
+                int r = Interop.mincore.GetLongPathName(currentDirectory, sb, sb.Capacity);
+                if (r == 0 || r >= Interop.MAX_PATH)
+                {
+                    int errorCode = Marshal.GetLastWin32Error();
+                    if (r >= Interop.MAX_PATH)
+                        errorCode = Interop.ERROR_FILENAME_EXCED_RANGE;
+                    if (errorCode != Interop.ERROR_FILE_NOT_FOUND &&
+                        errorCode != Interop.ERROR_PATH_NOT_FOUND &&
+                        errorCode != Interop.ERROR_INVALID_FUNCTION &&  // by design - enough said.
+                        errorCode != Interop.ERROR_ACCESS_DENIED)
+                        throw Win32Marshal.GetExceptionForWin32Error(errorCode);
+                }
+                currentDirectory = sb.ToString();
+            }
+            StringBuilderCache.Release(sb);
+
+            return currentDirectory;
+        }
+
+        public override DateTimeOffset GetCreationTime(string fullPath)
+        {
+            Interop.WIN32_FILE_ATTRIBUTE_DATA data = new Interop.WIN32_FILE_ATTRIBUTE_DATA();
+            int errorCode = FillAttributeInfo(fullPath, ref data, false, false);
+            if (errorCode != 0)
+                throw Win32Marshal.GetExceptionForWin32Error(errorCode, fullPath);
+
+            long dt = ((long)(data.ftCreationTimeHigh) << 32) | ((long)data.ftCreationTimeLow);
+            return DateTimeOffset.FromFileTime(dt);
+        }
+
+        public override IFileSystemObject GetFileSystemInfo(string fullPath, bool asDirectory)
+        {
+            return new Win32FileSystemObject(fullPath, asDirectory);
+        }
+
+        public override DateTimeOffset GetLastAccessTime(string fullPath)
+        {
+            Interop.WIN32_FILE_ATTRIBUTE_DATA data = new Interop.WIN32_FILE_ATTRIBUTE_DATA();
+            int errorCode = FillAttributeInfo(fullPath, ref data, false, false);
+            if (errorCode != 0)
+                throw Win32Marshal.GetExceptionForWin32Error(errorCode, fullPath);
+
+            long dt = ((long)(data.ftLastAccessTimeHigh) << 32) | ((long)data.ftLastAccessTimeLow);
+            return DateTimeOffset.FromFileTime(dt);
+        }
+
+        public override DateTimeOffset GetLastWriteTime(string fullPath)
+        {
+            Interop.WIN32_FILE_ATTRIBUTE_DATA data = new Interop.WIN32_FILE_ATTRIBUTE_DATA();
+            int errorCode = FillAttributeInfo(fullPath, ref data, false, false);
+            if (errorCode != 0)
+                throw Win32Marshal.GetExceptionForWin32Error(errorCode, fullPath);
+
+            long dt = ((long)data.ftLastWriteTimeHigh << 32) | ((long)data.ftLastWriteTimeLow);
+            return DateTimeOffset.FromFileTime(dt);
+        }
+
+        public override void MoveDirectory(string sourceFullPath, string destFullPath)
+        {
+            if (!Interop.mincore.MoveFile(sourceFullPath, destFullPath))
+            {
+                int errorCode = Marshal.GetLastWin32Error();
+
+                if (errorCode == Interop.ERROR_FILE_NOT_FOUND)
+                    throw Win32Marshal.GetExceptionForWin32Error(Interop.ERROR_PATH_NOT_FOUND, sourceFullPath);
+
+                // This check was originally put in for Win9x (unfortunately without special casing it to be for Win9x only). We can't change the NT codepath now for backcomp reasons.
+                if (errorCode == Interop.ERROR_ACCESS_DENIED) // WinNT throws IOException. This check is for Win9x. We can't change it for backcomp.
+                    throw new IOException(SR.Format(SR.UnauthorizedAccess_IODenied_Path, sourceFullPath), Win32Marshal.MakeHRFromErrorCode(errorCode));
+
+                throw Win32Marshal.GetExceptionForWin32Error(errorCode);
+            }
+        }
+
+        public override void MoveFile(string sourceFullPath, string destFullPath)
+        {
+            if (!Interop.mincore.MoveFile(sourceFullPath, destFullPath))
+            {
+                throw Win32Marshal.GetExceptionForLastWin32Error();
+            }
+        }
+
+        public override FileStreamBase Open(string fullPath, FileMode mode, FileAccess access, FileShare share, int bufferSize, FileOptions options, FileStream parent)
+        {
+            return new Win32FileStream(fullPath, mode, access, share, bufferSize, options, parent);
+        }
+
+        [System.Security.SecurityCritical]
+        private static SafeFileHandle OpenHandle(string fullPath, bool asDirectory)
+        {
+            String root = fullPath.Substring(0, PathHelpers.GetRootLength(fullPath));
+            if (root == fullPath && root[1] == Path.VolumeSeparatorChar)
+                throw new ArgumentException(SR.Arg_PathIsVolume);
+
+            Interop.SECURITY_ATTRIBUTES secAttrs = default(Interop.SECURITY_ATTRIBUTES);
+            SafeFileHandle handle = Interop.mincore.SafeCreateFile(
+                fullPath,
+                (int)Interop.GENERIC_WRITE,
+                FileShare.ReadWrite | FileShare.Delete,
+                ref secAttrs,
+                FileMode.Open,
+                asDirectory ? (int)Interop.FILE_FLAG_BACKUP_SEMANTICS : (int)FileOptions.None,
+                IntPtr.Zero
+            );
+
+            if (handle.IsInvalid)
+            {
+                int errorCode = Marshal.GetLastWin32Error();
+
+                // NT5 oddity - when trying to open "C:\" as a File,
+                // we usually get ERROR_PATH_NOT_FOUND from the OS.  We should
+                // probably be consistent w/ every other directory.
+                if (!asDirectory && errorCode == Interop.ERROR_PATH_NOT_FOUND && fullPath.Equals(Directory.GetDirectoryRoot(fullPath)))
+                    errorCode = Interop.ERROR_ACCESS_DENIED;
+
+                throw Win32Marshal.GetExceptionForWin32Error(errorCode, fullPath);
+            }
+            return handle;
+        }
+        public override void RemoveDirectory(string fullPath, bool recursive)
+        {
+            // Do not recursively delete through reparse points.  Perhaps in a
+            // future version we will add a new flag to control this behavior,
+            // but for now we're much safer if we err on the conservative side.
+            // This applies to symbolic links and mount points.
+            Interop.WIN32_FILE_ATTRIBUTE_DATA data = new Interop.WIN32_FILE_ATTRIBUTE_DATA();
+            int errorCode = FillAttributeInfo(fullPath, ref data, false, true);
+            if (errorCode != 0)
+            {
+                // Ensure we throw a DirectoryNotFoundException.
+                if (errorCode == Interop.ERROR_FILE_NOT_FOUND)
+                    errorCode = Interop.ERROR_PATH_NOT_FOUND;
+                throw Win32Marshal.GetExceptionForWin32Error(errorCode, fullPath);
+            }
+
+            if (((FileAttributes)data.fileAttributes & FileAttributes.ReparsePoint) != 0)
+                recursive = false;
+
+            RemoveDirectoryHelper(fullPath, recursive, true);
+        }
+
+        [System.Security.SecurityCritical]  // auto-generated
+        private static void RemoveDirectoryHelper(String fullPath, bool recursive, bool throwOnTopLevelDirectoryNotFound)
+        {
+            bool r;
+            int errorCode;
+            Exception ex = null;
+
+            // Do not recursively delete through reparse points.  Perhaps in a
+            // future version we will add a new flag to control this behavior,
+            // but for now we're much safer if we err on the conservative side.
+            // This applies to symbolic links and mount points.
+            // Note the logic to check whether fullPath is a reparse point is
+            // in Delete(String, String, bool), and will set "recursive" to false.
+            // Note that Win32's DeleteFile and RemoveDirectory will just delete
+            // the reparse point itself.
+
+            if (recursive)
+            {
+                Interop.WIN32_FIND_DATA data = new Interop.WIN32_FIND_DATA();
+
+                // Open a Find handle
+                using (SafeFindHandle hnd = Interop.mincore.FindFirstFile(fullPath + PathHelpers.DirectorySeparatorCharAsString + "*", ref data))
+                {
+                    if (hnd.IsInvalid)
+                        throw Win32Marshal.GetExceptionForLastWin32Error(fullPath);
+
+                    do
+                    {
+                        bool isDir = (0 != (data.dwFileAttributes & Interop.FILE_ATTRIBUTE_DIRECTORY));
+                        if (isDir)
+                        {
+                            // Skip ".", "..".
+                            if (data.cFileName.Equals(".") || data.cFileName.Equals(".."))
+                                continue;
+
+                            // Recurse for all directories, unless they are
+                            // reparse points.  Do not follow mount points nor
+                            // symbolic links, but do delete the reparse point
+                            // itself.
+                            bool shouldRecurse = (0 == (data.dwFileAttributes & (int)FileAttributes.ReparsePoint));
+                            if (shouldRecurse)
+                            {
+                                String newFullPath = Path.Combine(fullPath, data.cFileName);
+                                try
+                                {
+                                    RemoveDirectoryHelper(newFullPath, recursive, false);
+                                }
+                                catch (Exception e)
+                                {
+                                    if (ex == null)
+                                        ex = e;
+                                }
+                            }
+                            else
+                            {
+                                // Check to see if this is a mount point, and
+                                // unmount it.
+                                if (data.dwReserved0 == Interop.IO_REPARSE_TAG_MOUNT_POINT)
+                                {
+                                    // Use full path plus a trailing '\'
+                                    String mountPoint = Path.Combine(fullPath, data.cFileName + PathHelpers.DirectorySeparatorCharAsString);
+                                    r = Interop.mincore.DeleteVolumeMountPoint(mountPoint);
+                                    if (!r)
+                                    {
+                                        errorCode = Marshal.GetLastWin32Error();
+                                        if (errorCode != Interop.ERROR_PATH_NOT_FOUND)
+                                        {
+                                            try
+                                            {
+                                                throw Win32Marshal.GetExceptionForWin32Error(errorCode, data.cFileName);
+                                            }
+                                            catch (Exception e)
+                                            {
+                                                if (ex == null)
+                                                    ex = e;
+                                            }
+                                        }
+                                    }
+                                }
+
+                                // RemoveDirectory on a symbolic link will
+                                // remove the link itself.
+                                String reparsePoint = Path.Combine(fullPath, data.cFileName);
+                                r = Interop.mincore.RemoveDirectory(reparsePoint);
+                                if (!r)
+                                {
+                                    errorCode = Marshal.GetLastWin32Error();
+                                    if (errorCode != Interop.ERROR_PATH_NOT_FOUND)
+                                    {
+                                        try
+                                        {
+                                            throw Win32Marshal.GetExceptionForWin32Error(errorCode, data.cFileName);
+                                        }
+                                        catch (Exception e)
+                                        {
+                                            if (ex == null)
+                                                ex = e;
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                        else
+                        {
+                            String fileName = Path.Combine(fullPath, data.cFileName);
+                            r = Interop.mincore.DeleteFile(fileName);
+                            if (!r)
+                            {
+                                errorCode = Marshal.GetLastWin32Error();
+                                if (errorCode != Interop.ERROR_FILE_NOT_FOUND)
+                                {
+                                    try
+                                    {
+                                        throw Win32Marshal.GetExceptionForWin32Error(errorCode, data.cFileName);
+                                    }
+                                    catch (Exception e)
+                                    {
+                                        if (ex == null)
+                                            ex = e;
+                                    }
+                                }
+                            }
+                        }
+                    } while (Interop.mincore.FindNextFile(hnd, ref data));
+                    // Make sure we quit with a sensible error.
+                    errorCode = Marshal.GetLastWin32Error();
+                }
+
+                if (ex != null)
+                    throw ex;
+                if (errorCode != 0 && errorCode != Interop.ERROR_NO_MORE_FILES)
+                    throw Win32Marshal.GetExceptionForWin32Error(errorCode, fullPath);
+            }
+
+            r = Interop.mincore.RemoveDirectory(fullPath);
+
+            if (!r)
+            {
+                errorCode = Marshal.GetLastWin32Error();
+                if (errorCode == Interop.ERROR_FILE_NOT_FOUND) // A dubious error code.
+                    errorCode = Interop.ERROR_PATH_NOT_FOUND;
+                // This check was originally put in for Win9x (unfortunately without special casing it to be for Win9x only). We can't change the NT codepath now for backcomp reasons.
+                if (errorCode == Interop.ERROR_ACCESS_DENIED)
+                    throw new IOException(SR.Format(SR.UnauthorizedAccess_IODenied_Path, fullPath));
+
+                // don't throw the DirectoryNotFoundException since this is a subdir and
+                // there could be a race condition between two Directory.Delete callers
+                if (errorCode == Interop.ERROR_PATH_NOT_FOUND && !throwOnTopLevelDirectoryNotFound)
+                    return;
+
+                throw Win32Marshal.GetExceptionForWin32Error(errorCode, fullPath);
+            }
+        }
+
+        public override void SetAttributes(string fullPath, FileAttributes attributes)
+        {
+            SetAttributesInternal(fullPath, attributes);
+        }
+
+        private static void SetAttributesInternal(string fullPath, FileAttributes attributes)
+        {
+            bool r = Interop.mincore.SetFileAttributes(fullPath, (int)attributes);
+            if (!r)
+            {
+                int errorCode = Marshal.GetLastWin32Error();
+                if (errorCode == Interop.ERROR_INVALID_PARAMETER)
+                    throw new ArgumentException(SR.Arg_InvalidFileAttrs);
+                throw Win32Marshal.GetExceptionForWin32Error(errorCode, fullPath);
+            }
+        }
+
+        public override void SetCreationTime(string fullPath, DateTimeOffset time, bool asDirectory)
+        {
+            SetCreationTimeInternal(fullPath, time, asDirectory);
+        }
+
+        private static void SetCreationTimeInternal(string fullPath, DateTimeOffset time, bool asDirectory)
+        {
+            using (SafeFileHandle handle = OpenHandle(fullPath, asDirectory))
+            {
+                bool r = Interop.mincore.SetFileTime(handle, creationTime: time.ToFileTime());
+                if (!r)
+                {
+                    throw Win32Marshal.GetExceptionForLastWin32Error(fullPath);
+                }
+            }
+        }
+
+        public override void SetCurrentDirectory(string fullPath)
+        {
+            if (!Interop.mincore.SetCurrentDirectory(fullPath))
+            {
+                // If path doesn't exist, this sets last error to 2 (File
+                // not Found).  LEGACY: This may potentially have worked correctly
+                // on Win9x, maybe.
+                int errorCode = Marshal.GetLastWin32Error();
+                if (errorCode == Interop.ERROR_FILE_NOT_FOUND)
+                    errorCode = Interop.ERROR_PATH_NOT_FOUND;
+                throw Win32Marshal.GetExceptionForWin32Error(errorCode, fullPath);
+            }
+        }
+
+        public override void SetLastAccessTime(string fullPath, DateTimeOffset time, bool asDirectory)
+        {
+            SetLastAccessTimeInternal(fullPath, time, asDirectory);
+        }
+
+        private static void SetLastAccessTimeInternal(string fullPath, DateTimeOffset time, bool asDirectory)
+        {
+            using (SafeFileHandle handle = OpenHandle(fullPath, asDirectory))
+            {
+                bool r = Interop.mincore.SetFileTime(handle, lastAccessTime: time.ToFileTime());
+                if (!r)
+                {
+                    throw Win32Marshal.GetExceptionForLastWin32Error(fullPath);
+                }
+            }
+        }
+
+        public override void SetLastWriteTime(string fullPath, DateTimeOffset time, bool asDirectory)
+        {
+            SetLastWriteTimeInternal(fullPath, time, asDirectory);
+        }
+
+        private static void SetLastWriteTimeInternal(string fullPath, DateTimeOffset time, bool asDirectory)
+        {
+            using (SafeFileHandle handle = OpenHandle(fullPath, asDirectory))
+            {
+                bool r = Interop.mincore.SetFileTime(handle, lastWriteTime: time.ToFileTime());
+                if (!r)
+                {
+                    throw Win32Marshal.GetExceptionForLastWin32Error(fullPath);
+                }
+            }
+        }
+    }
+}
+
+// Copyright (c) Microsoft. All rights reserved.
+// Licensed under the MIT license. See LICENSE file in the project root for full license information.
+
+using System;
+using System.Runtime.InteropServices;
+
+namespace System.IO
+{
+    // Maps to FILE_FLAG_DELETE_ON_CLOSE and similar values from winbase.h.
+    // We didn't expose a number of these values because we didn't believe
+    // a number of them made sense in managed code, at least not yet.
+
+    [Flags]
+    /// <devdoc>
+    ///   Additional options to how to create a FileStream.
+    /// </devdoc>
+    public enum FileOptions
+    {
+        // NOTE: any change to FileOptions enum needs to be
+        // matched in the FileStream ctor for error validation
+        None = 0,
+        WriteThrough = unchecked((int)0x80000000),
+        Asynchronous = unchecked((int)0x40000000), // FILE_FLAG_OVERLAPPED
+        // NoBuffering = 0x20000000,
+        RandomAccess = 0x10000000,
+        DeleteOnClose = 0x04000000,
+        SequentialScan = 0x08000000,
+        // AllowPosix = 0x01000000,  // FILE_FLAG_POSIX_SEMANTICS
+        // BackupOrRestore,
+        // DisallowReparsePoint = 0x00200000, // FILE_FLAG_OPEN_REPARSE_POINT
+        // NoRemoteRecall = 0x00100000, // FILE_FLAG_OPEN_NO_RECALL
+        // FirstPipeInstance = 0x00080000, // FILE_FLAG_FIRST_PIPE_INSTANCE
+        Encrypted = 0x00004000, // FILE_ATTRIBUTE_ENCRYPTED
+    }
+}
+
+namespace Nancy.Extensions
+{
+    using System;
+    using System.IO;
+
+    /// <summary>
+    /// Containing extensions for the <see cref="Stream"/> object.
+    /// </summary>
+    public static class StreamExtensions
+    {
+        /// <summary>
+        /// Buffer size for copy operations
+        /// </summary>
+        internal const int BufferSize = 4096;
+
+        /// <summary>
+        /// Copies the contents between two <see cref="Stream"/> instances in an async fashion.
+        /// </summary>
+        /// <param name="source">The source stream to copy from.</param>
+        /// <param name="destination">The destination stream to copy to.</param>
+        /// <param name="onComplete">Delegate that should be invoked when the operation has completed. Will pass the source, destination and exception (if one was thrown) to the function. Can pass in <see langword="null" />.</param>
+        public static void CopyTo(this Stream source, Stream destination, Action<Stream, Stream, Exception> onComplete)
+        {
+            var buffer =
+                new byte[BufferSize];
+
+            Action<Exception> done = e =>
+            {
+                if (onComplete != null)
+                {
+                    onComplete.Invoke(source, destination, e);
+                }
+            };
+
+            AsyncCallback rc = null;
+
+            rc = readResult =>
+            {
+                try
+                {
+                    var read =
+                        source.EndRead(readResult);
+
+                    if (read <= 0)
+                    {
+                        done.Invoke(null);
+                        return;
+                    }
+
+                    destination.BeginWrite(buffer, 0, read, writeResult =>
+                    {
+                        try
+                        {
+                            destination.EndWrite(writeResult);
+                            source.BeginRead(buffer, 0, buffer.Length, rc, null);
+                        }
+                        catch (Exception ex)
+                        {
+                            done.Invoke(ex);
+                        }
+
+                    }, null);
+                }
+                catch (Exception ex)
+                {
+                    done.Invoke(ex);
+                }
+            };
+
+            source.BeginRead(buffer, 0, buffer.Length, rc, null);
+        }
+    }
+}
+
+namespace Nancy
+{
+    using System;
+    using System.Linq;
+    using System.IO;
+
+    using Extensions;
+    using Nancy.Responses;
+
+    public static class FormatterExtensions
+    {
+        private static ISerializer jsonSerializer;
+
+        private static ISerializer xmlSerializer;
+
+        public static Response AsFile(this IResponseFormatter formatter, string applicationRelativeFilePath, string contentType)
+        {
+            return new GenericFileResponse(applicationRelativeFilePath, contentType);
+        }
+
+        public static Response AsFile(this IResponseFormatter formatter, string applicationRelativeFilePath)
+        {
+            return new GenericFileResponse(applicationRelativeFilePath);
+        }
+
+        public static Response AsText(this IResponseFormatter formatter, string contents, string contentType)
+        {
+            return new TextResponse(contents, contentType);
+        }
+
+        public static Response AsText(this IResponseFormatter formatter, string contents)
+        {
+            return new TextResponse(contents);
+        }
+
+        public static Response AsImage(this IResponseFormatter formatter, string applicationRelativeFilePath)
+        {
+            return AsFile(formatter, applicationRelativeFilePath);
+        }
+
+        public static Response AsJson<TModel>(this IResponseFormatter formatter, TModel model, HttpStatusCode statusCode = HttpStatusCode.OK)
+        {
+            var serializer = jsonSerializer ?? (jsonSerializer = formatter.Serializers.FirstOrDefault(s => s.CanSerialize("application/json")));
+
+            var r = new JsonResponse<TModel>(model, serializer);
+        	r.StatusCode = statusCode;
+
+        	return r;
+        }
+
+        public static Response AsRedirect(this IResponseFormatter formatter, string location, Nancy.Responses.RedirectResponse.RedirectType type = RedirectResponse.RedirectType.SeeOther)
+        {
+            return new RedirectResponse(formatter.Context.ToFullPath(location), type);
+        }
+
+        public static Response AsXml<TModel>(this IResponseFormatter formatter, TModel model)
+        {
+            var serializer = xmlSerializer ?? (xmlSerializer = formatter.Serializers.FirstOrDefault(s => s.CanSerialize("application/xml")));
+
+            return new XmlResponse<TModel>(model, serializer);
+        }
+
+        public static Response FromStream(this IResponseFormatter formatter, Stream stream, string contentType)
+        {
+            return new StreamResponse(() => stream, contentType);
+        }
+
+        public static Response FromStream(this IResponseFormatter formatter, Func<Stream> streamDelegate, string contentType)
+        {
+            return new StreamResponse(streamDelegate, contentType);
+        }
+    }
+}
+
+namespace Nancy
+{
+    using System;
+    using System.Collections.Generic;
+    using System.Threading;
+    using System.Threading.Tasks;
+
+    public class BeforePipeline : AsyncNamedPipelineBase<Func<NancyContext, CancellationToken, Task<Response>>, Func<NancyContext, Response>>
+    {
+        public BeforePipeline()
+        {
+        }
+
+        public BeforePipeline(int capacity)
+            : base(capacity)
+        {
+        }
+
+        public static implicit operator Func<NancyContext, CancellationToken, Task<Response>>(BeforePipeline pipeline)
+        {
+            return pipeline.Invoke;
+        }
+
+        public static implicit operator BeforePipeline(Func<NancyContext, CancellationToken, Task<Response>> func)
+        {
+            var pipeline = new BeforePipeline();
+            pipeline.AddItemToEndOfPipeline(func);
+            return pipeline;
+        }
+
+        public static BeforePipeline operator +(BeforePipeline pipeline, Func<NancyContext, CancellationToken, Task<Response>> func)
+        {
+            pipeline.AddItemToEndOfPipeline(func);
+            return pipeline;
+        }
+
+        public static BeforePipeline operator +(BeforePipeline pipeline, Func<NancyContext, Response> action)
+        {
+            pipeline.AddItemToEndOfPipeline(action);
+            return pipeline;
+        }
+
+        public static BeforePipeline operator +(BeforePipeline pipelineToAddTo, BeforePipeline pipelineToAdd)
+        {
+            foreach (var pipelineItem in pipelineToAdd.PipelineItems)
+            {
+                pipelineToAddTo.AddItemToEndOfPipeline(pipelineItem);
+            }
+
+            return pipelineToAddTo;
+        }
+
+        public Task<Response> Invoke(NancyContext context, CancellationToken cancellationToken)
+        {
+            var tcs = new TaskCompletionSource<Response>();
+
+            var enumerator = this.PipelineDelegates.GetEnumerator();
+
+            if (enumerator.MoveNext())
+            {
+                ExecuteTasksWithSingleResultInternal(context, cancellationToken, enumerator, tcs);
+            }
+            else
+            {
+                tcs.SetResult(null);
+            }
+
+            return tcs.Task;
+        }
+
+        private static void ExecuteTasksWithSingleResultInternal(NancyContext context, CancellationToken cancellationToken, IEnumerator<Func<NancyContext, CancellationToken, Task<Response>>> enumerator, TaskCompletionSource<Response> tcs)
+        {
+            // Endless loop to try and optimise the "main" use case of
+            // our tasks just being delegates wrapped in a task.
+            //
+            // If they finish executing before returning them we will
+            // just loop around this while loop running them one by one,
+            // as soon as we have to return, or a task is actually async,
+            // then we will bale out and set a continuation.
+            while (true)
+            {
+                var current = enumerator.Current.Invoke(context, cancellationToken);
+
+                if (current.Status == TaskStatus.Created)
+                {
+                    current.Start();
+                }
+
+                if (current.IsCompleted || current.IsFaulted)
+                {
+                    var resultTask = current;
+                    if (!current.IsFaulted)
+                    {
+                        // Task has already completed, so don't bother with continuations
+                        if (ContinueExecution(current.IsFaulted, current.Result, current.Exception))
+                        {
+                            if (enumerator.MoveNext())
+                            {
+                                continue;
+                            }
+
+                            resultTask = null;
+                        }
+                    }
+
+                    ExecuteTasksSingleResultFinished(resultTask, tcs);
+
+                    break;
+                }
+
+                // Task hasn't finished - set a continuation and bail out of the loop
+                current.ContinueWith(ExecuteTasksWithSingleResultContinuation(context, cancellationToken, enumerator, tcs), TaskContinuationOptions.ExecuteSynchronously);
+                break;
+            }
+        }
+
+        private static Action<Task<Response>> ExecuteTasksWithSingleResultContinuation(NancyContext context, CancellationToken cancellationToken, IEnumerator<Func<NancyContext, CancellationToken, Task<Response>>> enumerator, TaskCompletionSource<Response> tcs)
+        {
+            return t =>
+            {
+                if (ContinueExecution(t.IsFaulted, t.IsFaulted ? null : t.Result, t.Exception))
+                {
+                    if (enumerator.MoveNext())
+                    {
+                        ExecuteTasksWithSingleResultInternal(context, cancellationToken, enumerator, tcs);
+                    }
+                    else
+                    {
+                        ExecuteTasksSingleResultFinished(null, tcs);
+                    }
+                }
+                else
+                {
+                    ExecuteTasksSingleResultFinished(t, tcs);
+                }
+            };
+        }
+
+        private static void ExecuteTasksSingleResultFinished(Task<Response> task, TaskCompletionSource<Response> tcs)
+        {
+            if (task == null)
+            {
+                tcs.SetResult(default(Response));
+                return;
+            }
+
+            if (task.IsFaulted)
+            {
+                tcs.SetException(task.Exception);
+            }
+            else
+            {
+                tcs.SetResult(task.Result);
+            }
+        }
+
+        private static bool ContinueExecution(bool isFaulted, Response result, AggregateException exception)
+        {
+            return !isFaulted && result == null;
+        }
+
+        /// <summary>
+        /// Wraps a sync delegate into it's async form
+        /// </summary>
+        /// <param name="pipelineItem">Sync pipeline item instance</param>
+        /// <returns>Async pipeline item instance</returns>
+        protected override PipelineItem<Func<NancyContext, CancellationToken, Task<Response>>> Wrap(PipelineItem<Func<NancyContext, Response>> pipelineItem)
+        {
+            var syncDelegate = pipelineItem.Delegate;
+            Func<NancyContext, CancellationToken, Task<Response>> asyncDelegate = (ctx, ct) =>
+            {
+                var tcs = new TaskCompletionSource<Response>();
+                try
+                {
+                    var result = syncDelegate.Invoke(ctx);
+                    tcs.SetResult(result);
+                }
+                catch (Exception e)
+                {
+                    tcs.SetException(e);
+                }
+                return tcs.Task;
+            };
+            return new PipelineItem<Func<NancyContext, CancellationToken, Task<Response>>>(pipelineItem.Name, asyncDelegate);
+        }
+    }
+}
+
+namespace Nancy.Security
+{
+    using System;
+    using System.Linq;
+
+    using Nancy.Bootstrapper;
+
+    /// <summary>
+    /// Allows a BeforeRequest hook to change Url to HTTPS if X-Forwarded-Proto header present
+    /// </summary>
+    public static class SSLProxy
+    {
+        /// <summary>
+        /// Checks for Forwarded or X-Forwarded-Proto header and if so makes current url scheme https
+        /// </summary>
+        /// <param name="pipelines">Application pipelines</param>
+        public static void RewriteSchemeUsingForwardedHeaders(IPipelines pipelines)
+        {
+            pipelines.BeforeRequest += ctx =>
+            {
+                //X-Forwarded-Proto: https
+                if (ctx.Request.Headers.Keys.Any(x => x.Equals("X-Forwarded-Proto", StringComparison.OrdinalIgnoreCase)))
+                {
+                    ctx.Request.Url.Scheme = "https";
+                }
+
+                //RFC7239
+                if (ctx.Request.Headers.Keys.Any(x => x.Equals("Forwarded", StringComparison.OrdinalIgnoreCase)))
+                {
+                    var forwardedHeader = ctx.Request.Headers["Forwarded"];
+                    var protoValue = forwardedHeader.FirstOrDefault(x => x.StartsWith("proto", StringComparison.OrdinalIgnoreCase));
+                    if (protoValue != null && protoValue.Equals("proto=https", StringComparison.OrdinalIgnoreCase))
+                    {
+                        ctx.Request.Url.Scheme = "https";
+                    }
+                }
+
+                return null;
+            };
+        }
+    }
+}
+
+namespace Nancy.Demo.Caching
+{
+    using System;
+    using System.IO;
+    using System.Text;
+    using Nancy;
+
+    /// <summary>
+    /// Wraps a regular response in a cached response
+    /// The cached response invokes the old response and stores it as a string.
+    /// Obviously this only works for ASCII text based responses, so don't use this
+    /// in a real application :-)
+    /// </summary>
+    public class CachedResponse : Response
+    {
+        private readonly string oldResponseOutput;
+
+        public CachedResponse(Response response)
+        {
+            this.ContentType = response.ContentType;
+            this.Headers = response.Headers;
+            this.StatusCode = response.StatusCode;
+
+            using (var memoryStream = new MemoryStream())
+            {
+                response.Contents.Invoke(memoryStream);
+                this.oldResponseOutput = Encoding.ASCII.GetString(memoryStream.GetBuffer());
+            }
+
+            this.Contents = GetContents(this.oldResponseOutput);
+        }
+
+        protected static Action<Stream> GetContents(string contents)
+        {
+            return stream =>
+            {
+                var writer = new StreamWriter(stream) { AutoFlush = true };
+                writer.Write(contents);
+            };
+        }
+    }
+}
+
+namespace Nancy.Demo.Caching
+{
+    using System;
+    using System.Collections.Generic;
+    using Bootstrapper;
+    using Nancy;
+    using Nancy.Demo.Caching.CachingExtensions;
+    using Nancy.TinyIoc;
+
+    public class CachingBootstrapper : DefaultNancyBootstrapper
+    {
+        private const int CACHE_SECONDS = 30;
+
+        private readonly Dictionary<string, Tuple<DateTime, Response, int>> cachedResponses = new Dictionary<string, Tuple<DateTime, Response, int>>();
+
+        protected override void ApplicationStartup(TinyIoCContainer container, IPipelines pipelines)
+        {
+            base.ApplicationStartup(container, pipelines);
+
+            pipelines.BeforeRequest += CheckCache;
+
+            pipelines.AfterRequest += SetCache;
+        }
+
+        /// <summary>
+        /// Check to see if we have a cache entry - if we do, see if it has expired or not,
+        /// if it hasn't then return it, otherwise return null;
+        /// </summary>
+        /// <param name="context">Current context</param>
+        /// <returns>Request or null</returns>
+        public Response CheckCache(NancyContext context)
+        {
+            Tuple<DateTime, Response, int> cacheEntry;
+
+            if (this.cachedResponses.TryGetValue(context.Request.Path, out cacheEntry))
+            {
+                if (cacheEntry.Item1.AddSeconds(cacheEntry.Item3) > DateTime.Now)
+                {
+                    return cacheEntry.Item2;
+                }
+            }
+
+            return null;
+        }
+
+        /// <summary>
+        /// Adds the current response to the cache if required
+        /// Only stores by Path and stores the response in a dictionary.
+        /// Do not use this as an actual cache :-)
+        /// </summary>
+        /// <param name="context">Current context</param>
+        public void SetCache(NancyContext context)
+        {
+            if (context.Response.StatusCode != HttpStatusCode.OK)
+            {
+                return;
+            }
+
+            object cacheSecondsObject;
+            if (!context.Items.TryGetValue(ContextExtensions.OUTPUT_CACHE_TIME_KEY, out cacheSecondsObject))
+            {
+                return;
+            }
+
+            int cacheSeconds;
+            if (!int.TryParse(cacheSecondsObject.ToString(), out cacheSeconds))
+            {
+                return;
+            }
+
+            var cachedResponse = new CachedResponse(context.Response);
+
+            this.cachedResponses[context.Request.Path] = new Tuple<DateTime, Response, int>(DateTime.Now, cachedResponse, cacheSeconds);
+
+            context.Response = cachedResponse;
+        }
+    }
+}
+
+namespace Nancy.Embedded.Conventions
+{
+    using System;
+    using System.Collections.Concurrent;
+    using System.IO;
+    using System.Linq;
+    using System.Reflection;
+    using System.Text.RegularExpressions;
+    using Helpers;
+    using Responses;
+
+    public class EmbeddedStaticContentConventionBuilder
+    {
+        private static readonly ConcurrentDictionary<string, Func<Response>> ResponseFactoryCache;
+        private static readonly Regex PathReplaceRegex = new Regex(@"[/\\]", RegexOptions.Compiled);
+
+        static EmbeddedStaticContentConventionBuilder()
+        {
+            ResponseFactoryCache = new ConcurrentDictionary<string, Func<Response>>();
+        }
+
+        /// <summary>
+        /// Adds a directory-based convention for embedded static convention.
+        /// </summary>
+        /// <param name="requestedPath">The path that should be matched with the request.</param>
+        /// <param name="contentPath">The path to where the content is stored in your application, relative to the root. If this is <see langword="null" /> then it will be the same as <paramref name="requestedPath"/>.</param>
+        /// <param name="allowedExtensions">A list of extensions that is valid for the conventions. If not supplied, all extensions are valid.</param>
+        /// <returns>A <see cref="EmbeddedFileResponse"/> instance for the requested embedded static contents if it was found, otherwise <see langword="null"/>.</returns>
+        public static Func<NancyContext, string, Response> AddDirectory(string requestedPath, Assembly assembly, string contentPath = null, params string[] allowedExtensions)
+        {
+            if (!requestedPath.StartsWith("/"))
+            {
+                requestedPath = string.Concat("/", requestedPath);
+            }
+
+            return (ctx, root) =>
+            {
+                var path =
+                    HttpUtility.UrlDecode(ctx.Request.Path);
+
+                var fileName =
+                    Path.GetFileName(path);
+
+                if (string.IsNullOrEmpty(fileName))
+                {
+                    return null;
+                }
+
+                var pathWithoutFilename =
+                    GetPathWithoutFilename(fileName, path);
+
+                if (!pathWithoutFilename.StartsWith(requestedPath, StringComparison.OrdinalIgnoreCase))
+                {
+                    ctx.Trace.TraceLog.WriteLog(x => x.AppendLine(string.Concat("[EmbeddedStaticContentConventionBuilder] The requested resource '", path, "' does not match convention mapped to '", requestedPath, "'")));
+                    return null;
+                }
+
+                contentPath =
+                    GetContentPath(requestedPath, contentPath);
+
+                var responseFactory =
+                    ResponseFactoryCache.GetOrAdd(path, BuildContentDelegate(ctx, requestedPath, contentPath, assembly, allowedExtensions));
+
+                return responseFactory.Invoke();
+            };
+        }
+
+        private static Func<string, Func<Response>> BuildContentDelegate(NancyContext context, string requestedPath, string contentPath, Assembly assembly, string[] allowedExtensions)
+        {
+            return requestPath =>
+            {
+                context.Trace.TraceLog.WriteLog(x => x.AppendLine(string.Concat("[EmbeddedStaticContentConventionBuilder] Attempting to resolve embedded static content '", requestPath, "'")));
+
+                var extension = Path.GetExtension(requestPath);
+
+                if (allowedExtensions.Length != 0 && !allowedExtensions.Any(e => string.Equals(e, extension, StringComparison.OrdinalIgnoreCase)))
+                {
+                    context.Trace.TraceLog.WriteLog(x => x.AppendLine(string.Concat("[EmbeddedStaticContentConventionBuilder] The requested extension '", extension, "' does not match any of the valid extensions for the convention '", string.Join(",", allowedExtensions), "'")));
+                    return () => null;
+                }
+
+                var transformedRequestPath =
+                     GetSafeRequestPath(requestPath, requestedPath, contentPath);
+
+                transformedRequestPath =
+                    GetEncodedPath(transformedRequestPath);
+
+                // Resolve relative paths by using c:\ as a fake root path
+                var fileName =
+                    Path.GetFullPath(Path.Combine("c:\\", transformedRequestPath));
+
+                var contentRootPath =
+                    Path.GetFullPath(Path.Combine("c:\\", GetEncodedPath(contentPath)));
+
+                if (!IsWithinContentFolder(contentRootPath, fileName))
+                {
+                    context.Trace.TraceLog.WriteLog(x => x.AppendLine(string.Concat("[EmbeddedStaticContentConventionBuilder] The request '", fileName, "' is trying to access a path outside the content folder '", contentPath, "'")));
+                    return () => null;
+                }
+
+                var resourceName =
+                    Path.GetDirectoryName(assembly.GetName().Name + fileName.Substring(2)).Replace('\\', '.').Replace('-', '_');
+
+                fileName =
+                    Path.GetFileName(fileName);
+
+                if (!assembly.GetManifestResourceNames().Any(x => string.Equals(x, resourceName + "." + fileName, StringComparison.OrdinalIgnoreCase)))
+                {
+                    context.Trace.TraceLog.WriteLog(x => x.AppendLine(string.Concat("[EmbeddedStaticContentConventionBuilder] The requested resource '", requestPath, "' was not found in assembly '", assembly.GetName().Name, "'")));
+                    return () => null;
+                }
+
+                context.Trace.TraceLog.WriteLog(x => x.AppendLine(string.Concat("[EmbeddedStaticContentConventionBuilder] Returning file '", fileName, "'")));
+                return () => new EmbeddedFileResponse(assembly, resourceName, fileName);
+            };
+        }
+
+        private static string GetEncodedPath(string path)
+        {
+            return PathReplaceRegex.Replace(path.TrimStart(new[] { '/' }), Path.DirectorySeparatorChar.ToString());
+        }
+
+        private static string GetSafeRequestPath(string requestPath, string requestedPath, string contentPath)
+        {
+            var actualContentPath =
+                (contentPath.Equals("/") ? string.Empty : contentPath);
+
+            if (requestedPath.Equals("/"))
+            {
+                return string.Concat(actualContentPath, requestPath);
+            }
+
+            var expression =
+                new Regex(Regex.Escape(requestedPath), RegexOptions.IgnoreCase);
+
+            return expression.Replace(requestPath, actualContentPath, 1);
+        }
+
+        private static string GetContentPath(string requestedPath, string contentPath)
+        {
+            contentPath =
+                contentPath ?? requestedPath;
+
+            if (!contentPath.StartsWith("/"))
+            {
+                contentPath = string.Concat("/", contentPath);
+            }
+
+            return contentPath;
+        }
+
+        private static string GetPathWithoutFilename(string fileName, string path)
+        {
+            var pathWithoutFileName =
+                path.Replace(fileName, string.Empty);
+
+            return (pathWithoutFileName.Equals("/")) ?
+                pathWithoutFileName :
+                pathWithoutFileName.TrimEnd(new[] { '/' });
+        }
+
+        /// <summary>
+        /// Returns whether the given filename is contained within the content folder
+        /// </summary>
+        /// <param name="contentRootPath">Content root path</param>
+        /// <param name="fileName">Filename requested</param>
+        /// <returns>True if contained within the content root, false otherwise</returns>
+        private static bool IsWithinContentFolder(string contentRootPath, string fileName)
+        {
+            return fileName.StartsWith(contentRootPath, StringComparison.Ordinal);
+        }
+    }
+}
+
+using System;
+using System.Collections.Generic;
+using System.Linq;
+using System.Text;
+
+namespace AutoMapper
+{
+    public class AutoMapperMappingException : Exception
+    {
+        private string _message;
+
+        //
+        // For guidelines regarding the creation of new exception types, see
+        //    http://msdn.microsoft.com/library/default.asp?url=/library/en-us/cpgenref/html/cpconerrorraisinghandlingguidelines.asp
+        // and
+        //    http://msdn.microsoft.com/library/default.asp?url=/library/en-us/dncscol/html/csharp07192001.asp
+        //
+
+        public AutoMapperMappingException()
+        {
+        }
+
+        public AutoMapperMappingException(string message)
+            : base(message)
+        {
+            _message = message;
+        }
+
+        public AutoMapperMappingException(string message, Exception inner)
+            : base(null, inner)
+        {
+            _message = message;
+        }
+
+        public AutoMapperMappingException(ResolutionContext context)
+        {
+            Context = context;
+        }
+
+        public AutoMapperMappingException(ResolutionContext context, Exception inner)
+            : base(null, inner)
+        {
+            Context = context;
+        }
+
+        public AutoMapperMappingException(ResolutionContext context, string message)
+            : this(context)
+        {
+            _message = message;
+        }
+
+        public ResolutionContext Context { get; private set; }
+
+        public override string Message
+        {
+            get
+            {
+                string message = null;
+                var newLine = Environment.NewLine;
+                if (Context != null)
+                {
+                    message = _message + newLine + newLine + "Mapping types:";
+                    message += newLine + string.Format("{0} -> {1}", Context.SourceType.Name, Context.DestinationType.Name);
+                    message += newLine + string.Format("{0} -> {1}", Context.SourceType.FullName, Context.DestinationType.FullName);
+
+                    var destPath = GetDestPath(Context);
+                    message += newLine + newLine + "Destination path:" + newLine + destPath;
+
+                    message += newLine + newLine + "Source value:" + newLine + (Context.SourceValue ?? "(null)");
+
+                    return message;
+                }
+                if (_message != null)
+                {
+                    message = _message;
+                }
+
+                message = (message == null ? null : message + newLine) + base.Message;
+
+                return message;
+            }
+        }
+
+	    private string GetDestPath(ResolutionContext context)
+	    {
+	        var allContexts = GetContexts(context).Reverse();
+
+	        var builder = new StringBuilder(allContexts.First().DestinationType.Name);
+
+	        foreach (var ctxt in allContexts)
+	        {
+	            if (!string.IsNullOrEmpty(ctxt.MemberName))
+	            {
+	                builder.Append(".");
+	                builder.Append(ctxt.MemberName);
+	            }
+                if (ctxt.ArrayIndex != null)
+                {
+                    builder.AppendFormat("[{0}]", ctxt.ArrayIndex);
+                }
+	        }
+	        return builder.ToString();
+	    }
+
+	    private static IEnumerable<ResolutionContext> GetContexts(ResolutionContext context)
+	    {
+            while (context.Parent != null)
+            {
+                yield return context;
+
+                context = context.Parent;
+            }
+	        yield return context;
+	    }
+
+#if !DEBUG
+	    public override string StackTrace
+        {
+            get
+            {
+                return string.Join(Environment.NewLine,
+                    base.StackTrace
+                        .Split(new[] {Environment.NewLine}, StringSplitOptions.None)
+                        .Where(str => !str.TrimStart().StartsWith("at AutoMapper.")));
+            }
+        }
+#endif
+    }
+}
+
+using System;
+using System.Text;
+using System.Linq;
+
+namespace AutoMapper
+{
+    public class AutoMapperConfigurationException : Exception
+    {
+        public TypeMapConfigErrors[] Errors { get; private set; }
+        public ResolutionContext Context { get; private set; }
+
+        public class TypeMapConfigErrors
+        {
+            public TypeMap TypeMap { get; private set; }
+            public string[] UnmappedPropertyNames { get; private set; }
+
+            public TypeMapConfigErrors(TypeMap typeMap, string[] unmappedPropertyNames)
+            {
+                TypeMap = typeMap;
+                UnmappedPropertyNames = unmappedPropertyNames;
+            }
+        }
+
+        public AutoMapperConfigurationException(string message)
+            : base(message)
+        {
+        }
+
+        protected AutoMapperConfigurationException(string message, Exception inner)
+            : base(message, inner)
+        {
+        }
+
+        public AutoMapperConfigurationException(TypeMapConfigErrors[] errors)
+        {
+            Errors = errors;
+        }
+
+        public AutoMapperConfigurationException(ResolutionContext context)
+        {
+            Context = context;
+        }
+
+        public override string Message
+        {
+            get
+            {
+                if (Context != null)
+                {
+                    var contextToUse = Context;
+                    var message = string.Format("The following property on {0} cannot be mapped: \n\t{2}\nAdd a custom mapping expression, ignore, add a custom resolver, or modify the destination type {1}.",
+                        contextToUse.DestinationType.FullName, contextToUse.DestinationType.FullName, contextToUse.GetContextPropertyMap().DestinationProperty.Name);
+
+                    message += "\nContext:";
+
+                    while (contextToUse != null)
+                    {
+                        message += contextToUse.GetContextPropertyMap() == null
+                                    ? string.Format("\n\tMapping from type {1} to {0}", contextToUse.DestinationType.FullName, contextToUse.SourceType.FullName)
+                                    : string.Format("\n\tMapping to property {0} from {2} to {1}", contextToUse.GetContextPropertyMap().DestinationProperty.Name, contextToUse.DestinationType.FullName, contextToUse.SourceType.FullName);
+                        contextToUse = contextToUse.Parent;
+                    }
+
+                    return message + "\n" + base.Message;
+                }
+                if (Errors != null)
+                {
+                    var message = new StringBuilder("\nUnmapped members were found. Review the types and members below.\nAdd a custom mapping expression, ignore, add a custom resolver, or modify the source/destination type\n");
+
+                    foreach (var error in Errors)
+                    {
+                        var len = error.TypeMap.SourceType.FullName.Length +
+                                  error.TypeMap.DestinationType.FullName.Length + 5;
+
+                        message.AppendLine(new string('=', len));
+                        message.AppendLine(error.TypeMap.SourceType.Name + " -> " + error.TypeMap.DestinationType.Name + " (" +
+                                           error.TypeMap.ConfiguredMemberList + " member list)");
+                        message.AppendLine(error.TypeMap.SourceType.FullName + " -> " +
+                                           error.TypeMap.DestinationType.FullName + " (" +
+                                           error.TypeMap.ConfiguredMemberList + " member list)");
+                        message.AppendLine();
+                        message.AppendLine("Unmapped properties:");
+                        foreach (var name in error.UnmappedPropertyNames)
+                        {
+                            message.AppendLine(name);
+                        }
+                    }
+                    return message.ToString();
+                }
+                return base.Message;
+            }
+        }
+
+        public override string StackTrace
+        {
+            get
+            {
+                if (Errors != null)
+                    return string.Join(Environment.NewLine,
+                        base.StackTrace
+                            .Split(new[] {Environment.NewLine}, StringSplitOptions.None)
+                            .Where(str => !str.TrimStart().StartsWith("at AutoMapper."))
+                            .ToArray());
+
+                return base.StackTrace;
+            }
+        }
+    }
+}
+
+using System;
+using System.Collections.Generic;
+using System.Reflection;
+using AutoMapper.Internal;
+
+namespace AutoMapper
+{
+    /// <summary>
+    /// Provides a named configuration for maps. Naming conventions become scoped per profile.
+    /// </summary>
+	public class Profile : IProfileExpression
+	{
+        private ConfigurationStore _configurator;
+
+		internal Profile(string profileName)
+		{
+			ProfileName = profileName;
+		}
+
+		protected Profile()
+		{
+		    ProfileName = GetType().FullName;
+		}
+
+	    public virtual string ProfileName { get; private set; }
+
+        public void DisableConstructorMapping()
+        {
+            GetProfile().ConstructorMappingEnabled = false;
+        }
+
+	    public bool AllowNullDestinationValues
+		{
+			get { return GetProfile().AllowNullDestinationValues; }
+			set { GetProfile().AllowNullDestinationValues = value; }
+		}
+
+	    public bool AllowNullCollections
+		{
+            get { return GetProfile().AllowNullCollections; }
+            set { GetProfile().AllowNullCollections = value; }
+		}
+
+        public void IncludeSourceExtensionMethods(Assembly assembly)
+        {
+            GetProfile().IncludeSourceExtensionMethods(assembly);
+        }
+
+        public INamingConvention SourceMemberNamingConvention
+		{
+			get { return GetProfile().SourceMemberNamingConvention; }
+			set { GetProfile().SourceMemberNamingConvention = value; }
+		}
+
+		public INamingConvention DestinationMemberNamingConvention
+		{
+			get { return GetProfile().DestinationMemberNamingConvention; }
+			set { GetProfile().DestinationMemberNamingConvention = value; }
+		}
+
+		public IEnumerable<string> Prefixes
+	    {
+	        get { return GetProfile().Prefixes; }
+	    }
+
+	    public IEnumerable<string> Postfixes
+	    {
+	        get { return GetProfile().Postfixes; }
+	    }
+
+	    public IEnumerable<string> DestinationPrefixes
+	    {
+	        get { return GetProfile().DestinationPrefixes; }
+	    }
+
+	    public IEnumerable<string> DestinationPostfixes
+	    {
+	        get { return GetProfile().DestinationPostfixes; }
+	    }
+
+        public IEnumerable<MemberNameReplacer> MemberNameReplacers
+        {
+            get { throw new NotImplementedException(); }
+        }
+
+        public IEnumerable<AliasedMember> Aliases
+	    {
+	        get { throw new NotImplementedException(); }
+	    }
+
+	    public bool ConstructorMappingEnabled
+	    {
+	        get { return _configurator.ConstructorMappingEnabled; }
+	    }
+
+	    public bool DataReaderMapperYieldReturnEnabled
+	    {
+            get { return _configurator.DataReaderMapperYieldReturnEnabled; }
+	    }
+
+        public IEnumerable<MethodInfo> SourceExtensionMethods
+        {
+            get { return GetProfile().SourceExtensionMethods; }
+        }
+
+		public IMappingExpression<TSource, TDestination> CreateMap<TSource, TDestination>()
+		{
+		    return CreateMap<TSource, TDestination>(MemberList.Destination);
+		}
+
+		public IMappingExpression<TSource, TDestination> CreateMap<TSource, TDestination>(MemberList memberList)
+		{
+			var map = _configurator.CreateMap<TSource, TDestination>(ProfileName, memberList);
+
+			return map;
+		}
+
+		public IMappingExpression CreateMap(Type sourceType, Type destinationType)
+		{
+		    return CreateMap(sourceType, destinationType, MemberList.Destination);
+		}
+
+		public IMappingExpression CreateMap(Type sourceType, Type destinationType, MemberList memberList)
+		{
+			var map = _configurator.CreateMap(sourceType, destinationType, memberList, ProfileName);
+
+			return map;
+		}
+
+		public void RecognizeAlias(string original, string alias)
+		{
+			GetProfile().RecognizeAlias(original, alias);
+		}
+
+        public void ReplaceMemberName(string original, string newValue)
+        {
+            GetProfile().ReplaceMemberName(original, newValue);
+        }
+
+        public void RecognizePrefixes(params string[] prefixes)
+		{
+			GetProfile().RecognizePrefixes(prefixes);
+		}
+
+		public void RecognizePostfixes(params string[] postfixes)
+		{
+			GetProfile().RecognizePostfixes(postfixes);
+		}
+
+        public void RecognizeDestinationPrefixes(params string[] prefixes)
+        {
+            GetProfile().RecognizeDestinationPrefixes(prefixes);
+        }
+
+        public void RecognizeDestinationPostfixes(params string[] postfixes)
+        {
+            GetProfile().RecognizeDestinationPostfixes(postfixes);
+        }
+
+	    public void AddGlobalIgnore(string propertyNameStartingWith)
+	    {
+	        _configurator.AddGlobalIgnore(propertyNameStartingWith);
+	    }
+
+        /// <summary>
+        /// Override this method in a derived class and call the CreateMap method to associate that map with this profile.
+        /// Avoid calling the <see cref="Mapper"/> class from this method.
+        /// </summary>
+	    protected internal virtual void Configure()
+		{
+			// override in a derived class for custom configuration behavior
+		}
+
+        public void Initialize(ConfigurationStore configurator)
+		{
+			_configurator = configurator;
+		}
+
+		private FormatterExpression GetProfile()
+		{
+			return _configurator.GetProfile(ProfileName);
+		}
+	}
+}
+
+using System;
+using System.Collections;
+using System.Collections.Generic;
+using System.Linq;
+using System.Reflection;
+using System.Runtime.CompilerServices;
+using AutoMapper.Internal;
+
+namespace AutoMapper
+{
+    using System.Diagnostics;
+
+    /// <summary>
+    /// Contains cached reflection information for easy retrieval
+    /// </summary>
+    [DebuggerDisplay("{Type}")]
+    public class TypeInfo
+    {
+        private readonly MemberInfo[] _publicGetters;
+        private readonly MemberInfo[] _publicAccessors;
+        private readonly MethodInfo[] _publicGetMethods;
+        private readonly ConstructorInfo[] _constructors;
+        private readonly MethodInfo[] _extensionMethods;
+
+        public Type Type { get; }
+
+        public TypeInfo(Type type)
+            : this (type, new MethodInfo[0])
+        {
+        }
+
+        public TypeInfo(Type type, IEnumerable<MethodInfo> sourceExtensionMethodSearch)
+        {
+            Type = type;
+        	var publicReadableMembers = GetAllPublicReadableMembers();
+            var publicWritableMembers = GetAllPublicWritableMembers();
+			_publicGetters = BuildPublicReadAccessors(publicReadableMembers);
+            _publicAccessors = BuildPublicAccessors(publicWritableMembers);
+            _publicGetMethods = BuildPublicNoArgMethods();
+            _constructors = type.GetDeclaredConstructors().Where(ci => !ci.IsStatic).ToArray();
+            _extensionMethods = BuildPublicNoArgExtensionMethods(sourceExtensionMethodSearch);
+        }
+
+        public IEnumerable<ConstructorInfo> GetConstructors()
+        {
+            return _constructors;
+        }
+
+        public IEnumerable<MemberInfo> GetPublicReadAccessors()
+        {
+            return _publicGetters;
+        }
+
+		public IEnumerable<MemberInfo> GetPublicWriteAccessors()
+        {
+            return _publicAccessors;
+        }
+
+        public IEnumerable<MethodInfo> GetPublicNoArgMethods()
+        {
+            return _publicGetMethods;
+        }
+
+		public IEnumerable<MethodInfo> GetPublicNoArgExtensionMethods()
+		{
+		    return _extensionMethods;
+		}
+
+        private MethodInfo[] BuildPublicNoArgExtensionMethods(IEnumerable<MethodInfo> sourceExtensionMethodSearch)
+        {
+            var sourceExtensionMethodSearchArray = sourceExtensionMethodSearch.ToArray();
+
+            var explicitExtensionMethods = sourceExtensionMethodSearchArray
+                .Where(method => method.GetParameters()[0].ParameterType == Type)
+                .ToList();
+
+            var genericInterfaces = Type.GetInterfaces().Where(t => t.IsGenericType()).ToList();
+
+            if (Type.IsInterface() && Type.IsGenericType())
+                genericInterfaces.Add(Type);
+
+            foreach (var method in sourceExtensionMethodSearchArray
+                .Where(method => method.IsGenericMethodDefinition))
+            {
+                var parameterType = method.GetParameters()[0].ParameterType;
+
+                var matchingLength = genericInterfaces
+                    .Where(t =>
+                    {
+                        var length = t.GetGenericParameters().Length;
+                        var otherLength = parameterType.GetGenericArguments().Length;
+                        return length ==
+                               otherLength;
+                    }).ToArray();
+                var interfaceMatch = matchingLength
+                    .Where(t => method.MakeGenericMethod(t.GetGenericArguments()).GetParameters()[0].ParameterType.IsAssignableFrom(t))
+                    .FirstOrDefault();
+
+                if (interfaceMatch != null)
+                {
+                    explicitExtensionMethods.Add(method.MakeGenericMethod(interfaceMatch.GetGenericArguments()));
+                }
+            }
+
+            return explicitExtensionMethods.ToArray();
+        }
+
+        private MemberInfo[] BuildPublicReadAccessors(IEnumerable<MemberInfo> allMembers)
+        {
+			// Multiple types may define the same property (e.g. the class and multiple interfaces) - filter this to one of those properties
+            var filteredMembers = allMembers
+                .OfType<PropertyInfo>()
+                .GroupBy(x => x.Name) // group properties of the same name together
+                .Select(x => x.First())
+                .OfType<MemberInfo>() // cast back to MemberInfo so we can add back FieldInfo objects
+                .Concat(allMembers.Where(x => x is FieldInfo));  // add FieldInfo objects back
+
+            return filteredMembers.ToArray();
+        }
+
+        private MemberInfo[] BuildPublicAccessors(IEnumerable<MemberInfo> allMembers)
+        {
+        	// Multiple types may define the same property (e.g. the class and multiple interfaces) - filter this to one of those properties
+            var filteredMembers = allMembers
+                .OfType<PropertyInfo>()
+                .GroupBy(x => x.Name) // group properties of the same name together
+                .Select(x =>
+                    x.Any(y => y.CanWrite && y.CanRead) ? // favor the first property that can both read & write - otherwise pick the first one
+						x.First(y => y.CanWrite && y.CanRead) :
+                        x.First())
+				.Where(pi => pi.CanWrite || pi.PropertyType.IsListOrDictionaryType())
+                .OfType<MemberInfo>() // cast back to MemberInfo so we can add back FieldInfo objects
+                .Concat(allMembers.Where(x => x is FieldInfo));  // add FieldInfo objects back
+
+            return filteredMembers.ToArray();
+        }
+
+    	private IEnumerable<MemberInfo> GetAllPublicReadableMembers()
+    	{
+            return GetAllPublicMembers(PropertyReadable, mi => !mi.IsStatic() && mi.IsPublic());
+    	}
+
+        private IEnumerable<MemberInfo> GetAllPublicWritableMembers()
+        {
+            return GetAllPublicMembers(PropertyWritable, mi => !mi.IsStatic() && mi.IsPublic());
+        }
+
+        private bool PropertyReadable(PropertyInfo propertyInfo)
+        {
+            return propertyInfo.CanRead;
+        }
+
+        private bool PropertyWritable(PropertyInfo propertyInfo)
+        {
+            bool propertyIsEnumerable = (typeof(string) != propertyInfo.PropertyType)
+                                         && typeof(IEnumerable).IsAssignableFrom(propertyInfo.PropertyType);
+
+            return propertyInfo.CanWrite || propertyIsEnumerable;
+        }
+
+        private IEnumerable<MemberInfo> GetAllPublicMembers(Func<PropertyInfo, bool> propertyAvailableFor, Func<MemberInfo, bool> memberAvailableFor)
+        {
+            var typesToScan = new List<Type>();
+            for (var t = Type; t != null; t = t.BaseType())
+                typesToScan.Add(t);
+
+            if (Type.IsInterface())
+                typesToScan.AddRange(Type.GetInterfaces());
+
+            // Scan all types for public properties and fields
+            return typesToScan
+                .Where(x => x != null) // filter out null types (e.g. type.BaseType == null)
+                .SelectMany(x => x.GetDeclaredMembers()
+                        .Where(mi => mi.DeclaringType != null && mi.DeclaringType == x)
+                        .Where(memberAvailableFor)
+                        .Where(
+                            m =>
+                                m is FieldInfo ||
+                                (m is PropertyInfo && propertyAvailableFor((PropertyInfo) m) &&
+                                 !((PropertyInfo) m).GetIndexParameters().Any()))
+                );
+        }
+
+        private MethodInfo[] BuildPublicNoArgMethods()
+        {
+            return Type.GetDeclaredMethods()
+                .Where(mi => mi.IsPublic && !mi.IsStatic)
+                .Where(m => (m.ReturnType != typeof(void)) && (m.GetParameters().Length == 0))
+                .ToArray();
+        }
+    }
+}
+
+using System;
+using System.Reflection;
+
+namespace AutoMapper.Impl
+{
+    using System.Collections.Generic;
+
+    public class FieldGetter : MemberGetter
+	{
+		private readonly FieldInfo _fieldInfo;
+		private readonly string _name;
+		private readonly Type _memberType;
+		private readonly LateBoundFieldGet _lateBoundFieldGet;
+
+		public FieldGetter(FieldInfo fieldInfo)
+		{
+			_fieldInfo = fieldInfo;
+			_name = fieldInfo.Name;
+			_memberType = fieldInfo.FieldType;
+            _lateBoundFieldGet = DelegateFactory.CreateGet(fieldInfo);
+		}
+
+		public override MemberInfo MemberInfo
+		{
+			get { return _fieldInfo; }
+		}
+
+		public override string Name
+		{
+			get { return _name; }
+		}
+
+		public override Type MemberType
+		{
+			get { return _memberType; }
+		}
+
+		public override object GetValue(object source)
+		{
+			return _lateBoundFieldGet(source);
+		}
+
+		public bool Equals(FieldGetter other)
+		{
+			if (ReferenceEquals(null, other)) return false;
+			if (ReferenceEquals(this, other)) return true;
+			return Equals(other._fieldInfo, _fieldInfo);
+		}
+
+		public override bool Equals(object obj)
+		{
+			if (ReferenceEquals(null, obj)) return false;
+			if (ReferenceEquals(this, obj)) return true;
+			if (obj.GetType() != typeof(FieldGetter)) return false;
+			return Equals((FieldGetter)obj);
+		}
+
+		public override int GetHashCode()
+		{
+			return _fieldInfo.GetHashCode();
+		}
+
+		public override IEnumerable<object> GetCustomAttributes(Type attributeType, bool inherit)
+		{
+			return _fieldInfo.GetCustomAttributes(attributeType, inherit);
+		}
+
+		public override IEnumerable<object> GetCustomAttributes(bool inherit)
+		{
+			return _fieldInfo.GetCustomAttributes(inherit);
+		}
+
+		public override bool IsDefined(Type attributeType, bool inherit)
+		{
+			return _fieldInfo.IsDefined(attributeType, inherit);
+		}
+	}
+
+	public class FieldAccessor : FieldGetter, IMemberAccessor
+	{
+		private readonly LateBoundFieldSet _lateBoundFieldSet;
+
+		public FieldAccessor(FieldInfo fieldInfo)
+			: base(fieldInfo)
+		{
+            _lateBoundFieldSet = DelegateFactory.CreateSet(fieldInfo);
+		}
+
+		public void SetValue(object destination, object value)
+		{
+			_lateBoundFieldSet(destination, value);
+		}
+	}
+
+	public class ValueTypeFieldAccessor : FieldGetter, IMemberAccessor
+	{
+		private readonly FieldInfo _lateBoundFieldSet;
+
+		public ValueTypeFieldAccessor(FieldInfo fieldInfo)
+			: base(fieldInfo)
+		{
+			_lateBoundFieldSet = fieldInfo;
+		}
+
+		public void SetValue(object destination, object value)
+		{
+			_lateBoundFieldSet.SetValue(destination, value);
+		}
+	}
+}
+
+#if NET4 || NETFX_CORE || MONODROID || MONOTOUCH || __IOS__ || ASPNET50 || ASPNETCORE50
+using System;
+using System.Collections.Concurrent;
+
+namespace AutoMapper.Internal
+{
+    public class DictionaryFactoryOverride : IDictionaryFactory
+    {
+        public IDictionary<TKey, TValue> CreateDictionary<TKey, TValue>()
+        {
+            return new ConcurrentDictionaryImpl<TKey, TValue>(new ConcurrentDictionary<TKey, TValue>());
+        }
+
+        private class ConcurrentDictionaryImpl<TKey, TValue> : IDictionary<TKey, TValue>
+        {
+            private readonly ConcurrentDictionary<TKey, TValue> _dictionary;
+
+            public ConcurrentDictionaryImpl(ConcurrentDictionary<TKey, TValue> dictionary)
+            {
+                _dictionary = dictionary;
+            }
+
+
+            public TValue AddOrUpdate(TKey key, TValue addValue, Func<TKey, TValue, TValue> updateValueFactory)
+            {
+                return _dictionary.AddOrUpdate(key, addValue, updateValueFactory);
+            }
+
+            public bool TryGetValue(TKey key, out TValue value)
+            {
+                return _dictionary.TryGetValue(key, out value);
+            }
+
+            public TValue GetOrAdd(TKey key, Func<TKey, TValue> valueFactory)
+            {
+                return _dictionary.GetOrAdd(key, valueFactory);
+            }
+
+            public TValue this[TKey key]
+            {
+                get { return _dictionary[key]; }
+                set { _dictionary[key] = value; }
+            }
+
+            public bool TryRemove(TKey key, out TValue value)
+            {
+                return _dictionary.TryRemove(key, out value);
+            }
+
+            public void Clear()
+            {
+                _dictionary.Clear();
+            }
+        }
+    }
+}
+#endif
+
+using System;
+using System.Collections.Generic;
+using System.IO;
+using System.Linq;
+using System.Text;
+using System.Threading.Tasks;
+
+namespace EmbedPayload
+{
+    class Startup
+    {
+        public enum ExitCode
+        {
+            Success = 0,
+            Failure = 1
+        }
+
+        static void Main(string[] args)
+        {
+            if (args.Length != 2)
+            {
+                Console.WriteLine("Usage: [payload BIN] [firmware image]");
+                return;
+            }
+
+            try
+            {
+                //Assume success at first
+                Environment.ExitCode = (int)ExitCode.Success;
+
+                //Read all bytes from input file
+                var payload = File.ReadAllBytes(args[0]);
+
+                //Read all bytes from output file:
+                var stream = new FileStream(args[1], FileMode.Open, FileAccess.ReadWrite);
+                var header = new byte[0x200];
+                stream.Read(header, 0, header.Length);
+                var data = new byte[0x6000];
+                stream.Read(data, 0, data.Length);
+
+                //  Look for 0x12345678
+                var signature = new byte[] { 0x12, 0x34, 0x56, 0x78 };
+                int? address = null;
+                for (int i = 0; i < data.Length; i++)
+                {
+                    bool match = true;
+                    for (int j = 0; j < signature.Length; j++)
+                    {
+                        if (data[i + j] != signature[j])
+                        {
+                            match = false;
+                            break;
+                        }
+                    }
+
+                    if (match)
+                    {
+                        address = i;
+                        break;
+                    }
+                }
+
+                //  When found, overwrite with input data
+                if (address.HasValue)
+                {
+                    if ((0x200 + address.Value) >= 0x6000)
+                    {
+                        throw new InvalidOperationException("Insufficient memory to inject file!");
+                    }
+
+                    stream.Seek(0x200 + address.Value, SeekOrigin.Begin);
+                    stream.Write(payload, 0, payload.Length);
+
+                    //Save output file back out
+                    stream.Close();
+                    Console.WriteLine("File updated.");
+                }
+                else
+                {
+                    Console.WriteLine("Signature not found!");
+                }
+            }
+            catch (Exception ex)
+            {
+                //Uh-oh
+                Environment.ExitCode = (int)ExitCode.Failure;
+
+                Console.WriteLine("FATAL: " + ex.ToString());
+            }
+        }
+    }
+}
+
+using Microsoft.Win32.SafeHandles;
+using System;
+using System.Collections.Generic;
+using System.IO;
+using System.Linq;
+using System.Runtime.InteropServices;
+using System.Text;
+using System.Threading.Tasks;
+
+namespace DriveCom
+{
+    public class PhisonDevice
+    {
+        private char _driveLetter;
+        private SafeFileHandle _handle;
+
+        public enum RunMode
+        {
+            Unknown,
+            BootMode,
+            Burner,
+            HardwareVerify,
+            Firmware
+        }
+
+        [Flags]
+        public enum EFileAttributes : uint
+        {
+            Readonly = 0x00000001,
+            Hidden = 0x00000002,
+            System = 0x00000004,
+            Directory = 0x00000010,
+            Archive = 0x00000020,
+            Device = 0x00000040,
+            Normal = 0x00000080,
+            Temporary = 0x00000100,
+            SparseFile = 0x00000200,
+            ReparsePoint = 0x00000400,
+            Compressed = 0x00000800,
+            Offline = 0x00001000,
+            NotContentIndexed = 0x00002000,
+            Encrypted = 0x00004000,
+            Write_Through = 0x80000000,
+            Overlapped = 0x40000000,
+            NoBuffering = 0x20000000,
+            RandomAccess = 0x10000000,
+            SequentialScan = 0x08000000,
+            DeleteOnClose = 0x04000000,
+            BackupSemantics = 0x02000000,
+            PosixSemantics = 0x01000000,
+            OpenReparsePoint = 0x00200000,
+            OpenNoRecall = 0x00100000,
+            FirstPipeInstance = 0x00080000
+        }
+
+        [DllImport("Kernel32.dll", SetLastError = true, CharSet = CharSet.Auto)]
+        public static extern SafeFileHandle CreateFile(
+          string fileName,
+          [MarshalAs(UnmanagedType.U4)] FileAccess fileAccess,
+          [MarshalAs(UnmanagedType.U4)] FileShare fileShare,
+          IntPtr securityAttributes,
+          [MarshalAs(UnmanagedType.U4)] FileMode creationDisposition,
+          [MarshalAs(UnmanagedType.U4)] EFileAttributes flags,
+          IntPtr template);
+
+        [DllImport("kernel32.dll")]
+        static public extern int CloseHandle(SafeFileHandle hObject);
+
+        public const byte SCSI_IOCTL_DATA_OUT = 0;
+        public const byte SCSI_IOCTL_DATA_IN = 1;
+
+        [StructLayout(LayoutKind.Sequential)]
+        class SCSI_PASS_THROUGH_DIRECT
+        {
+            private const int _CDB_LENGTH = 16;
+
+            public short Length;
+            public byte ScsiStatus;
+            public byte PathId;
+            public byte TargetId;
+            public byte Lun;
+            public byte CdbLength;
+            public byte SenseInfoLength;
+            public byte DataIn;
+            public int DataTransferLength;
+            public int TimeOutValue;
+            public IntPtr DataBuffer;
+            public uint SenseInfoOffset;
+
+            [MarshalAs(UnmanagedType.ByValArray, SizeConst = _CDB_LENGTH)]
+            public byte[] Cdb;
+
+            public SCSI_PASS_THROUGH_DIRECT()
+            {
+                Cdb = new byte[_CDB_LENGTH];
+            }
+        };
+
+        [StructLayout(LayoutKind.Sequential)]
+        class SCSI_PASS_THROUGH_DIRECT_WITH_BUFFER
+        {
+            private const int _SENSE_LENGTH = 32;
+            internal SCSI_PASS_THROUGH_DIRECT sptd = new SCSI_PASS_THROUGH_DIRECT();
+
+            [MarshalAs(UnmanagedType.ByValArray, SizeConst = _SENSE_LENGTH)]
+            internal byte[] sense;
+
+            public SCSI_PASS_THROUGH_DIRECT_WITH_BUFFER()
+            {
+                sense = new byte[_SENSE_LENGTH];
+            }
+        };
+
+        [DllImport("kernel32.dll", ExactSpelling = true, SetLastError = true, CharSet = CharSet.Auto)]
+        static extern bool DeviceIoControl(IntPtr hDevice, uint dwIoControlCode,
+            IntPtr lpInBuffer, uint nInBufferSize,
+            IntPtr lpOutBuffer, uint nOutBufferSize,
+            out uint lpBytesReturned, IntPtr lpOverlapped);
+
+        /// <summary>
+        /// Creates a reference to a device with a Phison USB controller.
+        /// </summary>
+        /// <param name="driveLetter">The Windows drive letter representing the device.</param>
+        public PhisonDevice(char driveLetter)
+        {
+            _driveLetter = driveLetter;
+        }
+
+        /// <summary>
+        /// Opens a connection to the device.
+        /// </summary>
+        public void Open()
+        {
+            _handle = CreateFile(string.Format("\\\\.\\{0}:", _driveLetter), FileAccess.ReadWrite, FileShare.ReadWrite,
+                IntPtr.Zero, FileMode.Open, EFileAttributes.NoBuffering, IntPtr.Zero);
+        }
+
+        public byte[] RequestVendorInfo()
+        {
+            var data = SendCommand(new byte[] { 0x06, 0x05, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x01 },
+                512 + 16);
+            byte[] ret = null;
+
+            if (data != null)
+            {
+                ret = data.Take(512).ToArray();
+            }
+
+            return ret;
+        }
+
+        public string GetChipID()
+        {
+            var response = SendCommand(new byte[] { 0x06, 0x56, 0x00, 0x00, 0x00,
+                0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00 }, 512);
+
+            return BitConverter.ToString(response, 0, 6);
+        }
+
+        public string GetFirmwareVersion()
+        {
+            var info = RequestVendorInfo();
+
+            return info[0x94] + "." + info[0x95].ToString("X02") + "." + info[0x96].ToString("X02");
+        }
+
+        public ushort? GetChipType()
+        {
+            ushort? ret = null;
+            var info = RequestVendorInfo();
+
+            if (info != null)
+            {
+                if (info[0x17A] == (byte)'V' && info[0x17B] == (byte)'R')
+                {
+                    var data = info.Skip(0x17E).Take(2).ToArray();
+                    ret = (ushort)((data[0] << 8) | data[1]);
+                }
+            }
+
+            return ret;
+        }
+
+        public RunMode GetRunMode()
+        {
+            var ret = RunMode.Unknown;
+            var info = RequestVendorInfo();
+
+            if (info != null)
+            {
+                if (info[0x17A] == (byte)'V' && info[0x17B] == (byte)'R')
+                {
+                    //TODO: Fix this, this is a dumb way of detecting it
+                    switch (ASCIIEncoding.ASCII.GetString(info.Skip(0xA0).Take(8).ToArray()))
+                    {
+                        case " PRAM   ":
+                            ret = RunMode.BootMode;
+                            break;
+                        case " FW BURN":
+                            ret = RunMode.Burner;
+                            break;
+                        case " HV TEST":
+                            ret = RunMode.HardwareVerify;
+                            break;
+                        default:
+                            ret = RunMode.Firmware;
+                            break;
+                    }
+                }
+            }
+
+            return ret;
+        }
+
+        public ulong GetNumLBAs()
+        {
+            var response = SendCommand(new byte[] { 0x25, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00 }, 8);
+            ulong ret = response[3];
+            ret |= (ulong)((ulong)(response[2] << 8) & 0x0000FF00);
+            ret |= (ulong)((ulong)(response[1] << 16) & 0x00FF0000);
+            ret |= (ulong)((ulong)(response[0] << 24) & 0xFF000000);
+
+            return ret + 1;
+        }
+
+        public void JumpToPRAM()
+        {
+            SendCommand(new byte[] { 0x06, 0xB3, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00 });
+        }
+
+        public void JumpToBootMode()
+        {
+            SendCommand(new byte[] { 0x06, 0xBF, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00 });
+        }
+
+        public void TransferFile(byte[] data)
+        {
+            TransferFile(data, 0x03, 0x02);
+        }
+
+        public void TransferFile(byte[] data, byte header, byte body)
+        {
+            var size = data.Length - 1024;
+
+            //Send header
+            SendCommand(new byte[] { 0x06, 0xB1, header, 0x00, 0x00, 0x00, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00 }, data.Take(0x200).ToArray());
+
+            //Get response
+            var response = SendCommand(new byte[] { 0x06, 0xB0, 0x00, 0x00, 0x08, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00 }, 8);
+            if (response == null || response[0] != 0x55)
+            {
+                throw new InvalidOperationException("Header not accepted");
+            }
+
+            //Send body
+            int address = 0;
+            while (size > 0)
+            {
+                int chunkSize;
+                if (size > 0x8000)
+                {
+                    chunkSize = 0x8000;
+                }
+                else
+                {
+                    chunkSize = size;
+                }
+
+                int cmdAddress = address >> 9;
+                int cmdChunk = chunkSize >> 9;
+                SendCommand(new byte[] { 0x06, 0xB1, body, (byte)((cmdAddress >> 8) & 0xFF), (byte)(cmdAddress & 0xFF),
+                    0x00, 0x00, (byte)((cmdChunk >> 8) & 0xFF), (byte)(cmdChunk & 0xFF), 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00 },
+                    data.Skip(address + 0x200).Take(chunkSize).ToArray());
+
+                //Get response
+                var r = SendCommand(new byte[] { 0x06, 0xB0, 0x00, 0x00, 0x08, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00 }, 8);
+                if (r == null || r[0] != 0xA5)
+                {
+                    throw new InvalidOperationException("Body not accepted");
+                }
+
+                address += chunkSize;
+                size -= chunkSize;
+            }
+        }
+
+        /// <summary>
+        /// Sends command with no attached data and returns expected response.
+        /// </summary>
+        /// <param name="cmd"></param>
+        /// <param name="bytesExpected"></param>
+        /// <returns></returns>
+        public byte[] SendCommand(byte[] cmd, int bytesExpected)
+        {
+            return _SendCommand(_handle, cmd, null, bytesExpected);
+        }
+
+        /// <summary>
+        /// Sends command with no attached data and no response.
+        /// </summary>
+        /// <param name="cmd"></param>
+        public void SendCommand(byte[] cmd)
+        {
+            SendCommand(cmd, null);
+        }
+
+        /// <summary>
+        /// Sends command with attached data and no response.
+        /// </summary>
+        /// <param name="cmd"></param>
+        /// <param name="data"></param>
+        public void SendCommand(byte[] cmd, byte[] data)
+        {
+            _SendCommand(_handle, cmd, data, 0);
+        }
+
+        /// <summary>
+        /// Closes the connection to the device.
+        /// </summary>
+        public void Close()
+        {
+            if (_handle != null && !_handle.IsClosed)
+            {
+                _handle.Close();
+            }
+        }
+
+        private static byte[] _SendCommand(SafeFileHandle handle, byte[] cmd, byte[] data, int bytesExpected)
+        {
+            const int IOCTL_SCSI_PASS_THROUGH_DIRECT = 0x4D014;
+            const int TIMEOUT_SECS = 30;
+            SCSI_PASS_THROUGH_DIRECT_WITH_BUFFER scsi = null;
+            IntPtr inBuffer = IntPtr.Zero;
+            byte[] ret = null;
+
+            try
+            {
+                scsi = new SCSI_PASS_THROUGH_DIRECT_WITH_BUFFER();
+                scsi.sptd.Length = (short)Marshal.SizeOf(scsi.sptd);
+                scsi.sptd.TimeOutValue = TIMEOUT_SECS;
+                scsi.sptd.SenseInfoOffset = (uint)Marshal.OffsetOf(typeof(SCSI_PASS_THROUGH_DIRECT_WITH_BUFFER), "sense");
+                scsi.sptd.SenseInfoLength = (byte)scsi.sense.Length;
+                scsi.sptd.CdbLength = (byte)cmd.Length;
+                Array.Copy(cmd, scsi.sptd.Cdb, cmd.Length);
+                scsi.sptd.DataIn = data != null && data.Length > 0 ? SCSI_IOCTL_DATA_OUT : SCSI_IOCTL_DATA_IN;
+                scsi.sptd.DataTransferLength = data != null && data.Length > 0 ? data.Length : bytesExpected;
+                scsi.sptd.DataBuffer = Marshal.AllocHGlobal(scsi.sptd.DataTransferLength);
+                if (data != null && data.Length > 0)
+                {
+                    Marshal.Copy(data, 0, scsi.sptd.DataBuffer, data.Length);
+                }
+
+                uint bytesReturned;
+                inBuffer = Marshal.AllocHGlobal(Marshal.SizeOf(scsi));
+                var size = (uint)Marshal.SizeOf(scsi);
+                Marshal.StructureToPtr(scsi, inBuffer, false);
+                if (!DeviceIoControl(handle.DangerousGetHandle(), IOCTL_SCSI_PASS_THROUGH_DIRECT,
+                    inBuffer, size, inBuffer, size, out bytesReturned, IntPtr.Zero))
+                {
+                    //Whoops, do something with the error code
+                    int last = Marshal.GetLastWin32Error();
+                    throw new InvalidOperationException("DeviceIoControl failed: " + last.ToString("X04"));
+                }
+                else
+                {
+                    if (scsi.sptd.ScsiStatus != 0)
+                    {
+                        //Whoops, do something with the error code
+                        throw new InvalidOperationException("SCSI command failed: " + scsi.sptd.ScsiStatus.ToString("X02"));
+                    }
+                    else
+                    {
+                        //Success, marshal back any data we received
+                        if (scsi.sptd.DataTransferLength > 0)
+                        {
+                            ret = new byte[scsi.sptd.DataTransferLength];
+                            Marshal.Copy(scsi.sptd.DataBuffer, ret, 0, ret.Length);
+                        }
+                    }
+                }
+            }
+            finally
+            {
+                /* Free any unmanaged resources */
+
+                if (scsi != null && scsi.sptd.DataBuffer != IntPtr.Zero)
+                {
+                    Marshal.FreeHGlobal(scsi.sptd.DataBuffer);
+                }
+
+                if (inBuffer != IntPtr.Zero)
+                {
+                    Marshal.FreeHGlobal(inBuffer);
+                }
+            }
+
+            return ret;
+        }
+    }
+}
+
+using System;
+using System.Collections.Generic;
+using System.IO;
+using System.Linq;
+using System.Text;
+using System.Threading.Tasks;
+
+namespace Injector
+{
+    public class FirmwareImage
+    {
+        private string _fileName;
+        private byte[] _header;
+        private Dictionary<FirmwareSection, byte[]> _sections;
+        private byte[] _footer;
+
+        public FirmwareImage(string fileName)
+        {
+            _fileName = fileName;
+            _header = new byte[0x200];
+            _sections = new Dictionary<FirmwareSection, byte[]>();
+            _sections.Add(FirmwareSection.Base, new byte[0x6000]);
+        }
+
+        public byte[] GetSection(FirmwareSection section)
+        {
+            byte[] ret = null;
+
+            if (_sections.ContainsKey(section))
+            {
+                ret = _sections[section];
+            }
+
+            return ret;
+        }
+
+        public void Open()
+        {
+            FirmwareSection i = 0;
+
+            //Get the header and base page
+            var stream = new FileStream(_fileName, FileMode.Open);
+            var @base = GetSection(FirmwareSection.Base);
+            stream.Read(_header, 0, _header.Length);
+            stream.Read(@base, 0, @base.Length);
+
+            //Read in all the sections
+            while ((stream.Length - stream.Position) > 0x200)
+            {
+                var data = new byte[0x4000];
+                stream.Read(data, 0, data.Length);
+                _sections.Add(i++, data);
+            }
+
+            //If we have a footer, read it in
+            if ((stream.Length - stream.Position) == 0x200)
+            {
+                _footer = new byte[0x200];
+                stream.Read(_footer, 0, _footer.Length);
+            }
+
+            //All done
+            stream.Close();
+        }
+
+        public bool FindPattern(byte?[] pattern, out FirmwareSection section, out int address)
+        {
+            return FindPattern(pattern, 0, out section, out address);
+        }
+
+        public bool FindPattern(byte?[] pattern, int startingOffset, out FirmwareSection section, out int address)
+        {
+            bool ret = false;
+            section = FirmwareSection.Base;
+            address = 0;
+
+            foreach (var s in _sections)
+            {
+                for (int i = startingOffset; i < s.Value.Length; i++)
+                {
+                    bool match = true;
+                    for (int j = 0; j < pattern.Length; j++)
+                    {
+                        if (((i + j) >= s.Value.Length) ||
+                            ((s.Value[i + j] != pattern[j]) && (pattern[j].HasValue)))
+                        {
+                            match = false;
+                            break;
+                        }
+                    }
+
+                    if (match)
+                    {
+                        section = s.Key;
+                        address = i;
+                        ret = true;
+                        break;
+                    }
+                }
+
+                if (ret)
+                {
+                    break;
+                }
+            }
+
+            return ret;
+        }
+
+        public int FindLastFreeChunk(FirmwareSection section)
+        {
+            int ret = -1;
+
+            if (_sections.ContainsKey(section))
+            {
+                var data = _sections[section];
+                var repeating = data[data.Length - 1];
+                ret = data.Length - 2;
+
+                while (data[ret] == repeating)
+                {
+                    ret--;
+                    if (ret < 0)
+                    {
+                        break;
+                    }
+                }
+            }
+
+            return ++ret;
+        }
+
+        public void Save(string fileName)
+        {
+            var output = new FileStream(fileName, FileMode.Create);
+            output.Write(_header, 0, _header.Length);
+            foreach (var section in _sections.OrderBy(t => t.Key))
+            {
+                output.Write(section.Value, 0, section.Value.Length);
+            }
+
+            if (_footer != null)
+            {
+                output.Write(_footer, 0, _footer.Length);
+            }
+
+            output.Close();
+        }
+    }
+}
+
+using System;
+using System.Collections.Generic;
+using System.Linq;
+using MonoTouch.Foundation;
+using MonoTouch.UIKit;
+
+using ServiceStack.ServiceClient.Web;
+using ServiceStack.Text;
+using ServiceStack.Text.Common;
+using ServiceStack.Service;
+using RestFiles.ServiceModel.Operations;
+using RestFiles.ServiceModel.Types;
+
+namespace RestFilesClient
+{
+	public class Application
+	{
+		static void Main (string[] args)
+		{
+			UIApplication.Main (args);
+		}
+	}
+
+	// The name AppDelegate is referenced in the MainWindow.xib file.
+	public partial class AppDelegate : UIApplicationDelegate
+	{
+		JsonServiceClient gateway = new JsonServiceClient("http://servicestack.net/RestFiles");
+		//JsvServiceClient gateway = new JsvServiceClient("http://servicestack.net/RestFiles");
+
+		// This method is invoked when the application has loaded its UI and its ready to run
+		public override bool FinishedLaunching (UIApplication app, NSDictionary options)
+		{
+			// If you have defined a view, add it here:
+			// window.AddSubview (navigationController.View);
+
+			window.MakeKeyAndVisible();
+
+			return true;
+		}
+
+		// This method is required in iPhoneOS 3.0
+		public override void OnActivated (UIApplication application)
+		{
+		}
+
+		partial void getFilesAtPath (MonoTouch.UIKit.UIButton sender)
+		{
+			//calling sync web service
+			var response = gateway.Get<FilesResponse>(txtPath.Text);
+			txtResults.Text = response.Dump();
+
+			var alertView = new UIAlertView("Alert", "getFiles Sync: " + txtPath.Text, null, "Cancel");
+			alertView.Show();
+		}
+
+		partial void getFilesAtPathAsync (MonoTouch.UIKit.UIButton sender)
+		{
+			//calling async web service
+			gateway.GetAsync<FilesResponse>(txtPath.Text,
+				r => InvokeOnMainThread(() => txtResults.Text = r.Dump()),
+				null);
+		}
+
+	}
+}
+
+using System.ComponentModel;
+using System.Runtime.Serialization;
+using RestFiles.ServiceModel.Types;
+using ServiceStack.ServiceHost;
+using ServiceStack.ServiceInterface.ServiceModel;
+
+namespace RestFiles.ServiceModel.Operations
+{
+	[Description("GET the File or Directory info at {Path}\n"
+               + "POST multipart/formdata to upload a new file to any {Path} in the /ReadWrite folder\n"
+               + "PUT {TextContents} to replace the contents of a text file in the /ReadWrite folder\n")]
+	[RestService("/files")]
+	[RestService("/files/{Path*}")]
+	[DataContract]
+	public class Files
+	{
+		[DataMember]
+		public string Path { get; set; }
+
+		[DataMember]
+		public string TextContents { get; set; }
+
+		[DataMember]
+		public bool ForDownload { get; set; }
+	}
+
+	[DataContract]
+	public class FilesResponse : IHasResponseStatus
+	{
+		[DataMember]
+		public FolderResult Directory { get; set; }
+
+		[DataMember]
+		public FileResult File { get; set; }
+
+		//Auto inject and serialize web service exceptions
+		[DataMember] public ResponseStatus ResponseStatus { get; set; }
+	}
+}
+
+using System.Runtime.Serialization;
+using ServiceStack.ServiceHost;
+using ServiceStack.ServiceInterface.ServiceModel;
+
+namespace RestFiles.ServiceModel.Operations
+{
+	[RestService("revertfiles")]
+	[DataContract]
+	public class RevertFiles { }
+
+	[DataContract]
+	public class RevertFilesResponse : IHasResponseStatus
+	{
+		public RevertFilesResponse()
+		{
+			this.ResponseStatus = new ResponseStatus();
+		}
+
+		[DataMember]
+		public ResponseStatus ResponseStatus { get; set; }
+	}
+}
+
+using System;
+using System.Runtime.Serialization;
+
+namespace RestFiles.ServiceModel.Types
+{
+	[DataContract]
+	public class File
+	{
+		[DataMember]
+		public string Name { get; set; }
+
+		[DataMember]
+		public string Extension { get; set; }
+
+		[DataMember]
+		public long FileSizeBytes { get; set; }
+
+		[DataMember]
+		public DateTime ModifiedDate { get; set; }
+
+		[DataMember]
+		public bool IsTextFile { get; set; }
+	}
+}
+
+using System;
+using System.Runtime.Serialization;
+
+namespace RestFiles.ServiceModel.Types
+{
+	[DataContract]
+	public class FileResult
+	{
+		[DataMember]
+		public string Name { get; set; }
+
+		[DataMember]
+		public string Extension { get; set; }
+
+		[DataMember]
+		public long FileSizeBytes { get; set; }
+
+		[DataMember]
+		public DateTime ModifiedDate { get; set; }
+
+		[DataMember]
+		public bool IsTextFile { get; set; }
+
+		[DataMember]
+		public string Contents { get; set; }
+	}
+}
+
+using System;
+using System.Runtime.Serialization;
+
+namespace RestFiles.ServiceModel.Types
+{
+	[DataContract]
+	public class Folder
+	{
+		[DataMember]
+		public string Name { get; set; }
+
+		[DataMember]
+		public DateTime ModifiedDate { get; set; }
+
+		[DataMember]
+		public int FileCount { get; set; }
+	}
+}
+
+using System.Collections.Generic;
+using System.Runtime.Serialization;
+
+namespace RestFiles.ServiceModel.Types
+{
+	[DataContract]
+	public class FolderResult
+	{
+		public FolderResult()
+		{
+			Folders = new List<Folder>();
+			Files = new List<File>();
+		}
+
+		[DataMember]
+		public List<Folder> Folders { get; set; }
+
+		[DataMember]
+		public List<File> Files { get; set; }
+	}
+}
+
+using System;
+using Funq;
+using RestIntro.ServiceInterface;
+using RestIntro.ServiceModel;
+using ServiceStack;
+using ServiceStack.Data;
+using ServiceStack.OrmLite;
+
+namespace RestIntro
+{
+    /// <summary>
+    /// Create your ServiceStack web service application with a singleton AppHost.
+    /// </summary>
+    public class AppHost : AppHostBase
+    {
+        /// <summary>
+        /// Initializes a new instance of your ServiceStack application, with the specified name and assembly containing the services.
+        /// </summary>
+        public AppHost() : base("REST Intro", typeof(CustomerService).Assembly) { }
+
+        /// <summary>
+        /// Configure the container with the necessary routes for your ServiceStack application.
+        /// </summary>
+        /// <param name="container">The built-in IoC used with ServiceStack.</param>
+        public override void Configure(Container container)
+        {
+            container.Register<IDbConnectionFactory>(
+                new OrmLiteConnectionFactory(
+                "~/RestIntro.sqlite".MapHostAbsolutePath(),
+                SqliteDialect.Provider));
+
+            using (var db = container.Resolve<IDbConnectionFactory>().Open())
+            {
+                db.DropAndCreateTable<Customer>();
+            }
+        }
+    }
+
+    public class Global : System.Web.HttpApplication
+    {
+        protected void Application_Start(object sender, EventArgs e)
+        {
+            //Initialize your application
+            (new AppHost()).Init();
+        }
+    }
+}
+
+using RestIntro.ServiceModel;
+using ServiceStack;
+using ServiceStack.OrmLite;
+
+namespace RestIntro.ServiceInterface
+{
+    /// <summary>
+    /// Create your ServiceStack rest-ful web service implementation.
+    /// </summary>
+    public class CustomerService : Service
+    {
+        public object Get(Customer request)
+        {
+            if (request.Id != default(long))
+                return Db.SingleById<Customer>(request.Id);
+
+            return Db.Select<Customer>();
+        }
+
+        public object Post(Customer customer)
+        {
+            Db.Save(customer);
+
+            var pathToNewResource = base.Request.AbsoluteUri.CombineWith(customer.Id.ToString());
+            return HttpResult.Status201Created(customer, pathToNewResource);
+        }
+
+        public Customer Put(Customer customer)
+        {
+            Db.Save(customer);
+            return customer;
+        }
+
+        public void Delete(Customer request)
+        {
+            Db.DeleteById<Customer>(request.Id);
+        }
+
+        public void frgfdhx(Customer request)
+        {
+            Db.Del
+        }
+    }
+}
