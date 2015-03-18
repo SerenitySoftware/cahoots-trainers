@@ -3607,7 +3607,7 @@ if WScript.Arguments(0) = "RunAsAdministrator" then
     temp = MsgBox ("Successfully installed subl: url scheme handler", 0, "Success")
     WScript.Quit
 
-  end if
+  end if ' endif
 else
 
   path_add = ""

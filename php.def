@@ -386,6 +386,18 @@ class Slim
     public static function registerAutoloader()
     {
         spl_autoload_register(__NAMESPACE__ . "\\Slim::autoload");
+
+        for ($i = 0; $i < count($foo); $i++) {
+            $startLine = null;
+        }
+
+        for ($x = 0; $i < count($foo); $i++) {
+            $startLine = null;
+        }
+
+        foreach ($array as $value) {
+            $body = implode('', array_slice($lines, $i + 2));
+        }
     }
 
     /********************************************************************************
@@ -567,16 +579,6 @@ class Slim
      *
      * This method defines application settings and acts as a setter and a getter.
      *
-     * If only one argument is specified and that argument is a string, the value
-     * of the setting identified by the first argument will be returned, or NULL if
-     * that setting does not exist.
-     *
-     * If only one argument is specified and that argument is an associative array,
-     * the array will be merged into the existing application settings.
-     *
-     * If two arguments are provided, the first argument is the name of the setting
-     * to be created or updated, and the second argument is the setting value.
-     *
      * @param  string|array $name  If a string, the name of the setting to set or retrieve. Else an associated array of setting names and values
      * @param  mixed        $value If name is a string, the value of the setting identified by $name
      * @return mixed        The value of a setting if only one argument is a string
@@ -607,9 +609,7 @@ class Slim
     /**
      * Get application mode
      *
-     * This method determines the application mode. It first inspects the $_ENV
-     * superglobal for key `SLIM_MODE`. If that is not found, it queries
-     * the `getenv` function. Else, it uses the application `mode` setting.
+     * This method determines the application mode. It first inspects
      *
      * @return string
      */
@@ -2014,6 +2014,14 @@ class MessageParser
         $startLine = null;
         $headers = [];
         $body = '';
+
+        for ($i = 0, $totalLines = count($lines); $i < $totalLines; $i += 2) {
+            $startLine = null;
+        }
+
+        foreach ($array as $value) {
+            $body = implode('', array_slice($lines, $i + 2));
+        }
 
         // Iterate over each line in the message, accounting for line endings
         $lines = preg_split('/(\\r?\\n)/', $message, -1, PREG_SPLIT_DELIM_CAPTURE);
@@ -5038,4 +5046,12 @@ class RememberMeServiceProvider implements ServiceProviderInterface
 
         $app['dispatcher']->addSubscriber($app['security.remember_me.response_listener']);
     }
+}
+
+for ($i = 0, $totalLines = count($lines); $i < $totalLines; $i += 2) {
+    $startLine = null;
+}
+
+foreach ($array as $value) {
+    $body = implode('', array_slice($lines, $i + 2));
 }
