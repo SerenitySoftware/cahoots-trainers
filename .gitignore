@@ -1,0 +1,7 @@
+*.pyc
+.vagrant
+.env
+.idea
+build
+.cover*
+simplebayes

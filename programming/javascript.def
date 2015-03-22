@@ -1545,12 +1545,6 @@ CSSLint.Util = {
     }
 };
 
-//     (c) 2012 Airbnb, Inc.
-//
-//     infinity.js may be freely distributed under the terms of the BSD
-//     license. For all licensing information, details, and documention:
-//     http://airbnb.github.com/infinity
-
 !function(window, Math, $) {
   'use strict';
 
@@ -3385,18 +3379,6 @@ CSSLint.Util = {
 
 }));
 
-/**
- * Copyright 2013-2015, Facebook, Inc.
- * All rights reserved.
- *
- * This source code is licensed under the BSD-style license found in the
- * LICENSE file in the root directory of this source tree. An additional grant
- * of patent rights can be found in the PATENTS file in the same directory.
- *
- * @providesModule ReactMultiChild
- * @typechecks static-only
- */
-
 'use strict';
 
 var ReactComponentEnvironment = require('ReactComponentEnvironment');
@@ -3814,16 +3796,6 @@ var ReactMultiChild = {
 
 module.exports = ReactMultiChild;
 
-/**
- * Copyright 2013-2015, Facebook, Inc.
- * All rights reserved.
- *
- * This source code is licensed under the BSD-style license found in the
- * LICENSE file in the root directory of this source tree. An additional grant
- * of patent rights can be found in the PATENTS file in the same directory.
- *
- * @providesModule ReactOwner
- */
 
 'use strict';
 

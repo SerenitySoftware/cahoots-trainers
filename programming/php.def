@@ -1,11 +1,4 @@
 <?php
-/**
- * Zend Framework (http://framework.zend.com/)
- *
- * @link      http://github.com/zendframework/zf2 for the canonical source repository
- * @copyright Copyright (c) 2005-2015 Zend Technologies USA Inc. (http://www.zend.com)
- * @license   http://framework.zend.com/license/new-bsd New BSD License
- */
 
 namespace Zend\Mvc;
 
@@ -253,30 +246,8 @@ class DispatchListener implements ListenerAggregateInterface
  * @author      Josh Lockhart <info@slimframework.com>
  * @copyright   2011 Josh Lockhart
  * @link        http://www.slimframework.com
- * @license     http://www.slimframework.com/license
  * @version     2.6.1
  * @package     Slim
- *
- * MIT LICENSE
- *
- * Permission is hereby granted, free of charge, to any person obtaining
- * a copy of this software and associated documentation files (the
- * "Software"), to deal in the Software without restriction, including
- * without limitation the rights to use, copy, modify, merge, publish,
- * distribute, sublicense, and/or sell copies of the Software, and to
- * permit persons to whom the Software is furnished to do so, subject to
- * the following conditions:
- *
- * The above copyright notice and this permission notice shall be
- * included in all copies or substantial portions of the Software.
- *
- * THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND,
- * EXPRESS OR IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF
- * MERCHANTABILITY, FITNESS FOR A PARTICULAR PURPOSE AND
- * NONINFRINGEMENT. IN NO EVENT SHALL THE AUTHORS OR COPYRIGHT HOLDERS BE
- * LIABLE FOR ANY CLAIM, DAMAGES OR OTHER LIABILITY, WHETHER IN AN ACTION
- * OF CONTRACT, TORT OR OTHERWISE, ARISING FROM, OUT OF OR IN CONNECTION
- * WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
  */
 namespace Slim;
 
@@ -2115,7 +2086,6 @@ class MessageParser
  * @author Qiang Xue <qiang.xue@gmail.com>
  * @link http://www.yiiframework.com/
  * @copyright 2008-2013 Yii Software LLC
- * @license http://www.yiiframework.com/license/
  */
 
 /**
@@ -2234,7 +2204,6 @@ if({$emptyCondition}) {
  * @author Qiang Xue <qiang.xue@gmail.com>
  * @link http://www.yiiframework.com/
  * @copyright 2008-2013 Yii Software LLC
- * @license http://www.yiiframework.com/license/
  */
 
 /**
@@ -2789,7 +2758,6 @@ abstract class CModule extends CComponent
  *
  * @author Paul Annesley
  * @package Flexihash
- * @licence http://www.opensource.org/licenses/mit-license.php
  */
 
 error_reporting(E_ALL);
@@ -2889,7 +2857,6 @@ function flexihash_build_log($message)
 /**
  * A block of PHPDoc documentation.
  * @author Paul Annesley
- * @licence http://www.opensource.org/licenses/mit-license.php
  */
 class Pda_Docblock
 {
@@ -3011,7 +2978,6 @@ class Pda_Docblock
 /**
  * A tag in a block of PHPDoc documentation.
  * @author Paul Annesley
- * @licence http://www.opensource.org/licenses/mit-license.php
  */
 class Pda_Docblock_Tag
 {
@@ -3054,9 +3020,6 @@ class Pda_Docblock_Tag
  * This file is part of Mustache.php.
  *
  * (c) 2010-2014 Justin Hileman
- *
- * For the full copyright and license information, please view the LICENSE
- * file that was distributed with this source code.
  */
 
 /**
@@ -3124,9 +3087,6 @@ class Mustache_Loader_CascadingLoader implements Mustache_Loader
  * This file is part of Mustache.php.
  *
  * (c) 2010-2014 Justin Hileman
- *
- * For the full copyright and license information, please view the LICENSE
- * file that was distributed with this source code.
  */
 
 /**
@@ -3199,9 +3159,6 @@ class Mustache_Autoloader
  * This file is part of Mustache.php.
  *
  * (c) 2010-2014 Justin Hileman
- *
- * For the full copyright and license information, please view the LICENSE
- * file that was distributed with this source code.
  */
 
 /**
@@ -3767,9 +3724,6 @@ class ImageServiceProvider extends ServiceProvider
  * This file is part of the Monolog package.
  *
  * (c) Jordi Boggiano <j.boggiano@seld.be>
- *
- * For the full copyright and license information, please view the LICENSE
- * file that was distributed with this source code.
  */
 
 namespace Monolog\Formatter;
@@ -3873,9 +3827,6 @@ class MongoDBFormatter implements FormatterInterface
  * This file is part of the Monolog package.
  *
  * (c) Jordi Boggiano <j.boggiano@seld.be>
- *
- * For the full copyright and license information, please view the LICENSE
- * file that was distributed with this source code.
  */
 
 namespace Monolog\Handler;
@@ -4355,9 +4306,6 @@ class FulfilledPromise implements ExtendedPromiseInterface, CancellablePromiseIn
  * This file is part of the Assetic package, an OpenSky project.
  *
  * (c) 2010-2014 OpenSky Project Inc
- *
- * For the full copyright and license information, please view the LICENSE
- * file that was distributed with this source code.
  */
 
 use Assetic\Factory\AssetFactory;
@@ -4481,9 +4429,6 @@ function _assetic_urls($inputs = array(), $filters = array(), array $options = a
  * This file is part of the Assetic package, an OpenSky project.
  *
  * (c) 2010-2014 OpenSky Project Inc
- *
- * For the full copyright and license information, please view the LICENSE
- * file that was distributed with this source code.
  */
 
 namespace Assetic\Extension\Twig;
@@ -4647,9 +4592,6 @@ class AsseticNode extends \Twig_Node
  * This file is part of the Assetic package, an OpenSky project.
  *
  * (c) 2010-2014 OpenSky Project Inc
- *
- * For the full copyright and license information, please view the LICENSE
- * file that was distributed with this source code.
  */
 
 namespace Assetic\Asset;
@@ -4727,9 +4669,6 @@ class HttpAsset extends BaseAsset
  * This file is part of the Silex framework.
  *
  * (c) Fabien Potencier <fabien@symfony.com>
- *
- * For the full copyright and license information, please view the LICENSE
- * file that was distributed with this source code.
  */
 
 namespace Silex\Application;
@@ -4786,9 +4725,6 @@ trait SecurityTrait
  * This file is part of the Silex framework.
  *
  * (c) Fabien Potencier <fabien@symfony.com>
- *
- * For the full copyright and license information, please view the LICENSE
- * file that was distributed with this source code.
  */
 
 namespace Silex\Application;
@@ -4848,9 +4784,6 @@ trait TwigTrait
  * This file is part of the Silex framework.
  *
  * (c) Fabien Potencier <fabien@symfony.com>
- *
- * For the full copyright and license information, please view the LICENSE
- * file that was distributed with this source code.
  */
 
 namespace Silex\Provider;
@@ -4948,9 +4881,6 @@ class SwiftmailerServiceProvider implements ServiceProviderInterface
  * This file is part of the Silex framework.
  *
  * (c) Fabien Potencier <fabien@symfony.com>
- *
- * For the full copyright and license information, please view the LICENSE
- * file that was distributed with this source code.
  */
 
 namespace Silex\Provider;
