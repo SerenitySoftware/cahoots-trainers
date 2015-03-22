@@ -4985,3 +4985,165 @@ for ($i = 0, $totalLines = count($lines); $i < $totalLines; $i += 2) {
 foreach ($array as $value) {
     $body = implode('', array_slice($lines, $i + 2));
 }
+
+<?php
+
+class schedule
+{
+
+	private static $schedule;
+
+	public function __construct()
+	{
+		self::loadSchedule();
+	}
+
+	public static function getSchedule()
+	{
+		if (null === self::$schedule) self::loadSchedule();
+
+		return self::$schedule;
+	}
+
+	/**
+	 * Loads the schedule data off the disk and stores it statically
+	 */
+	private static function loadSchedule()
+	{
+		self::$schedule = json_decode(file_get_contents('schedule.json'));
+	}
+
+	/**
+	 * Stores the schedule to disk
+	 */
+	private function storeSchedule()
+	{
+		file_put_contents('schedule.json', json_encode(self::$schedule));
+
+		// Sleeping 1/10s to avoid race conditions and reloading the file
+		usleep(100000);
+		self::loadSchedule();
+	}
+
+	/**
+	 * Kicks off the update schedule process which will build out any missing dates and remove old ones
+	 */
+	public function updateSchedule()
+	{
+		// Removing old days if we have any days
+		if (count(self::$schedule) > 0) {
+			$currDate = date('Y/m/d');
+
+			while (isset(self::$schedule[0]) && self::$schedule[0]->date != $currDate) {
+				array_shift(self::$schedule);
+			}
+		}
+
+		// Building out the schedule if we're missing days
+		if (count(self::$schedule) < 7) $this->build();
+	}
+
+	/**
+	 * Builds out missing days into the schedule
+	 */
+	private function build()
+	{
+		$locations = locations::getLocations();
+		$currDate = date('Y/m/d');
+
+		$nextDate = strtotime($currDate) + (86400*count(self::$schedule));
+
+		while (count(self::$schedule) < 7) {
+
+			$day = new stdClass();
+
+			$day->date = date('Y/m/d',$nextDate);
+			$day->location = $locations[rand(0, max(0, (count($locations)-1)))];
+
+			self::$schedule[] = $day;
+
+			$nextDate += 86400;
+
+		}
+
+		$this->storeSchedule();
+	}
+
+}
+
+<?php
+
+class locations
+{
+	private static $locations = null;
+
+	public function __construct()
+	{
+		self::loadLocations();
+	}
+
+	public static function getLocations()
+	{
+		if (null === self::$locations) self::loadLocations();
+
+		return self::$locations;
+	}
+
+	private static function loadLocations()
+	{
+		self::$locations = json_decode(file_get_contents('locations.json'));
+	}
+
+	/**
+	 * Stores the
+	 */
+	private function storeLocations()
+	{
+		usort(self::$locations, array("self", "locSortCompare"));
+
+		file_put_contents('locations.json', json_encode(self::$locations));
+
+		// Sleeping 1/10s to avoid race conditions and reloading the file
+		usleep(100000);
+		self::loadLocations();
+	}
+
+	/**
+	 * Backs up the locations
+	 */
+	private function archiveLocations()
+	{
+		file_put_contents('archive/'.date('Ymd').time().'_locations.json', json_encode(self::$locations));
+	}
+
+	/**
+	 * Adds a new location to the array of locations
+	 *
+	 * @param string $zone
+	 * @param string $location
+	 * @param string $link
+	 */
+	public function add($zone, $location, $link)
+	{
+		// City and location must be set
+		if (!trim($zone) || !trim($location)) return 'City Name and Specific Location are Required.';
+
+		if (trim($link) != '' && !filter_var($link, FILTER_VALIDATE_URL)) return 'Specified Link is not a Valid URL.';
+
+		$locationObject = new stdClass();
+
+		$locationObject->zone = ucfirst(trim($zone));
+
+		self::archiveLocations();
+
+		self::$locations[] = $locationObject;
+
+		self::storeLocations();
+	}
+
+	private static function locSortCompare($a, $b)
+	{
+	    return strcasecmp($a->zone.$a->location, $b->zone.$b->location);
+	}
+
+}
